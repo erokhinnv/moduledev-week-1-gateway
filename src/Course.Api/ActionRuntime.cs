@@ -1,0 +1,437 @@
+using System.Diagnostics;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Course.Shared;
+using Npgsql;
+
+namespace Course.Api;
+
+/// <summary>Разобранный входящий HTTP-запрос к generic-маршруту действия.</summary>
+public sealed record ActionRequest(
+    string Method,
+    IReadOnlyList<string> Segments,
+    string? AuthorizationHeader,
+    string? VersionHeader,
+    string? IdempotencyKey,
+    byte[] Body);
+
+/// <summary>Готовый HTTP-ответ: статус-код и тело в виде JSON-конверта.</summary>
+public sealed record ActionResponse(int Status, JsonObject Body);
+
+/// <summary>
+/// Универсальный (generic) исполнитель HTTP-действий.
+///
+/// Это ЕДИНСТВЕННЫЙ компонент на C#, который вообще запускает предметные (доменные) действия —
+/// и при этом он сам не содержит НИ ОДНОЙ строчки предметной логики. Всё специфичное для
+/// конкретного действия (какая функция вызывается, какая у неё схема запроса/ответа, какие права
+/// требуются) приходит из опубликованного манифеста, а сам вызов предметной логики происходит
+/// внутри зарегистрированной PostgreSQL-функции за границей api.invoke. Благодаря этому разделению
+/// добавление нового действия никогда не требует правки или пересборки этого класса.
+/// </summary>
+public sealed class ActionRuntime(
+    ActionCatalog catalog,
+    JwtValidator jwtValidator,
+    DispatchRecorder dispatchRecorder,
+    DependencyState dependencyState,
+    NpgsqlDataSource dataSource,
+    ILogger<ActionRuntime> logger)
+{
+    private const int MaxIdempotencyKeyLength = 128;
+
+    /// <summary>
+    /// Главная точка входа: обрабатывает один HTTP-запрос к маршруту POST /api/{module}/{action}
+    /// от начала (проверка JWT) до конца (ответ клиенту), последовательно проходя все ступени
+    /// проверки, описанные ниже пронумерованными шагами.
+    /// </summary>
+    public async Task<ActionResponse> ExecuteAsync(ActionRequest request, CancellationToken cancellationToken)
+    {
+        // correlationId генерируется сервером для КАЖДОГО запроса — это уникальный идентификатор,
+        // по которому можно найти этот запрос в логах и в проверочных данных (autocheck).
+        // Клиент никогда не передаёт correlationId сам, только получает его в ответе.
+        var correlationId = Guid.NewGuid();
+        var started = Stopwatch.GetTimestamp();
+
+        // Шаг 1. Аутентификация идёт раньше всего остального: доверенный контекст (кто вызывает,
+        // от чьего имени, какими правами обладает) имеет ровно один источник — проверенный JWT.
+        // Если токен не проходит проверку, дальнейшая обработка вообще не начинается.
+        if (!jwtValidator.TryValidate(request.AuthorizationHeader, out var identity, out var reason))
+        {
+            logger.LogInformation(
+                "action rejected correlationId={CorrelationId} code={Code} reason={Reason}",
+                correlationId,
+                ContractCodes.AuthInvalid,
+                reason);
+            return Failure(ContractCodes.AuthInvalid, "request is not authenticated", correlationId, null);
+        }
+
+        // Шаг 2. Форма маршрута. После префикса /api в пути обязано быть ровно два сегмента:
+        // модуль и действие (например /api/payment/request). Оба сегмента должны быть похожи на
+        // корректные SQL-идентификаторы — это первая защита от попытки протащить что-то лишнее
+        // прямо в имени маршрута.
+        if (request.Segments.Count != 2 ||
+            !IsSqlIdentifier(request.Segments[0]) ||
+            !IsSqlIdentifier(request.Segments[1]))
+        {
+            return Failure(ContractCodes.RequestInvalid, "action route must be /api/{module}/{action}", correlationId, null);
+        }
+
+        var module = request.Segments[0];
+        var action = request.Segments[1];
+
+        if (!string.Equals(request.Method, HttpMethods.Post, StringComparison.OrdinalIgnoreCase))
+        {
+            return Failure(ContractCodes.RequestInvalid, "actions are invoked with POST", correlationId, null);
+        }
+
+        // Шаг 3. Явная версия действия передаётся ТОЛЬКО через заголовок X-Action-Version.
+        // Если заголовка нет — будет выбрана версия по умолчанию (default) для этого маршрута.
+        // Версия никогда не читается из тела запроса или из URL.
+        int? requestedVersion = null;
+        if (request.VersionHeader is not null)
+        {
+            if (!int.TryParse(request.VersionHeader.Trim(), out var parsed) || parsed < 1)
+            {
+                return Failure(ContractCodes.RequestInvalid, "X-Action-Version must be a positive integer", correlationId, null);
+            }
+
+            requestedVersion = parsed;
+        }
+
+        var idempotencyKey = string.IsNullOrWhiteSpace(request.IdempotencyKey) ? null : request.IdempotencyKey.Trim();
+        if (idempotencyKey is { Length: > MaxIdempotencyKeyLength })
+        {
+            return Failure(ContractCodes.RequestInvalid, "Idempotency-Key is too long", correlationId, null);
+        }
+
+        // Шаг 4. Разбор тела запроса. Оно обязано быть корректным JSON-объектом.
+        JsonDocument payloadDocument;
+        try
+        {
+            payloadDocument = JsonDocument.Parse(request.Body);
+        }
+        catch (JsonException)
+        {
+            return Failure(ContractCodes.RequestInvalid, "request body is not valid JSON", correlationId, null);
+        }
+
+        using (payloadDocument)
+        {
+            if (payloadDocument.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return Failure(ContractCodes.RequestInvalid, "request body must be a JSON object", correlationId, null);
+            }
+
+            // Хеш тела запроса — единственное, что попадает в технический след (evidence) вызова.
+            // Само содержимое запроса (например реальная сумма платежа) туда не пишется.
+            var payloadHash = Hashing.Sha256Hex(request.Body);
+            var evidence = new DispatchEvidence
+            {
+                CorrelationId = correlationId,
+                Module = module,
+                Action = action,
+                Principal = identity!.Principal,
+                Consumer = identity.Consumer,
+                PayloadHash = payloadHash,
+                RequestId = idempotencyKey,
+            };
+
+            try
+            {
+                var response = await RunAsync(
+                    module,
+                    action,
+                    requestedVersion,
+                    identity,
+                    idempotencyKey,
+                    payloadDocument.RootElement,
+                    correlationId,
+                    evidence,
+                    cancellationToken);
+
+                evidence.DurationMs = (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                await dispatchRecorder.RecordAsync(evidence, cancellationToken);
+                return response;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                // Сюда попадают непредвиденные технические сбои (например обрыв соединения с
+                // PostgreSQL посреди выполнения). Классифицируем причину и, если это похоже на
+                // недоступность базы, "запоминаем" это на короткое время через DependencyState —
+                // чтобы следующие запросы не ждали повторного долгого таймаута соединения.
+                var code = PostgresFailure.Classify(exception);
+                if (code == ContractCodes.DependencyUnavailable)
+                {
+                    dependencyState.MarkUnavailable();
+                }
+
+                logger.LogError(
+                    exception,
+                    "action failed correlationId={CorrelationId} route={Module}.{Action} code={Code}",
+                    correlationId,
+                    module,
+                    action,
+                    code);
+
+                evidence.Status = "ERROR";
+                evidence.ErrorCode = code;
+                evidence.DurationMs = (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                await dispatchRecorder.RecordAsync(evidence, cancellationToken);
+
+                return Failure(code, DescribeTechnicalFailure(code), correlationId, evidence.Version);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Основная последовательность разрешения действия, проверки прав, идемпотентности и
+    /// собственно вызова через api.invoke внутри одной транзакции.
+    /// </summary>
+    private async Task<ActionResponse> RunAsync(
+        string module,
+        string action,
+        int? requestedVersion,
+        TrustedIdentity identity,
+        string? idempotencyKey,
+        JsonElement payload,
+        Guid correlationId,
+        DispatchEvidence evidence,
+        CancellationToken cancellationToken)
+    {
+        // Шаг 5. Target (целевая функция) разрешается ТОЛЬКО из неизменяемого каталога действий.
+        // Если зависимость (PostgreSQL) только что доказала свою недоступность — отвечаем сразу
+        // же кодом 503, не пытаясь снова ждать соединения: см. подробный комментарий в
+        // DependencyState.cs про то, зачем это нужно (резолв Compose DNS может занимать секунды).
+        if (dependencyState.IsKnownUnavailable)
+        {
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.DependencyUnavailable;
+            return Failure(
+                ContractCodes.DependencyUnavailable,
+                "authoritative state is temporarily unavailable",
+                correlationId,
+                requestedVersion);
+        }
+
+        var manifest = await catalog.ResolveAsync(module, action, requestedVersion, cancellationToken);
+        if (manifest is null)
+        {
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.ActionNotFound;
+            evidence.Version = requestedVersion;
+            return Failure(ContractCodes.ActionNotFound, "action version is not published or is disabled", correlationId, requestedVersion);
+        }
+
+        evidence.Version = manifest.Version;
+
+        // Шаг 6. Проверка прав (policy) на границе HTTP. Это ПЕРВАЯ из двух проверок прав —
+        // вторая, полностью независимая проверка, будет выполнена ещё раз внутри api.invoke на
+        // стороне PostgreSQL. Два независимых места проверки — сознательное решение: даже если
+        // кто-то вызовет api.invoke напрямую в обход HTTP-слоя, права всё равно будут проверены.
+        var missingScopes = manifest.RequiredPolicy
+            .Where(scope => !identity.Scopes.Contains(scope, StringComparer.Ordinal))
+            .ToArray();
+        if (missingScopes.Length > 0)
+        {
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.AccessDenied;
+            return Failure(ContractCodes.AccessDenied, "token does not satisfy the required policy", correlationId, manifest.Version);
+        }
+
+        // Шаг 7. Требование идемпотентности берётся из манифеста конкретного действия.
+        if (manifest.RequiresIdempotencyKey && idempotencyKey is null)
+        {
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.IdempotencyRequired;
+            return Failure(ContractCodes.IdempotencyRequired, "action requires an Idempotency-Key header", correlationId, manifest.Version);
+        }
+
+        // Если ключ идемпотентности не передан клиентом (для действий, где он не обязателен),
+        // в качестве requestId используется сгенерированный correlationId — так у каждого вызова
+        // всегда есть какой-то идентификатор запроса для технического следа.
+        var requestId = idempotencyKey ?? correlationId.ToString();
+        evidence.RequestId = requestId;
+
+        // Шаг 8. Схема запроса проверяется ДО любого предметного вызова. Если payload не проходит
+        // JSON Schema действия — до PostgreSQL дело вообще не доходит.
+        if (!SchemaValidator.TryValidate(manifest.RequestSchema, payload, out var violations))
+        {
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.PayloadInvalid;
+            return Failure(
+                ContractCodes.PayloadInvalid,
+                "payload does not match the request schema of the action",
+                correlationId,
+                manifest.Version,
+                details: SchemaValidator.Details(violations));
+        }
+
+        // Шаг 9. Формирование серверного (доверенного) контекста. Поля тела запроса НИКОГДА не
+        // могут повлиять на его содержимое — даже если payload случайно (или намеренно) содержит
+        // поле "principal" или "scopes", оно будет просто проигнорировано: контекст строится
+        // исключительно из проверенного identity и данных манифеста.
+        var deadline = DateTimeOffset.UtcNow.AddMilliseconds(manifest.TimeoutMs);
+        var context = new JsonObject
+        {
+            ["principal"] = identity.Principal,
+            ["consumer"] = identity.Consumer,
+            ["scopes"] = new JsonArray(identity.Scopes.Select(scope => (JsonNode)JsonValue.Create(scope)!).ToArray()),
+            ["correlationId"] = correlationId.ToString(),
+            ["requestId"] = requestId,
+            ["deadline"] = deadline.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"),
+        };
+
+        // Шаг 10. Один и только один вызов к базе на весь предметный эффект: открываем
+        // транзакцию, вызываем api.invoke, проверяем контракт результата и только после этого
+        // делаем commit. Если что-то пойдёт не так на любом из следующих под-шагов — вся
+        // транзакция откатывается целиком (rollback), и никакого частичного эффекта не остаётся.
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        // SET LOCAL statement_timeout действует только внутри этой транзакции: если PostgreSQL не
+        // успевает выполнить запрос за отведённое манифестом время, он сам прервёт выполнение с
+        // SQL-состоянием 57014 (query_canceled), которое затем превращается в 504 action.timeout.
+        await using (var deadlineCommand = new NpgsqlCommand(
+            $"SET LOCAL statement_timeout = {manifest.TimeoutMs}", connection, transaction))
+        {
+            await deadlineCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        string? envelopeText;
+        await using (var invoke = new NpgsqlCommand(
+            "SELECT api.invoke($1, $2, $3, $4, $5)::text", connection, transaction))
+        {
+            invoke.Parameters.Add(ActionCatalog.Text(module));
+            invoke.Parameters.Add(ActionCatalog.Text(action));
+            invoke.Parameters.Add(ActionCatalog.Integer(requestedVersion));
+            invoke.Parameters.Add(ActionCatalog.Jsonb(context.ToJsonString()));
+            invoke.Parameters.Add(ActionCatalog.Jsonb(payload.GetRawText()));
+            invoke.CommandTimeout = (manifest.TimeoutMs / 1000) + 10;
+            envelopeText = await invoke.ExecuteScalarAsync(cancellationToken) as string;
+        }
+
+        if (envelopeText is null || JsonNode.Parse(envelopeText) is not JsonObject envelope)
+        {
+            // api.invoke обязан вернуть валидный JSON-конверт. Если этого не произошло —
+            // это нарушение контракта самой функции каталога, а не предметной ошибки клиента.
+            await transaction.RollbackAsync(cancellationToken);
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.ContractViolation;
+            return Failure(ContractCodes.ContractViolation, "action returned a non contractual envelope", correlationId, manifest.Version);
+        }
+
+        if (envelope["status"]?.GetValue<string>() != "ok")
+        {
+            // Любой объявленный сбой (status=error) полностью откатывает весь предметный эффект
+            // ЕЩЁ ДО того, как клиенту будет отправлен ответ. Например, если платёжная функция
+            // вернула ошибку уже после того, как успела что-то вставить в таблицу — эта вставка
+            // будет отменена транзакцией целиком.
+            await transaction.RollbackAsync(cancellationToken);
+
+            var code = envelope["code"]?.GetValue<string>() ?? ContractCodes.InternalError;
+            var message = envelope["message"]?.GetValue<string>() ?? "action returned a domain error";
+            var retryable = envelope["retryable"]?.GetValue<bool>() ?? false;
+
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = code;
+
+            return new ActionResponse(
+                ContractCodes.HttpStatus(code),
+                Envelope.Error(code, message, correlationId, manifest.Version, retryable));
+        }
+
+        var outcome = envelope["outcome"]?.GetValue<string>();
+        var result = envelope["result"];
+
+        // Исход (outcome) обязан входить в список outcomes, объявленный в манифесте действия.
+        // Если функция вернула какой-то другой, неизвестный исход — это тоже откат и 500-я ошибка
+        // action.contract_violation, а не тихое принятие непредвиденного результата.
+        if (outcome is null || !manifest.Outcomes.Contains(outcome, StringComparer.Ordinal))
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.ContractViolation;
+            return Failure(ContractCodes.ContractViolation, "action returned an undeclared outcome", correlationId, manifest.Version);
+        }
+
+        // Результат (result) обязан пройти проверку по response_schema манифеста — точно так же,
+        // как payload запроса проверялся по request_schema на шаге 8. Опять же, любое нарушение —
+        // это полный откат.
+        if (result is not JsonObject ||
+            !SchemaValidator.TryValidate(manifest.ResponseSchema, result, out _))
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.ContractViolation;
+            return Failure(ContractCodes.ContractViolation, "action result does not match the response schema", correlationId, manifest.Version);
+        }
+
+        // Все проверки пройдены — теперь и только теперь фиксируем транзакцию.
+        await transaction.CommitAsync(cancellationToken);
+
+        dependencyState.MarkAvailable();
+        evidence.Status = "OK";
+        evidence.Outcome = outcome;
+
+        logger.LogInformation(
+            "action completed correlationId={CorrelationId} route={Module}.{Action} version={Version} outcome={Outcome}",
+            correlationId,
+            module,
+            action,
+            manifest.Version,
+            outcome);
+
+        return new ActionResponse(
+            StatusCodes.Status200OK,
+            Envelope.Success(outcome, result.DeepClone(), correlationId, manifest.Version));
+    }
+
+    /// <summary>Строит ответ об ошибке в едином формате контракта, автоматически проставляя признак "можно повторить" для временных сбоев.</summary>
+    private static ActionResponse Failure(
+        string code,
+        string message,
+        Guid correlationId,
+        int? actionVersion,
+        JsonNode? details = null)
+        => new(
+            ContractCodes.HttpStatus(code),
+            Envelope.Error(
+                code,
+                message,
+                correlationId,
+                actionVersion,
+                retryable: code is ContractCodes.DependencyUnavailable or ContractCodes.ActionTimeout,
+                details: details));
+
+    /// <summary>Человекочитаемое, но не раскрывающее внутренние детали, описание технического сбоя.</summary>
+    private static string DescribeTechnicalFailure(string code) => code switch
+    {
+        ContractCodes.DependencyUnavailable => "authoritative state is temporarily unavailable",
+        ContractCodes.ActionTimeout => "action deadline was reached",
+        _ => "request could not be completed",
+    };
+
+    /// <summary>
+    /// Проверяет, что строка похожа на корректный SQL-идентификатор PostgreSQL: начинается со
+    /// строчной латинской буквы, дальше — строчные буквы, цифры или подчёркивание, не длиннее 63
+    /// символов. Используется для проверки сегментов маршрута (module/action) до того, как они
+    /// попадут в запрос к базе данных.
+    /// </summary>
+    internal static bool IsSqlIdentifier(string value)
+    {
+        if (value.Length is 0 or > 63 || value[0] is < 'a' or > 'z')
+        {
+            return false;
+        }
+
+        foreach (var character in value)
+        {
+            var valid = character is >= 'a' and <= 'z' or >= '0' and <= '9' or '_';
+            if (!valid)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:course:course-1:operation-result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operationId",
+    "requestId",
+    "operationKind",
+    "amount",
+    "currency",
+    "status"
+  ],
+  "properties": {
+    "operationId": {"type": "string", "format": "uuid"},
+    "requestId": {"type": "string", "minLength": 1, "maxLength": 128},
+    "operationKind": {
+      "enum": ["PAYMENT_EXECUTION", "PAYMENT_APPROVAL"]
+    },
+    "amount": {
+      "type": "string",
+      "pattern": "^(?:0\\.0[1-9]|0\\.[1-9][0-9]?|[1-9][0-9]{0,15}(?:\\.[0-9]{1,2})?)$"
+    },
+    "currency": {"const": "RUB"},
+    "status": {"enum": ["CREATED", "PROCESSING", "COMPLETED", "REJECTED"]}
+  }
+}

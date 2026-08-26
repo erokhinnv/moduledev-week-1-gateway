@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Course.Shared\Course.Shared.csproj" />
+  </ItemGroup>
+
+</Project>

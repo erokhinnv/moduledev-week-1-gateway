@@ -1,0 +1,108 @@
+name: moduledev-week-1
+
+# Четыре сервиса, одна публичная точка входа.
+#
+#   gateway  - публичный C# ASP.NET Core шлюз, единственный сервис с опубликованным host-портом
+#   api      - внутренний C# движок исполнения действий, доступен только по сети Compose
+#   cli      - Course CLI: миграции и публикация действий, владеет учётными данными публикации
+#   postgres - авторитетное состояние в именованном томе (volume)
+#
+# Пароли ниже — это значения по умолчанию для локальной разработки, а НЕ настоящие секреты.
+# Реальные значения задаются переменными окружения хоста, на котором запускается стек, а
+# проверка (check.sh) подменяет ключ подписи JWT через свой собственный override-файл Compose.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: course
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${COURSE_POSTGRES_PASSWORD:-course_local_superuser}
+      COURSE_MIGRATOR_PASSWORD: ${COURSE_MIGRATOR_PASSWORD:-course_local_migrator}
+      COURSE_RUNTIME_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes:
+      # Именованный том: данные PostgreSQL переживают удаление и пересоздание контейнеров
+      # gateway и api (и даже самого postgres, пока том не удалён явно).
+      - postgres-data:/var/lib/postgresql/data
+      # Скрипт создания ролей выполняется официальным entrypoint-образа один раз, только при
+      # первой инициализации ПУСТОГО тома данных.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d course"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  cli:
+    build:
+      context: .
+      dockerfile: docker/cli.Dockerfile
+    environment:
+      # cli подключается к базе от лица роли ПУБЛИКАЦИИ (course_migrator) — именно эти учётные
+      # данные никогда не передаются сервису api.
+      COURSE_POSTGRES_HOST: postgres
+      COURSE_POSTGRES_PORT: 5432
+      COURSE_POSTGRES_DB: course
+      COURSE_POSTGRES_USER: course_migrator
+      COURSE_POSTGRES_PASSWORD: ${COURSE_MIGRATOR_PASSWORD:-course_local_migrator}
+      COURSE_APPLICATION_NAME: course-cli
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # По умолчанию контейнер cli выполняет команду "bootstrap" (см. CMD в docker/cli.Dockerfile)
+    # и завершается — restart: "no" означает "не перезапускать его после выхода".
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER:-moduledev-course}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE:-moduledev-api}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-local-development-signing-key-change-me-please}
+      # api подключается от лица RUNTIME-роли (course_runtime) — у неё нет прав на изменение
+      # каталога действий или структуры базы, только на выполнение api.invoke и чтение autocheck.
+      COURSE_POSTGRES_HOST: postgres
+      COURSE_POSTGRES_PORT: 5432
+      COURSE_POSTGRES_DB: course
+      COURSE_POSTGRES_USER: course_runtime
+      COURSE_POSTGRES_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
+      COURSE_APPLICATION_NAME: course-api
+    # expose (в отличие от ports) делает порт доступным только другим сервисам ВНУТРИ сети
+    # Compose — снаружи хоста этот порт не виден вообще.
+    expose:
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # api стартует только ПОСЛЕ того, как cli успешно завершил bootstrap (миграции применены,
+      # встроенные действия опубликованы) — поэтому api никогда не увидит пустой/неинициализированный каталог.
+      cli:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      # Ключевой момент: адрес внутреннего api задан именем сервиса Compose ("api"), а НЕ через
+      # localhost — DNS этого имени разрешается сетью Docker Compose и продолжает работать даже
+      # если контейнер api был пересоздан и получил новый IP-адрес.
+      COURSE_API_BASE_URL: http://api:8080
+    # Единственный сервис во всём стеке с публикацией host-порта наружу.
+    ports:
+      - "8080:8080"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

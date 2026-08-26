@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>course</AssemblyName>
+    <RootNamespace>Course.Cli</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Course.Shared\Course.Shared.csproj" />
+  </ItemGroup>
+
+  <!-- Каноническая JSON Schema манифеста действия встраивается прямо внутрь сборки CLI (как
+       embedded resource), чтобы команда "action validate/publish" могла проверить манифест
+       без обращения к файловой системе вне контейнера — см. Course.Cli/CatalogClient.cs,
+       класс ContractSchemas. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\contracts\course-1\action-manifest.schema.json" LogicalName="action-manifest.schema.json" />
+  </ItemGroup>
+
+</Project>
