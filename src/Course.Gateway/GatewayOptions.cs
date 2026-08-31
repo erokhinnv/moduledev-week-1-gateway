@@ -15,7 +15,21 @@ public sealed class GatewayOptions
     public required Uri UpstreamBaseAddress { get; init; }
 
     public required int ListenPort { get; init; }
-    public TimeSpan UpstreamTimeout { get; init; } = TimeSpan.FromSeconds(12);
+
+    /// <summary>
+    /// Бюджет ожидания ответа от внутреннего api.
+    ///
+    /// Он обязан быть ЗАВЕДОМО БОЛЬШЕ контрактного максимума timeout_ms (30 секунд) плюс запас на
+    /// накладные расходы. Иначе возникает худший из возможных исходов: действие успевает
+    /// зафиксировать предметный эффект, а клиент получает от шлюза таймаут и считает, что ничего
+    /// не произошло. Раньше здесь стояло 12 секунд, то есть меньше контрактного максимума.
+    ///
+    /// Подстроить бюджет под конкретное действие шлюз не может принципиально: по контракту он не
+    /// имеет права знать каталог, а значит и timeout_ms манифеста. Поэтому единственный
+    /// допустимый вариант — фиксированный бюджет выше контрактного потолка.
+    /// </summary>
+    public TimeSpan UpstreamTimeout { get; init; } = TimeSpan.FromSeconds(35);
+
     public TimeSpan ProbeTimeout { get; init; } = TimeSpan.FromMilliseconds(1500);
 
     public static GatewayOptions FromEnvironment()
@@ -40,7 +54,7 @@ public sealed class GatewayOptions
         {
             UpstreamBaseAddress = uri,
             ListenPort = Env.OptionalInt("COURSE_GATEWAY_PORT", 8080),
-            UpstreamTimeout = TimeSpan.FromSeconds(Env.OptionalInt("COURSE_GATEWAY_UPSTREAM_TIMEOUT", 12)),
+            UpstreamTimeout = TimeSpan.FromSeconds(Env.OptionalInt("COURSE_GATEWAY_UPSTREAM_TIMEOUT", 35)),
         };
     }
 }

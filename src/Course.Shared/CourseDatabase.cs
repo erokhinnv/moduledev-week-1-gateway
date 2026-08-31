@@ -12,13 +12,40 @@ namespace Course.Shared;
 /// </summary>
 public static class CourseDatabase
 {
+    /// <summary>Имена переменных окружения с логином и паролем одной роли.</summary>
+    public sealed record Credentials(string UserVariable, string PasswordVariable)
+    {
+        /// <summary>Основной набор: runtime для api, роль миграций для cli.</summary>
+        public static readonly Credentials Default = new("COURSE_POSTGRES_USER", "COURSE_POSTGRES_PASSWORD");
+
+        /// <summary>Отдельный набор роли публикации, которым пользуются только команды action *.</summary>
+        public static readonly Credentials Publication = new("COURSE_PUBLISHER_USER", "COURSE_PUBLISHER_PASSWORD");
+
+        /// <summary>
+        /// Набор публикации, если он задан, иначе основной. Возврат к основному нужен для
+        /// совместимости: контур, развёрнутый до разделения ролей, продолжает работать на одних
+        /// учётных данных, просто без выигрыша от разделения.
+        /// </summary>
+        public static Credentials PublicationOrDefault()
+            => string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(Publication.UserVariable))
+                ? Default
+                : Publication;
+    }
+
     /// <summary>
     /// Строит строку подключения к PostgreSQL. Если задана переменная окружения
     /// COURSE_POSTGRES_CONNECTION целиком — используется она; иначе строка собирается из
-    /// отдельных переменных (хост, порт, база, логин, пароль).
+    /// отдельных переменных (хост, порт, база, логин, пароль), причём логин и пароль берутся из
+    /// переменных запрошенного набора учётных данных.
     /// </summary>
-    public static string ConnectionString(int connectTimeoutSeconds, int commandTimeoutSeconds, int maxPoolSize)
+    public static string ConnectionString(
+        int connectTimeoutSeconds,
+        int commandTimeoutSeconds,
+        int maxPoolSize,
+        Credentials? credentials = null)
     {
+        credentials ??= Credentials.Default;
+
         var explicitConnection = Environment.GetEnvironmentVariable("COURSE_POSTGRES_CONNECTION");
         var builder = string.IsNullOrWhiteSpace(explicitConnection)
             ? new NpgsqlConnectionStringBuilder
@@ -26,8 +53,8 @@ public static class CourseDatabase
                 Host = Env.Optional("COURSE_POSTGRES_HOST", "postgres"),
                 Port = Env.OptionalInt("COURSE_POSTGRES_PORT", 5432),
                 Database = Env.Optional("COURSE_POSTGRES_DB", "course"),
-                Username = Env.Require("COURSE_POSTGRES_USER"),
-                Password = Env.Require("COURSE_POSTGRES_PASSWORD"),
+                Username = Env.Require(credentials.UserVariable),
+                Password = Env.Require(credentials.PasswordVariable),
             }
             : new NpgsqlConnectionStringBuilder(explicitConnection);
 
@@ -49,10 +76,11 @@ public static class CourseDatabase
     public static NpgsqlDataSource CreateDataSource(
         int connectTimeoutSeconds = 3,
         int commandTimeoutSeconds = 30,
-        int maxPoolSize = 40)
+        int maxPoolSize = 40,
+        Credentials? credentials = null)
     {
         var builder = new NpgsqlDataSourceBuilder(
-            ConnectionString(connectTimeoutSeconds, commandTimeoutSeconds, maxPoolSize));
+            ConnectionString(connectTimeoutSeconds, commandTimeoutSeconds, maxPoolSize, credentials));
         return builder.Build();
     }
 }

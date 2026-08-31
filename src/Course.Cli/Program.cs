@@ -105,7 +105,7 @@ internal static class CourseCli
             throw new CliException(ContractCodes.RequestInvalid, "migration apply requires a directory");
         }
 
-        await using var dataSource = CreateDataSource();
+        await using var dataSource = CreateMigrationDataSource();
         return await new MigrationRunner(dataSource).ApplyAsync(positional[2], cancellationToken);
     }
 
@@ -141,14 +141,14 @@ internal static class CourseCli
         }
 
         var manifest = ManifestReader.Read(positional[2]);
-        await using var dataSource = CreateDataSource();
+        await using var dataSource = CreatePublicationDataSource();
         return await new CatalogClient(dataSource).PublishAsync(manifest, cancellationToken);
     }
 
     /// <summary>Команда "action list": выводит все опубликованные версии всех действий.</summary>
     private static async Task<JsonObject> ActionListAsync(CancellationToken cancellationToken)
     {
-        await using var dataSource = CreateDataSource();
+        await using var dataSource = CreatePublicationDataSource();
         return await new CatalogClient(dataSource).ListAsync(cancellationToken);
     }
 
@@ -164,7 +164,7 @@ internal static class CourseCli
             throw new CliException(ContractCodes.RequestInvalid, "action activate requires --version <version>");
         }
 
-        await using var dataSource = CreateDataSource();
+        await using var dataSource = CreatePublicationDataSource();
         return await new CatalogClient(dataSource).ActivateAsync(module, action, version, cancellationToken);
     }
 
@@ -191,7 +191,7 @@ internal static class CourseCli
             replacement = parsed;
         }
 
-        await using var dataSource = CreateDataSource();
+        await using var dataSource = CreatePublicationDataSource();
         return await new CatalogClient(dataSource).DisableAsync(module, action, version, replacement, cancellationToken);
     }
 
@@ -207,12 +207,15 @@ internal static class CourseCli
         var migrations = Env.Optional("COURSE_BOOTSTRAP_MIGRATIONS", "/app/db/migrations");
         var actions = Env.Optional("COURSE_BOOTSTRAP_ACTIONS", "/app/db/actions");
 
-        await using var dataSource = CreateDataSource();
-        await WaitForDatabaseAsync(dataSource, cancellationToken);
+        // Bootstrap — единственное место, где нужны оба набора учётных данных сразу: структуру
+        // базы накатывает роль миграций, а встроенные манифесты публикует роль публикации.
+        await using var migrationSource = CreateMigrationDataSource();
+        await WaitForDatabaseAsync(migrationSource, cancellationToken);
 
-        var migration = await new MigrationRunner(dataSource).ApplyAsync(migrations, cancellationToken);
+        var migration = await new MigrationRunner(migrationSource).ApplyAsync(migrations, cancellationToken);
 
-        var catalog = new CatalogClient(dataSource);
+        await using var publicationSource = CreatePublicationDataSource();
+        var catalog = new CatalogClient(publicationSource);
         var published = new JsonArray();
         var directory = new DirectoryInfo(actions);
         if (directory.Exists)
@@ -277,15 +280,28 @@ internal static class CourseCli
     }
 
     /// <summary>
-    /// Создаёт подключение к базе от лица роли публикации (course_migrator) — заведомо не той
-    /// роли, под которой работает HTTP runtime (course_runtime). Именно так на уровне
-    /// инфраструктуры обеспечивается требование "runtime никогда не получает migration credentials".
+    /// Подключение от лица роли МИГРАЦИЙ (course_migrator). Она член course_owner, потому что DDL
+    /// требует прав владельца, и именно поэтому её учётные данные нужны как можно реже — только
+    /// команде migration apply. Роль runtime (course_runtime) их не получает никогда.
     /// </summary>
-    private static NpgsqlDataSource CreateDataSource()
+    private static NpgsqlDataSource CreateMigrationDataSource()
         => CourseDatabase.CreateDataSource(
             connectTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_CONNECT_TIMEOUT", 5),
             commandTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_COMMAND_TIMEOUT", 120),
             maxPoolSize: 4);
+
+    /// <summary>
+    /// Подключение от лица роли ПУБЛИКАЦИИ (course_publisher). Ей выданы EXECUTE ровно на пять
+    /// функций управления каталогом — ни DDL, ни доступа к предметным таблицам, ни api.invoke.
+    /// Если переменные публикации не заданы, используется основной набор: контур, развёрнутый до
+    /// разделения ролей, продолжает работать, просто без выигрыша от разделения.
+    /// </summary>
+    private static NpgsqlDataSource CreatePublicationDataSource()
+        => CourseDatabase.CreateDataSource(
+            connectTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_CONNECT_TIMEOUT", 5),
+            commandTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_COMMAND_TIMEOUT", 120),
+            maxPoolSize: 4,
+            credentials: CourseDatabase.Credentials.PublicationOrDefault());
 
     /// <summary>Печатает итоговый JSON-конверт в реальный stdout (переданный отдельно от подменённого Console.Out).</summary>
     private static void Write(TextWriter stdout, JsonNode envelope)

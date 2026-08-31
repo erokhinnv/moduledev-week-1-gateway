@@ -67,6 +67,31 @@ public sealed class CatalogClient(NpgsqlDataSource dataSource)
         CancellationToken cancellationToken,
         params NpgsqlParameter[] parameters)
     {
+        // Команды каталога сериализованы по маршруту advisory-блокировкой (007_catalog_serialization),
+        // но конкурентный доступ всё ещё может закончиться отказом сериализации или обнаруженной
+        // взаимоблокировкой. Это не ошибка вызывающего: PostgreSQL сама отменила одну из
+        // конкурирующих транзакций, и правильная реакция — повторить, а не показать ошибку.
+        const int maxAttempts = 3;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await CallOnceAsync(sql, cancellationToken, parameters);
+            }
+            catch (Exception exception)
+                when (attempt < maxAttempts && PostgresFailure.IsTransientConflict(exception))
+            {
+                Console.Error.WriteLine($"retrying catalog command after a concurrency conflict, attempt {attempt}");
+                await Task.Delay(TimeSpan.FromMilliseconds(50 * attempt), cancellationToken);
+            }
+        }
+    }
+
+    private async Task<JsonObject> CallOnceAsync(
+        string sql,
+        CancellationToken cancellationToken,
+        params NpgsqlParameter[] parameters)
+    {
         await using var command = dataSource.CreateCommand(sql);
         foreach (var parameter in parameters)
         {

@@ -112,9 +112,38 @@ public sealed class OpenApiBuilderTests
         Assert.False(KeyIsRequired(optional, "/api/operation/get"));
     }
 
+    [Fact]
+    public void ExactVersionDocumentPinsTheVersionHeader()
+    {
+        // Версионный документ описывает ровно одну версию, поэтому клиент, сгенерированный по
+        // нему, обязан передать именно её: иначе он имел бы право заголовок опустить и уехать
+        // в версию по умолчанию со схемами из документа другой версии.
+        var document = OpenApiBuilder.VersionDocument(Manifest("opencheck", "probe", 2));
+        var header = VersionHeader(document, "/api/opencheck/probe");
+
+        Assert.True(header["required"]!.GetValue<bool>());
+        Assert.Equal(2, header["schema"]!["const"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public void DefaultDocumentLeavesTheVersionHeaderOptional()
+    {
+        // Сводный документ, наоборот, описывает вызов БЕЗ заголовка.
+        var document = OpenApiBuilder.DefaultDocument([Manifest("payment", "request", 1)]);
+        var header = VersionHeader(document, "/api/payment/request");
+
+        Assert.False(header["required"]!.GetValue<bool>());
+        Assert.Null(header["schema"]!["const"]);
+    }
+
     /// <summary>Ищет в OpenAPI-документе параметр заголовка Idempotency-Key и возвращает, помечен ли он как обязательный.</summary>
     private static bool KeyIsRequired(JsonObject document, string path)
         => document["paths"]![path]!["post"]!["parameters"]!.AsArray()
             .Any(parameter => parameter!["name"]!.GetValue<string>() == "Idempotency-Key"
                               && parameter["required"]!.GetValue<bool>());
+
+    /// <summary>Достаёт из документа описание заголовка X-Action-Version.</summary>
+    private static JsonNode VersionHeader(JsonObject document, string path)
+        => document["paths"]![path]!["post"]!["parameters"]!.AsArray()
+            .First(parameter => parameter!["name"]!.GetValue<string>() == "X-Action-Version")!;
 }

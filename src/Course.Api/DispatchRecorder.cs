@@ -34,7 +34,12 @@ public sealed class DispatchRecorder(
     DependencyState dependencyState,
     ILogger<DispatchRecorder> logger)
 {
-    public async Task RecordAsync(DispatchEvidence evidence, CancellationToken cancellationToken)
+    /// <summary>
+    /// Пишет один след. Токена отмены у метода нет намеренно: след живёт дольше клиентского
+    /// соединения и ограничен только собственным дедлайном ниже — обрывать его из-за того, что
+    /// клиент отключился, было бы неверно, ведь предметный эффект уже зафиксирован.
+    /// </summary>
+    public async Task RecordAsync(DispatchEvidence evidence)
     {
         if (dependencyState.IsKnownUnavailable)
         {
@@ -61,11 +66,8 @@ public sealed class DispatchRecorder(
 
         try
         {
-            // Запись следа не должна зависеть от того, что клиентское HTTP-соединение уже
-            // закрылось (CancellationToken.None вместо токена запроса) — она переживает клиента
-            // и ограничена только собственным коротким дедлайном в 5 секунд.
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(CancellationToken.None);
-            deadline.CancelAfter(TimeSpan.FromSeconds(5));
+            // Собственный короткий дедлайн в 5 секунд — единственное, что ограничивает запись.
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
             await using var command = dataSource.CreateCommand("SELECT api.record_dispatch($1)");
             command.Parameters.Add(ActionCatalog.Jsonb(payload.ToJsonString()));

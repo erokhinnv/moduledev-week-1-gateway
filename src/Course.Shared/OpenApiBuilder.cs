@@ -26,7 +26,7 @@ public static class OpenApiBuilder
         var paths = new JsonObject();
         foreach (var manifest in manifests.OrderBy(item => item.HttpPath, StringComparer.Ordinal))
         {
-            paths[manifest.HttpPath] = new JsonObject { ["post"] = Operation(manifest) };
+            paths[manifest.HttpPath] = new JsonObject { ["post"] = Operation(manifest, exactVersion: false) };
         }
 
         return Document(
@@ -45,7 +45,7 @@ public static class OpenApiBuilder
     {
         var paths = new JsonObject
         {
-            [manifest.HttpPath] = new JsonObject { ["post"] = Operation(manifest) },
+            [manifest.HttpPath] = new JsonObject { ["post"] = Operation(manifest, exactVersion: true) },
         };
 
         return Document(
@@ -72,8 +72,12 @@ public static class OpenApiBuilder
             },
         };
 
-    /// <summary>Описание одной HTTP-операции (POST) для одного действия: параметры, тело запроса, ответы.</summary>
-    private static JsonObject Operation(ActionManifest manifest)
+    /// <summary>
+    /// Описание одной HTTP-операции (POST) для одного действия: параметры, тело запроса, ответы.
+    /// <paramref name="exactVersion"/> различает два вида документов: версионный описывает ровно
+    /// одну версию и обязывает клиента передать её явно, сводный описывает вызов без заголовка.
+    /// </summary>
+    private static JsonObject Operation(ActionManifest manifest, bool exactVersion)
     {
         var operation = new JsonObject
         {
@@ -85,7 +89,7 @@ public static class OpenApiBuilder
                 $"Idempotency: {manifest.IdempotencyMode} ({manifest.IdempotencyScope}). " +
                 $"Deadline: {manifest.TimeoutMs} ms.",
             ["tags"] = new JsonArray(manifest.Module),
-            ["parameters"] = Parameters(manifest),
+            ["parameters"] = Parameters(manifest, exactVersion),
             ["requestBody"] = new JsonObject
             {
                 ["required"] = true,
@@ -111,17 +115,37 @@ public static class OpenApiBuilder
         return operation;
     }
 
-    /// <summary>Заголовки запроса, общие для любого действия: X-Action-Version и Idempotency-Key.</summary>
-    private static JsonArray Parameters(ActionManifest manifest)
+    /// <summary>
+    /// Заголовки запроса, общие для любого действия: X-Action-Version и Idempotency-Key.
+    ///
+    /// Версионный документ описывает ровно одну версию, поэтому заголовок в нём обязателен и
+    /// зафиксирован константой: иначе сгенерированный по такому документу клиент имел бы полное
+    /// право заголовок не отправить и уехать в версию по умолчанию — со схемами из документа
+    /// совсем другой версии. Сводный документ, наоборот, описывает именно вызов без заголовка.
+    /// </summary>
+    private static JsonArray Parameters(ActionManifest manifest, bool exactVersion)
         => new(
-            new JsonObject
-            {
-                ["name"] = "X-Action-Version",
-                ["in"] = "header",
-                ["required"] = false,
-                ["description"] = "Explicit action version. Without the header the default version is selected.",
-                ["schema"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1 },
-            },
+            exactVersion
+                ? new JsonObject
+                {
+                    ["name"] = "X-Action-Version",
+                    ["in"] = "header",
+                    ["required"] = true,
+                    ["description"] =
+                        $"This document describes exactly version {manifest.Version}. " +
+                        "The header must carry that version.",
+                    ["schema"] = new JsonObject { ["type"] = "integer", ["const"] = manifest.Version },
+                }
+                : new JsonObject
+                {
+                    ["name"] = "X-Action-Version",
+                    ["in"] = "header",
+                    ["required"] = false,
+                    ["description"] =
+                        "Omit the header to invoke the default version documented here, " +
+                        "or send an explicit version to select another published version.",
+                    ["schema"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1 },
+                },
             new JsonObject
             {
                 ["name"] = "Idempotency-Key",

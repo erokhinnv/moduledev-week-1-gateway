@@ -39,6 +39,27 @@ public static class PostgresFailure
     }
 
     /// <summary>
+    /// Распознаёт конфликт параллельного доступа, который имеет смысл повторить.
+    ///
+    /// 40001 (serialization_failure) и 40P01 (deadlock_detected) — это не поломка и не ошибка
+    /// вызывающего: PostgreSQL сама отменила одну из конкурирующих транзакций, чтобы разрешить
+    /// конфликт. Правильная реакция на такой отказ — повторить операцию, а не показать ошибку.
+    /// Актуально для команд каталога, которые конкурируют за один и тот же маршрут.
+    /// </summary>
+    public static bool IsTransientConflict(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is PostgresException postgres)
+            {
+                return postgres.SqlState is "40001" or "40P01";
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Переводит SQL-состояние (SQLSTATE) PostgreSQL в код ошибки контракта. Коды SQLSTATE — это
     /// стандартизированные пятисимвольные коды, определённые стандартом SQL и документацией
     /// PostgreSQL (https://www.postgresql.org/docs/current/errcodes-appendix.html).

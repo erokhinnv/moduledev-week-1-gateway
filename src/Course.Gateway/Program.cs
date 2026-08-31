@@ -86,7 +86,10 @@ app.Use(async (context, next) =>
     }
     catch (Exception exception)
     {
-        app.Logger.LogError(exception, "gateway failure path={Path}", context.Request.Path);
+        app.Logger.LogError(
+            "gateway failure path={Path} failure={Failure}",
+            context.Request.Path,
+            Redaction.Describe(exception));
         await GatewayResponses.WriteAsync(
             context,
             500,

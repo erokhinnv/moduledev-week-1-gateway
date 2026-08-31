@@ -19,6 +19,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${COURSE_POSTGRES_PASSWORD:-course_local_superuser}
       COURSE_MIGRATOR_PASSWORD: ${COURSE_MIGRATOR_PASSWORD:-course_local_migrator}
+      COURSE_PUBLISHER_PASSWORD: ${COURSE_PUBLISHER_PASSWORD:-course_local_publisher}
       COURSE_RUNTIME_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
       POSTGRES_INITDB_ARGS: --data-checksums
     volumes:
@@ -41,13 +42,17 @@ services:
       context: .
       dockerfile: docker/cli.Dockerfile
     environment:
-      # cli подключается к базе от лица роли ПУБЛИКАЦИИ (course_migrator) — именно эти учётные
-      # данные никогда не передаются сервису api.
       COURSE_POSTGRES_HOST: postgres
       COURSE_POSTGRES_PORT: 5432
       COURSE_POSTGRES_DB: course
+      # Роль МИГРАЦИЙ: нужна только команде migration apply, потому что DDL требует прав
+      # владельца. Сервису api эти учётные данные не передаются никогда.
       COURSE_POSTGRES_USER: course_migrator
       COURSE_POSTGRES_PASSWORD: ${COURSE_MIGRATOR_PASSWORD:-course_local_migrator}
+      # Роль ПУБЛИКАЦИИ: под ней идут все команды action *. Ей выданы EXECUTE ровно на пять
+      # функций управления каталогом — ни DDL, ни предметных таблиц, ни api.invoke.
+      COURSE_PUBLISHER_USER: course_publisher
+      COURSE_PUBLISHER_PASSWORD: ${COURSE_PUBLISHER_PASSWORD:-course_local_publisher}
       COURSE_APPLICATION_NAME: course-cli
     depends_on:
       postgres:

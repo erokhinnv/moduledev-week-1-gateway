@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Course.Shared;
@@ -31,12 +32,24 @@ public sealed record ActionResponse(int Status, JsonObject Body);
 public sealed class ActionRuntime(
     ActionCatalog catalog,
     JwtValidator jwtValidator,
-    DispatchRecorder dispatchRecorder,
+    DispatchQueue dispatchQueue,
     DependencyState dependencyState,
     NpgsqlDataSource dataSource,
     ILogger<ActionRuntime> logger)
 {
     private const int MaxIdempotencyKeyLength = 128;
+
+    /// <summary>
+    /// Верхняя граница размера конверта, возвращённого api.invoke.
+    ///
+    /// Тело запроса ограничено Kestrel, а вот результат действия до сих пор не был ограничен
+    /// ничем: манифест может объявить схему ответа без верхних границ длины, и тогда одна
+    /// зарегистрированная функция способна вернуть сколь угодно большой JSON. Строку из
+    /// PostgreSQL к моменту проверки уже материализовал драйвер, но отсечка ДО разбора избавляет
+    /// от заведомо более дорогих стадий: построения дерева JsonNode, обхода валидатором схемы и
+    /// повторной сериализации в ответ.
+    /// </summary>
+    private static readonly int MaxResultBytes = Env.OptionalInt("COURSE_MAX_RESULT_BYTES", 512 * 1024);
 
     /// <summary>
     /// Главная точка входа: обрабатывает один HTTP-запрос к маршруту POST /api/{module}/{action}
@@ -146,11 +159,31 @@ public sealed class ActionRuntime(
                     payloadDocument.RootElement,
                     correlationId,
                     evidence,
+                    started,
                     cancellationToken);
 
                 evidence.DurationMs = (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-                await dispatchRecorder.RecordAsync(evidence, cancellationToken);
+                // След ставится в очередь, а не пишется здесь: коммит уже состоялся, и заставлять
+                // клиента ждать вспомогательную запись нечестно — см. DispatchQueue.
+                await dispatchQueue.EnqueueAsync(evidence);
                 return response;
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Истёк наш собственный бюджет времени, а не оборвалось соединение с клиентом:
+                // клиент всё ещё ждёт ответа и по контракту обязан получить 504, а не 500.
+                logger.LogWarning(
+                    "action deadline reached correlationId={CorrelationId} route={Module}.{Action}",
+                    correlationId,
+                    module,
+                    action);
+
+                evidence.Status = "ERROR";
+                evidence.ErrorCode = ContractCodes.ActionTimeout;
+                evidence.DurationMs = (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                await dispatchQueue.EnqueueAsync(evidence);
+
+                return Failure(ContractCodes.ActionTimeout, "action deadline was reached", correlationId, evidence.Version);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
@@ -164,18 +197,20 @@ public sealed class ActionRuntime(
                     dependencyState.MarkUnavailable();
                 }
 
+                // В журнал уходит только тип сбоя и SQLSTATE: сообщение PostgreSQL при нарушении
+                // ограничения содержит значения ключа, то есть фрагмент полезной нагрузки.
                 logger.LogError(
-                    exception,
-                    "action failed correlationId={CorrelationId} route={Module}.{Action} code={Code}",
+                    "action failed correlationId={CorrelationId} route={Module}.{Action} code={Code} failure={Failure}",
                     correlationId,
                     module,
                     action,
-                    code);
+                    code,
+                    Redaction.Describe(exception));
 
                 evidence.Status = "ERROR";
                 evidence.ErrorCode = code;
                 evidence.DurationMs = (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-                await dispatchRecorder.RecordAsync(evidence, cancellationToken);
+                await dispatchQueue.EnqueueAsync(evidence);
 
                 return Failure(code, DescribeTechnicalFailure(code), correlationId, evidence.Version);
             }
@@ -195,6 +230,7 @@ public sealed class ActionRuntime(
         JsonElement payload,
         Guid correlationId,
         DispatchEvidence evidence,
+        long startedAt,
         CancellationToken cancellationToken)
     {
         // Шаг 5. Target (целевая функция) разрешается ТОЛЬКО из неизменяемого каталога действий.
@@ -265,11 +301,26 @@ public sealed class ActionRuntime(
                 details: SchemaValidator.Details(violations));
         }
 
-        // Шаг 9. Формирование серверного (доверенного) контекста. Поля тела запроса НИКОГДА не
+        // Шаг 9. Бюджет времени на весь запрос.
+        //
+        // timeout_ms манифеста — это бюджет ВСЕГО запроса, а не одного лишь вызова функции.
+        // Поэтому из него вычитается уже потраченное: разрешение манифеста, проверка политики и
+        // валидация схемы. Остаток и есть то, что реально осталось на работу с базой, включая
+        // ожидание свободного соединения в пуле. Раньше эти стадии в бюджет не входили, из-за
+        // чего фактическая длительность запроса могла заметно превышать объявленную манифестом.
+        var remaining = TimeSpan.FromMilliseconds(manifest.TimeoutMs) - Stopwatch.GetElapsedTime(startedAt);
+        if (remaining <= TimeSpan.Zero)
+        {
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.ActionTimeout;
+            return Failure(ContractCodes.ActionTimeout, "action deadline was reached", correlationId, manifest.Version);
+        }
+
+        // Шаг 10. Формирование серверного (доверенного) контекста. Поля тела запроса НИКОГДА не
         // могут повлиять на его содержимое — даже если payload случайно (или намеренно) содержит
         // поле "principal" или "scopes", оно будет просто проигнорировано: контекст строится
         // исключительно из проверенного identity и данных манифеста.
-        var deadline = DateTimeOffset.UtcNow.AddMilliseconds(manifest.TimeoutMs);
+        var deadline = DateTimeOffset.UtcNow.Add(remaining);
         var context = new JsonObject
         {
             ["principal"] = identity.Principal,
@@ -280,20 +331,28 @@ public sealed class ActionRuntime(
             ["deadline"] = deadline.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"),
         };
 
-        // Шаг 10. Один и только один вызов к базе на весь предметный эффект: открываем
+        // Шаг 11. Один и только один вызов к базе на весь предметный эффект: открываем
         // транзакцию, вызываем api.invoke, проверяем контракт результата и только после этого
         // делаем commit. Если что-то пойдёт не так на любом из следующих под-шагов — вся
         // транзакция откатывается целиком (rollback), и никакого частичного эффекта не остаётся.
-        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        //
+        // Единый бюджет на всю работу с базой: он связан с токеном запроса (отключился клиент —
+        // прекращаем) и вдобавок сам истекает по остатку от timeout_ms. Под него попадает и
+        // ожидание свободного соединения в пуле, которое раньше не ограничивалось ничем.
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(remaining);
+
+        await using var connection = await dataSource.OpenConnectionAsync(budget.Token);
+        await using var transaction = await connection.BeginTransactionAsync(budget.Token);
 
         // SET LOCAL statement_timeout действует только внутри этой транзакции: если PostgreSQL не
-        // успевает выполнить запрос за отведённое манифестом время, он сам прервёт выполнение с
-        // SQL-состоянием 57014 (query_canceled), которое затем превращается в 504 action.timeout.
+        // успевает выполнить запрос за отведённое время, он сам прервёт выполнение с SQL-состоянием
+        // 57014 (query_canceled), которое затем превращается в 504 action.timeout. Значение — тот
+        // же остаток бюджета, поэтому отсечка со стороны базы и со стороны C# согласованы.
         await using (var deadlineCommand = new NpgsqlCommand(
-            $"SET LOCAL statement_timeout = {manifest.TimeoutMs}", connection, transaction))
+            $"SET LOCAL statement_timeout = {(int)remaining.TotalMilliseconds}", connection, transaction))
         {
-            await deadlineCommand.ExecuteNonQueryAsync(cancellationToken);
+            await deadlineCommand.ExecuteNonQueryAsync(budget.Token);
         }
 
         string? envelopeText;
@@ -302,18 +361,44 @@ public sealed class ActionRuntime(
         {
             invoke.Parameters.Add(ActionCatalog.Text(module));
             invoke.Parameters.Add(ActionCatalog.Text(action));
-            invoke.Parameters.Add(ActionCatalog.Integer(requestedVersion));
+            // Передаётся ИМЕННО разрешённая версия, а не то, что прислал клиент.
+            //
+            // Раньше сюда уходил requestedVersion, то есть null при отсутствии заголовка
+            // X-Action-Version, и PostgreSQL разрешала default-версию заново. Между разрешением
+            // манифеста выше (строка resolve) и этим вызовом конкурентная команда activate могла
+            // переключить default — и тогда payload, проверенный схемой версии A, доставался
+            // функции версии B, а ответ проверялся снова схемой A. Классическая гонка
+            // "проверили одно, выполнили другое" (TOCTOU).
+            //
+            // Явная версия закрывает окно полностью: выполняется ровно та версия, по схеме и
+            // политике которой запрос был проверен. Если версию успели выключить, invoke ответит
+            // action.not_found — это корректный отказ, а не исполнение чужой версии.
+            invoke.Parameters.Add(ActionCatalog.Integer(manifest.Version));
             invoke.Parameters.Add(ActionCatalog.Jsonb(context.ToJsonString()));
             invoke.Parameters.Add(ActionCatalog.Jsonb(payload.GetRawText()));
-            invoke.CommandTimeout = (manifest.TimeoutMs / 1000) + 10;
-            envelopeText = await invoke.ExecuteScalarAsync(cancellationToken) as string;
+            // Грубая страховка на уровне драйвера поверх точного бюджета budget.Token.
+            invoke.CommandTimeout = (int)Math.Ceiling(remaining.TotalSeconds) + 5;
+            envelopeText = await invoke.ExecuteScalarAsync(budget.Token) as string;
+        }
+
+        // Отсечка по размеру до разбора: см. комментарий у MaxResultBytes.
+        if (envelopeText is not null && Encoding.UTF8.GetByteCount(envelopeText) > MaxResultBytes)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.ContractViolation;
+            return Failure(
+                ContractCodes.ContractViolation,
+                "action result exceeds the configured size limit",
+                correlationId,
+                manifest.Version);
         }
 
         if (envelopeText is null || JsonNode.Parse(envelopeText) is not JsonObject envelope)
         {
             // api.invoke обязан вернуть валидный JSON-конверт. Если этого не произошло —
             // это нарушение контракта самой функции каталога, а не предметной ошибки клиента.
-            await transaction.RollbackAsync(cancellationToken);
+            await transaction.RollbackAsync(CancellationToken.None);
             evidence.Status = "ERROR";
             evidence.ErrorCode = ContractCodes.ContractViolation;
             return Failure(ContractCodes.ContractViolation, "action returned a non contractual envelope", correlationId, manifest.Version);
@@ -325,7 +410,7 @@ public sealed class ActionRuntime(
             // ЕЩЁ ДО того, как клиенту будет отправлен ответ. Например, если платёжная функция
             // вернула ошибку уже после того, как успела что-то вставить в таблицу — эта вставка
             // будет отменена транзакцией целиком.
-            await transaction.RollbackAsync(cancellationToken);
+            await transaction.RollbackAsync(CancellationToken.None);
 
             var code = envelope["code"]?.GetValue<string>() ?? ContractCodes.InternalError;
             var message = envelope["message"]?.GetValue<string>() ?? "action returned a domain error";
@@ -339,50 +424,96 @@ public sealed class ActionRuntime(
                 Envelope.Error(code, message, correlationId, manifest.Version, retryable));
         }
 
+        // Признак повтора по ключу идемпотентности. Такой результат был исполнен и полностью
+        // проверен РАНЬШЕ — возможно, другой версией действия, если с тех пор сменилась версия
+        // по умолчанию. Мерить его сегодняшним манифестом нельзя: список исходов и схема ответа
+        // у текущей версии могут быть другими, и честный сохранённый результат выглядел бы
+        // нарушением контракта.
+        var replayed = envelope["replayed"] is JsonValue replayFlag &&
+                       replayFlag.TryGetValue<bool>(out var replayValue) &&
+                       replayValue;
+
+        int? executedVersion = null;
+        if (envelope["meta"]?["actionVersion"] is JsonValue versionValue &&
+            versionValue.TryGetValue<int>(out var parsedExecutedVersion))
+        {
+            executedVersion = parsedExecutedVersion;
+        }
+
+        // Страховка к явной версии, переданной выше: свежее исполнение обязано подтвердить, что
+        // отработала именно та версия, по схеме и политике которой запрос был проверен. Для
+        // повтора это требование неприменимо — там версия заведомо своя, историческая.
+        if (!replayed && executedVersion != manifest.Version)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            evidence.Status = "ERROR";
+            evidence.ErrorCode = ContractCodes.ContractViolation;
+            return Failure(
+                ContractCodes.ContractViolation,
+                "action was executed under a different version than the one validated",
+                correlationId,
+                manifest.Version);
+        }
+
+        // Наружу и в технический след идёт версия, которая результат действительно произвела.
+        var reportedVersion = executedVersion ?? manifest.Version;
+        evidence.Version = reportedVersion;
+
         var outcome = envelope["outcome"]?.GetValue<string>();
         var result = envelope["result"];
 
-        // Исход (outcome) обязан входить в список outcomes, объявленный в манифесте действия.
-        // Если функция вернула какой-то другой, неизвестный исход — это тоже откат и 500-я ошибка
-        // action.contract_violation, а не тихое принятие непредвиденного результата.
-        if (outcome is null || !manifest.Outcomes.Contains(outcome, StringComparer.Ordinal))
+        if (outcome is null || result is not JsonObject)
         {
-            await transaction.RollbackAsync(cancellationToken);
+            await transaction.RollbackAsync(CancellationToken.None);
             evidence.Status = "ERROR";
             evidence.ErrorCode = ContractCodes.ContractViolation;
-            return Failure(ContractCodes.ContractViolation, "action returned an undeclared outcome", correlationId, manifest.Version);
+            return Failure(ContractCodes.ContractViolation, "action returned a non contractual result", correlationId, reportedVersion);
         }
 
-        // Результат (result) обязан пройти проверку по response_schema манифеста — точно так же,
-        // как payload запроса проверялся по request_schema на шаге 8. Опять же, любое нарушение —
-        // это полный откат.
-        if (result is not JsonObject ||
-            !SchemaValidator.TryValidate(manifest.ResponseSchema, result, out _))
+        if (!replayed)
         {
-            await transaction.RollbackAsync(cancellationToken);
-            evidence.Status = "ERROR";
-            evidence.ErrorCode = ContractCodes.ContractViolation;
-            return Failure(ContractCodes.ContractViolation, "action result does not match the response schema", correlationId, manifest.Version);
+            // Исход (outcome) обязан входить в список outcomes, объявленный в манифесте действия.
+            // Если функция вернула какой-то другой, неизвестный исход — это откат и 500-я ошибка
+            // action.contract_violation, а не тихое принятие непредвиденного результата.
+            if (!manifest.Outcomes.Contains(outcome, StringComparer.Ordinal))
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+                evidence.Status = "ERROR";
+                evidence.ErrorCode = ContractCodes.ContractViolation;
+                return Failure(ContractCodes.ContractViolation, "action returned an undeclared outcome", correlationId, manifest.Version);
+            }
+
+            // Результат (result) обязан пройти проверку по response_schema манифеста — точно так
+            // же, как payload запроса проверялся по request_schema на шаге 8. Любое нарушение —
+            // это полный откат.
+            if (!SchemaValidator.TryValidate(manifest.ResponseSchema, result, out _))
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+                evidence.Status = "ERROR";
+                evidence.ErrorCode = ContractCodes.ContractViolation;
+                return Failure(ContractCodes.ContractViolation, "action result does not match the response schema", correlationId, manifest.Version);
+            }
         }
 
         // Все проверки пройдены — теперь и только теперь фиксируем транзакцию.
-        await transaction.CommitAsync(cancellationToken);
+        await transaction.CommitAsync(budget.Token);
 
         dependencyState.MarkAvailable();
         evidence.Status = "OK";
         evidence.Outcome = outcome;
 
         logger.LogInformation(
-            "action completed correlationId={CorrelationId} route={Module}.{Action} version={Version} outcome={Outcome}",
+            "action completed correlationId={CorrelationId} route={Module}.{Action} version={Version} outcome={Outcome} replayed={Replayed}",
             correlationId,
             module,
             action,
-            manifest.Version,
-            outcome);
+            reportedVersion,
+            outcome,
+            replayed);
 
         return new ActionResponse(
             StatusCodes.Status200OK,
-            Envelope.Success(outcome, result.DeepClone(), correlationId, manifest.Version));
+            Envelope.Success(outcome, result.DeepClone(), correlationId, reportedVersion));
     }
 
     /// <summary>Строит ответ об ошибке в едином формате контракта, автоматически проставляя признак "можно повторить" для временных сбоев.</summary>

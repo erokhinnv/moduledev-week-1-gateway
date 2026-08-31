@@ -37,6 +37,10 @@ builder.Services.AddSingleton(_ => CourseDatabase.CreateDataSource(
 builder.Services.AddSingleton<DependencyState>();
 builder.Services.AddSingleton<ActionCatalog>();
 builder.Services.AddSingleton<DispatchRecorder>();
+// Очередь регистрируется и как обычная зависимость (её пополняет ActionRuntime), и как фоновая
+// служба (она же разбирает очередь) — оба обращения обязаны попасть в ОДИН экземпляр.
+builder.Services.AddSingleton<DispatchQueue>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<DispatchQueue>());
 builder.Services.AddSingleton<ReadinessProbe>();
 builder.Services.AddSingleton<ActionRuntime>();
 
@@ -62,7 +66,11 @@ app.Use(async (context, next) =>
     {
         var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
         var correlationId = Guid.NewGuid();
-        logger.LogError(exception, "unhandled failure correlationId={CorrelationId}", correlationId);
+        // Только тип сбоя и SQLSTATE — сообщения PostgreSQL умеют содержать значения данных.
+        logger.LogError(
+            "unhandled failure correlationId={CorrelationId} failure={Failure}",
+            correlationId,
+            Redaction.Describe(exception));
         await WriteAsync(
             context,
             500,
