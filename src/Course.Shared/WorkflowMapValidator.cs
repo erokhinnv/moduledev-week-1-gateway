@@ -112,23 +112,14 @@ public static class WorkflowMapValidator
             }
         }
 
-        // 5. Тип сигнала однозначно определяет шаг ожидания. Принятый сигнал адресуется типом, а
-        //    не шагом, поэтому два wait_signal одного типа сделали бы получателя раннего сигнала
-        //    зависящим от порядка обхода — то есть неопределённым.
-        var duplicateSignals = map.Steps
-            .Where(step => step.Type == WorkflowStepType.WaitSignal && step.SignalType is not null)
-            .GroupBy(step => step.SignalType!, StringComparer.Ordinal)
-            .Where(group => group.Count() > 1)
-            .Select(group => group.Key)
-            .Order(StringComparer.Ordinal)
-            .ToArray();
-        if (duplicateSignals.Length > 0)
-        {
-            violations.Add(
-                $"signal types are declared by more than one wait_signal step: {string.Join(", ", duplicateSignals)}");
-        }
+        // Повторяющийся signal_type среди шагов ожидания НЕ запрещается. Соблазн был: два таких
+        // шага выглядят двусмысленно. Но двусмысленности нет — граф ацикличен, за один проход
+        // процесс входит либо в один шаг (взаимоисключающие ветки), либо в оба по очереди
+        // (последовательные), а накопленные сигналы применяются в порядке получения. Запрет
+        // отклонял бы карту, валидную по контракту курса, а лишняя строгость валидатора — это
+        // такое же нарушение контракта, как и недостающая проверка.
 
-        // 6. Контракт действия каждой automatic-задачи: существование, включённость, точное
+        // 5. Контракт действия каждой automatic-задачи: существование, включённость, точное
         //    совпадение policy, достаточность server-side scopes исполнителя и идемпотентность.
         var stepOutcomes = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.Ordinal);
         foreach (var step in map.Steps)
@@ -142,7 +133,7 @@ public static class WorkflowMapValidator
             stepOutcomes[step.Key] = step.DeclaredOutcomes(actionOutcomes);
         }
 
-        // 7. Ровно один переход на каждый объявленный исход и ни одного лишнего перехода.
+        // 6. Ровно один переход на каждый объявленный исход и ни одного лишнего перехода.
         violations.AddRange(ValidateOutcomeCoverage(map, steps, stepOutcomes));
 
         if (violations.Count > 0)
@@ -150,7 +141,7 @@ public static class WorkflowMapValidator
             return violations;
         }
 
-        // 8. Достижимость, ацикличность и отсутствие тупиков считаются только на связном графе,
+        // 7. Достижимость, ацикличность и отсутствие тупиков считаются только на связном графе,
         //    иначе диагностика превращается в шум от уже найденных ошибок.
         violations.AddRange(ValidateGraph(map, steps));
 

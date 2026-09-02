@@ -149,36 +149,6 @@ public sealed class WorkflowMapTests
         Assert.Contains(violations, item => item.Contains("idempotency_mode 'none'", StringComparison.Ordinal));
     }
 
-    /// <summary>
-    /// Сигнал адресуется типом, а не шагом. Два ожидания одного типа сделали бы получателя
-    /// раннего сигнала зависящим от порядка обхода карты.
-    /// </summary>
-    [Fact]
-    public void TwoWaitStepsCannotShareOneSignalType()
-    {
-        var document = WorkflowMapReader.ReadDocument(Path.Combine(FixtureRoot, "3c363d117b40-v1.flow.json"));
-
-        // Ручной шаг превращается во второе ожидание того же типа: граф остаётся корректным,
-        // ломается только однозначность адресации сигнала.
-        var steps = document["steps"]!.AsArray();
-        var manual = steps.First(step => step!["type"]!.GetValue<string>() == "manual")!.AsObject();
-        var manualKey = manual["key"]!.GetValue<string>();
-        var manualOutcome = manual["allowed_outcomes"]!.AsArray()[0]!.GetValue<string>();
-        var index = steps.IndexOf(manual);
-        steps.RemoveAt(index);
-        steps.Insert(index, new JsonObject
-        {
-            ["key"] = manualKey,
-            ["type"] = "wait_signal",
-            ["signal_type"] = "signal_f21581.received_f1fa89",
-            ["outcome"] = manualOutcome,
-        });
-
-        var violations = WorkflowMapValidator.Validate(WorkflowMap.FromDocument(document), Facts);
-
-        Assert.Contains(violations, item => item.Contains("more than one wait_signal step", StringComparison.Ordinal));
-    }
-
     private static string Canonical(JsonNode node)
     {
         switch (node)

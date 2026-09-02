@@ -25,6 +25,11 @@ public static class CourseDatabase
         /// Набор роли ОПЕРАЦИЙ: им идут команды, двигающие процессы (start, signal, get и проба
         /// fencing). Публиковать карты или действия эта роль не может — разделение ровно обратное
         /// роли публикации, чтобы ни один набор учётных данных не давал и определения, и исполнение.
+        ///
+        /// Отката к набору публикации здесь СОЗНАТЕЛЬНО нет: у публикатора отозваны права на
+        /// запуск процессов и приём сигналов, поэтому «тихий откат» дал бы не работу без выигрыша
+        /// от разделения, а отказ по правам в середине команды. Отсутствие переменных должно быть
+        /// понятной ошибкой конфигурации, а не отложенным сюрпризом.
         /// </summary>
         public static readonly Credentials Operation = new("COURSE_OPERATOR_USER", "COURSE_OPERATOR_PASSWORD");
 
@@ -37,16 +42,6 @@ public static class CourseDatabase
             => string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(Publication.UserVariable))
                 ? Default
                 : Publication;
-
-        /// <summary>
-        /// Набор операций, если он задан, иначе набор публикации. Тот же приём совместимости:
-        /// контур, развёрнутый до появления роли оператора, продолжает работать на прежних
-        /// учётных данных — просто без выигрыша от разделения.
-        /// </summary>
-        public static Credentials OperationOrPublication()
-            => string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(Operation.UserVariable))
-                ? PublicationOrDefault()
-                : Operation;
     }
 
     /// <summary>

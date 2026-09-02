@@ -217,8 +217,11 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 envelope = await invoke.ExecuteScalarAsync(cancellationToken) as string;
             }
 
+            // Закреплённая картой версия передаётся и в api.invoke, и в разбор конверта: исход,
+            // пришедший от другой версии действия, обязан быть нарушением контракта, а не тихо
+            // принятым результатом.
             var outcome = RegisteredAction.Interpret(
-                envelope, job.Outcomes, job.ResponseSchema, options.MaxResultBytes);
+                envelope, job.Outcomes, job.ResponseSchema, options.MaxResultBytes, job.ActionVersion);
 
             if (outcome.Status != RegisteredActionStatus.Succeeded)
             {
@@ -231,7 +234,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
                     false,
                     outcome.Code,
                     outcome.Status == RegisteredActionStatus.DomainError && outcome.Retryable,
-                    Dispatch(job, correlationId, payloadHash, outcome.ActionVersion, started));
+                    Dispatch(job, correlationId, payloadHash, outcome.ActionVersion, started, succeeded: false));
             }
 
             // Failpoint «после действия, до завершения»: эффект уже выполнен ВНУТРИ транзакции,
@@ -245,7 +248,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 connection, transaction, $"SET LOCAL statement_timeout = {options.FinishTimeoutMs}", cancellationToken);
 
             var durationMs = (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            var dispatch = Dispatch(job, correlationId, payloadHash, outcome.ActionVersion, started);
+            var dispatch = Dispatch(job, correlationId, payloadHash, outcome.ActionVersion, started, succeeded: true);
 
             var finish = await FinishAsync(connection, transaction, job, outcome, dispatch, cancellationToken);
             if (finish?["status"]?.GetValue<string>() != "ok")
@@ -271,7 +274,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 false,
                 ContractCodes.ActionTimeout,
                 true,
-                Dispatch(job, correlationId, payloadHash, job.ActionVersion, started));
+                Dispatch(job, correlationId, payloadHash, job.ActionVersion, started, succeeded: false));
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -280,7 +283,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 false,
                 ContractCodes.ActionTimeout,
                 true,
-                Dispatch(job, correlationId, payloadHash, job.ActionVersion, started));
+                Dispatch(job, correlationId, payloadHash, job.ActionVersion, started, succeeded: false));
         }
         catch (PostgresException exception)
         {
@@ -313,11 +316,17 @@ public sealed class WorkflowWorker(WorkerOptions options)
         Guid correlationId,
         string payloadHash,
         int? executedVersion,
-        long startedAt)
+        long startedAt,
+        bool succeeded)
         => new()
         {
             ["correlationId"] = correlationId.ToString(),
-            ["requestId"] = job.ExecutionId.ToString(),
+            // Успешный вызов адресуется executionId: это ключ идемпотентности зафиксированного
+            // предметного эффекта, и по нему след связывается с самим эффектом. Откаченный вызов
+            // эффекта не создал, и тот же ключ у него означал бы несуществующую связь — поэтому
+            // неуспех адресуется попыткой. Заодно это единственный ключ, по которому у одного
+            // executionId не может оказаться двух записей об одном исполнении.
+            ["requestId"] = succeeded ? job.ExecutionId.ToString() : job.AttemptId.ToString(),
             ["module"] = job.Module,
             ["action"] = job.Action,
             ["version"] = executedVersion ?? job.ActionVersion,

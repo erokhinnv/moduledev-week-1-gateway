@@ -28,9 +28,17 @@ DECLARE
     -- payload, проверку схемы запроса и саму границу завершения.
     c_lease_margin_ms constant integer := 500;
 
+    -- Во сколько раз производный срок аренды может превысить настроенный профилем. Без потолка
+    -- срок становился бы функцией карты: задача с бюджетом в десятки секунд отодвигала бы
+    -- перехват настолько же, и наблюдаемое время восстановления перестало бы зависеть от
+    -- профиля вообще. Свыше потолка защита от повторного эффекта держится не арендой, а
+    -- ключом идемпотентности действия и абсолютным потолком попыток.
+    c_lease_factor constant integer := 3;
+
     v_now        timestamptz := clock_timestamp();
     v_floor_ms   integer := greatest(coalesce(p_lease_ms, 30000), 250);
     v_lease      interval;
+    v_lease_ms   integer;
     v_limit      integer := least(greatest(coalesce(p_limit, 1), 1), 16);
     v_ids        uuid[];
     v_id         uuid;
@@ -38,6 +46,7 @@ DECLARE
     v_task       workflow.task_definition%ROWTYPE;
     v_attempt_id uuid;
     v_expired    integer;
+    v_setting    workflow.runtime_setting%ROWTYPE;
     v_cap        integer;
     v_descriptor jsonb;
     v_result     jsonb := '[]'::jsonb;
@@ -62,6 +71,8 @@ BEGIN
         RETURN v_result;
     END IF;
 
+    SELECT * INTO v_setting FROM workflow.runtime_setting WHERE singleton;
+
     FOREACH v_id IN ARRAY v_ids
     LOOP
         -- Закреплённый картой контракт задачи нужен ДО выдачи аренды: из него берётся бюджет
@@ -75,8 +86,11 @@ BEGIN
         -- Абсолютный потолок попыток. Бюджет max_attempts тратят только отказы действия,
         -- поэтому сбой, который не доходит до fail_job (например исключение внутри границы
         -- завершения), иначе перезахватывался бы вечно. Потолок делает такой job наблюдаемо
-        -- мёртвым вместо бесконечно живого.
-        v_cap := greatest(coalesce(v_task.max_attempts, 1) * 3, 10);
+        -- мёртвым вместо бесконечно живого — и помечается ОТДЕЛЬНОЙ причиной смерти, чтобы не
+        -- выдавать «задание не доходит до отчёта» за «действие стабильно отказывает».
+        v_cap := greatest(
+            coalesce(v_task.max_attempts, 1) * v_setting.attempt_ceiling_factor,
+            v_setting.attempt_ceiling_minimum);
 
         SELECT * INTO v_job FROM workflow.workflow_job WHERE job_id = v_id;
 
@@ -86,38 +100,49 @@ BEGIN
             WHERE job_id = v_id AND status = 'RUNNING';
 
             UPDATE workflow.workflow_job
-            SET state = 'DEAD', lease_owner = NULL, lease_until = NULL, updated_at = now()
+            SET state = 'DEAD',
+                dead_reason = 'attempt_ceiling',
+                lease_owner = NULL,
+                lease_until = NULL,
+                updated_at = now()
             WHERE job_id = v_id;
 
             UPDATE workflow.step_instance
             SET state = 'FAILED', completed_at = clock_timestamp()
-            WHERE step_instance_id = v_job.step_instance_id AND state <> 'FAILED';
+            WHERE step_instance_id = v_job.step_instance_id
+              AND state NOT IN ('COMPLETED', 'FAILED');
 
             UPDATE workflow.process_instance
             SET state = 'FAILED', updated_at = now()
-            WHERE process_id = v_job.process_id AND state <> 'FAILED';
+            WHERE process_id = v_job.process_id
+              AND state NOT IN ('COMPLETED', 'FAILED');
 
             PERFORM workflow.record_event(
-                v_job.process_id, v_job.step_instance_id, 'TaskFailed',
+                v_job.process_id, v_job.step_instance_id, 'TaskAbandoned',
                 jsonb_build_object(
                     'jobId', v_job.job_id,
-                    'errorCode', 'workflow.attempt_limit_exhausted',
-                    'attemptCount', v_job.attempt_count
+                    'errorCode', 'workflow.attempt_ceiling_reached',
+                    'attemptCount', v_job.attempt_count,
+                    'attemptCeiling', v_cap
                 )
             );
             PERFORM workflow.record_event(
                 v_job.process_id, v_job.step_instance_id, 'ProcessFailed',
-                jsonb_build_object('errorCode', 'workflow.attempt_limit_exhausted')
+                jsonb_build_object('errorCode', 'workflow.attempt_ceiling_reached')
             );
 
             CONTINUE;
         END IF;
 
-        -- Аренда обязана переживать объявленный бюджет действия. Иначе второй исполнитель
-        -- перехватывает задание на середине работы первого, оба уходят в один и тот же
-        -- executionId и упираются в строку идемпотентности друг друга.
-        v_lease := make_interval(
-            secs => greatest(v_floor_ms, coalesce(v_task.timeout_ms, 0) + c_lease_margin_ms) / 1000.0);
+        -- Аренда должна переживать объявленный бюджет действия, иначе второй исполнитель
+        -- перехватывает задание на середине работы первого. Но не любой ценой: сверху срок
+        -- ограничен кратностью к профилю, чтобы карта не могла задать наблюдаемое время
+        -- восстановления. За этим потолком повторное исполнение безопасно по другой причине —
+        -- executionId остаётся ключом идемпотентности предметного эффекта.
+        v_lease_ms := least(
+            greatest(v_floor_ms, coalesce(v_task.timeout_ms, 0) + c_lease_margin_ms),
+            v_floor_ms * c_lease_factor);
+        v_lease := make_interval(secs => v_lease_ms / 1000.0);
 
         -- Истёкшая аренда оставляет попытку в статусе STALE: она увеличила attempt_count, но
         -- НЕ расходует бюджет отказов max_attempts — сбоя действия не было, было исчезновение
@@ -406,7 +431,15 @@ BEGIN
     -- транзакцией действия, поэтому переживает откат предметного эффекта. Строка появляется
     -- только если действие реально вызывалось: отказ маппинга или недоступность версии не
     -- являются вызовом и следа не оставляют.
-    IF p_dispatch IS NOT NULL AND jsonb_typeof(p_dispatch) = 'object' THEN
+    -- След неуспеха вспомогательный, поэтому кривой аргумент не должен ронять запись самой
+    -- попытки: тогда задание осталось бы арендованным и ушло в перезахват. У успешного
+    -- завершения (finish_job) обратный приоритет — там след обязателен, и его потеря должна
+    -- быть громкой, а не тихой.
+    IF p_dispatch IS NOT NULL
+       AND jsonb_typeof(p_dispatch) = 'object'
+       AND (p_dispatch ->> 'correlationId') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+       AND (p_dispatch ->> 'payloadHash') ~ '^[0-9a-f]{64}$'
+    THEN
         INSERT INTO api.dispatch (
             correlation_id, request_id, module, action, version,
             principal, consumer, payload_hash, status, error_code, duration_ms
@@ -460,18 +493,24 @@ BEGIN
 
     UPDATE workflow.workflow_job
     SET state = 'DEAD',
+        dead_reason = 'failure_budget',
         failure_count = v_failures,
         lease_until = NULL,
         updated_at = now()
     WHERE job_id = v_job.job_id;
 
+    -- Уже завершённые шаг и процесс не переписываются: в текущей модели у процесса не бывает
+    -- второго задания, но опираться на свойство графа там, где хватает условия запроса, значит
+    -- переносить хрупкость на будущие карты.
     UPDATE workflow.step_instance
     SET state = 'FAILED', completed_at = clock_timestamp()
-    WHERE step_instance_id = v_job.step_instance_id;
+    WHERE step_instance_id = v_job.step_instance_id
+      AND state NOT IN ('COMPLETED', 'FAILED');
 
     UPDATE workflow.process_instance
     SET state = 'FAILED', updated_at = now()
-    WHERE process_id = v_job.process_id;
+    WHERE process_id = v_job.process_id
+      AND state NOT IN ('COMPLETED', 'FAILED');
 
     PERFORM workflow.record_event(
         v_job.process_id, v_job.step_instance_id, 'TaskFailed',

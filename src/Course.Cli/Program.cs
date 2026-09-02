@@ -618,7 +618,7 @@ internal static class CourseCli
             connectTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_CONNECT_TIMEOUT", 5),
             commandTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_COMMAND_TIMEOUT", 120),
             maxPoolSize: 4,
-            credentials: CourseDatabase.Credentials.OperationOrPublication());
+            credentials: CourseDatabase.Credentials.Operation);
 
     /// <summary>Печатает итоговый JSON-конверт в реальный stdout (переданный отдельно от подменённого Console.Out).</summary>
     private static void Write(TextWriter stdout, JsonNode envelope)

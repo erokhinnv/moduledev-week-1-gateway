@@ -277,7 +277,16 @@ BEGIN
 
     v_hash := api.payload_hash(v_data);
 
-    SELECT * INTO v_flow FROM workflow.flow_definition WHERE flow_name = p_flow_name;
+    -- Разделяемая блокировка карты, а не исключительная: два старта разных business key
+    -- совместимы друг с другом и идут параллельно, но activate_flow берёт на этой же строке
+    -- исключительную блокировку — и потому не может переключить активную версию между её
+    -- чтением ниже и фиксацией процесса. Advisory-замок здесь сериализовал бы и старты между
+    -- собой, чего задача не требует.
+    SELECT * INTO v_flow
+    FROM workflow.flow_definition
+    WHERE flow_name = p_flow_name
+    FOR SHARE;
+
     IF NOT FOUND THEN
         RETURN workflow.failure('workflow.flow_not_found', 'flow is not published');
     END IF;
@@ -296,13 +305,6 @@ BEGIN
 
         RETURN workflow.ok(workflow.process_summary(v_process.process_id));
     END IF;
-
-    -- Выбор активной версии сериализуется с activate тем же advisory-замком по имени карты.
-    -- Без него процесс, вставка которого зафиксировалась ПОСЛЕ коммита activate, мог оказаться
-    -- закреплён за прежней версией, и утверждение «activate действует на новые экземпляры»
-    -- переставало быть точным на границе. Оба вызова берут этот замок первым, поэтому порядок
-    -- захвата одинаков и взаимоблокировки не возникает.
-    PERFORM pg_advisory_xact_lock(hashtext('workflow.flow'), hashtext(p_flow_name));
 
     SELECT * INTO v_version
     FROM workflow.flow_version

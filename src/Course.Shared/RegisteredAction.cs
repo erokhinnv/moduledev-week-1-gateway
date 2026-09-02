@@ -81,7 +81,8 @@ public static class RegisteredAction
         string? envelopeText,
         IReadOnlyList<string> declaredOutcomes,
         JsonNode? responseSchema,
-        int maxResultBytes)
+        int maxResultBytes,
+        int? expectedVersion = null)
     {
         if (envelopeText is null)
         {
@@ -135,6 +136,15 @@ public static class RegisteredAction
         // версией действия. Мерить его сегодняшним манифестом нельзя.
         if (!replayed)
         {
+            // Версия сверяется ПЕРВОЙ. Иначе исполнение чужой версии, вернувшее заодно чужой
+            // исход, диагностировалось бы как «необъявленный исход» — и подсказка уводила бы от
+            // настоящей причины ровно в том сценарии, ради которого сверка и существует.
+            if (expectedVersion is not null && version != expectedVersion)
+            {
+                return Violation(
+                    "action was executed under a different version than the one validated", version);
+            }
+
             if (!declaredOutcomes.Contains(outcome, StringComparer.Ordinal))
             {
                 return Violation("action returned an undeclared outcome", version);

@@ -84,7 +84,7 @@ sequenceDiagram
     participant P as PostgreSQL
 
     WA->>P: SELECT workflow.claim_jobs('worker-a', 1, lease)
-    P->>P: FOR UPDATE SKIP LOCKED; срок = max(lease, timeout_ms + запас); lease_version++; attempt_count++
+    P->>P: SKIP LOCKED; срок = min(max(lease, timeout_ms+запас), lease*3); lease_version++; attempt_count++
     P-->>WA: закреплённый контракт: версия действия, схемы, outcomes, policy, mapping, данные процесса
     WB->>P: SELECT workflow.claim_jobs('worker-b', 1, lease)
     P-->>WB: пусто, задание арендовано

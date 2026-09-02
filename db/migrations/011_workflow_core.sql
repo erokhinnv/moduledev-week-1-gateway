@@ -44,6 +44,12 @@ ON CONFLICT (principal) DO NOTHING;
 CREATE TABLE IF NOT EXISTS workflow.runtime_setting (
     singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     test_profile boolean NOT NULL DEFAULT false,
+    -- Абсолютный потолок попыток одного задания: max(max_attempts * factor, minimum). Бюджет
+    -- max_attempts тратят только отказы действия, поэтому сбой, не доходящий до fail_job,
+    -- иначе перезахватывался бы вечно. Значения вынесены сюда, а не зашиты в функцию: это
+    -- настройка эксплуатации, и её должно быть видно, не читая plpgsql.
+    attempt_ceiling_factor  integer NOT NULL DEFAULT 3 CHECK (attempt_ceiling_factor >= 1),
+    attempt_ceiling_minimum integer NOT NULL DEFAULT 10 CHECK (attempt_ceiling_minimum >= 1),
     updated_at   timestamptz NOT NULL DEFAULT now()
 );
 
@@ -228,8 +234,13 @@ CREATE TABLE IF NOT EXISTS workflow.workflow_job (
     attempt_count    integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     failure_count    integer NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
     next_attempt_at  timestamptz NOT NULL DEFAULT now(),
+    -- Почему задание умерло. Две причины смерти наблюдаемо разные: исчерпанный бюджет отказов
+    -- действия и абсолютный потолок попыток. Смешивать их в одном DEAD означало бы прятать
+    -- разницу между «действие стабильно отказывает» и «задание вообще не доходит до отчёта».
+    dead_reason      text CHECK (dead_reason IN ('failure_budget', 'attempt_ceiling')),
     created_at       timestamptz NOT NULL DEFAULT now(),
-    updated_at       timestamptz NOT NULL DEFAULT now()
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT workflow_job_dead_reason CHECK (state <> 'DEAD' OR dead_reason IS NOT NULL)
 );
 
 -- Индексы очереди: ровно те предикаты, по которым читает короткая транзакция claim.

@@ -219,15 +219,20 @@ DECLARE
     v_flow_id    uuid;
     v_version_id uuid;
 BEGIN
+    -- Исключительная блокировка карты: она конфликтует с разделяемой, которую берёт
+    -- start_process, поэтому переключение активной версии не может вклиниться между чтением
+    -- версии и фиксацией нового процесса. Advisory-замок дополнительно сериализует активацию
+    -- с публикацией новых версий той же карты.
+    PERFORM pg_advisory_xact_lock(hashtext('workflow.flow'), hashtext(p_flow_name));
+
     SELECT flow_id INTO v_flow_id
     FROM workflow.flow_definition
-    WHERE flow_name = p_flow_name;
+    WHERE flow_name = p_flow_name
+    FOR UPDATE;
 
     IF NOT FOUND THEN
         RETURN workflow.failure('workflow.flow_not_found', 'flow is not published');
     END IF;
-
-    PERFORM pg_advisory_xact_lock(hashtext('workflow.flow'), hashtext(p_flow_name));
 
     SELECT flow_version_id INTO v_version_id
     FROM workflow.flow_version

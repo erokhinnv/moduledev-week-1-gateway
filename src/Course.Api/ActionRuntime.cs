@@ -384,8 +384,11 @@ public sealed class ActionRuntime(
         // предметной ошибкой и нарушением контракта» обязаны совпадать дословно на обоих путях
         // исполнения одного и того же действия. Держать их в двух местах означало бы рано или
         // поздно разойтись в трактовке одного конверта.
+        // Ожидаемая версия передаётся внутрь: свежее исполнение обязано подтвердить, что
+        // отработала именно та версия, по схеме и политике которой запрос был проверен. Для
+        // повтора требование неприменимо — там версия заведомо своя, историческая.
         var interpreted = RegisteredAction.Interpret(
-            envelopeText, manifest.Outcomes, manifest.ResponseSchema, MaxResultBytes);
+            envelopeText, manifest.Outcomes, manifest.ResponseSchema, MaxResultBytes, manifest.Version);
 
         if (interpreted.Status == RegisteredActionStatus.ContractViolation)
         {
@@ -419,22 +422,6 @@ public sealed class ActionRuntime(
                     correlationId,
                     manifest.Version,
                     interpreted.Retryable));
-        }
-
-        // Страховка к явной версии, переданной выше: свежее исполнение обязано подтвердить, что
-        // отработала именно та версия, по схеме и политике которой запрос был проверен. Для
-        // повтора это требование неприменимо — там версия заведомо своя, историческая, и мерить
-        // сохранённый результат сегодняшним манифестом нельзя.
-        if (!interpreted.Replayed && interpreted.ActionVersion != manifest.Version)
-        {
-            await transaction.RollbackAsync(CancellationToken.None);
-            evidence.Status = "ERROR";
-            evidence.ErrorCode = ContractCodes.ContractViolation;
-            return Failure(
-                ContractCodes.ContractViolation,
-                "action was executed under a different version than the one validated",
-                correlationId,
-                manifest.Version);
         }
 
         // Наружу и в технический след идёт версия, которая результат действительно произвела.

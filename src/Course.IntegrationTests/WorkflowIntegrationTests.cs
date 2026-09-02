@@ -235,10 +235,17 @@ public sealed class WorkflowIntegrationTests
             $"SELECT state FROM autocheck.jobs WHERE process_id = '{processId}';");
         Assert.Equal("DEAD", job.Output.Trim());
 
-        var failed = IntegrationEnvironment.Psql(
+        // Причина смерти обязана отличаться от исчерпанного бюджета отказов: задание не «стабильно
+        // отказывает», оно вообще не доходит до отчёта, и путать это в диагностике нельзя.
+        var reason = IntegrationEnvironment.Psql(
+            "SELECT j.dead_reason FROM workflow.workflow_job j " +
+            $"WHERE j.process_id = '{processId}';");
+        Assert.Equal("attempt_ceiling", reason.Output.Trim());
+
+        var abandoned = IntegrationEnvironment.Psql(
             "SELECT count(*) FROM autocheck.workflow_events " +
-            $"WHERE process_id = '{processId}' AND event_type = 'TaskFailed';");
-        Assert.NotEqual("0", failed.Output.Trim());
+            $"WHERE process_id = '{processId}' AND event_type = 'TaskAbandoned';");
+        Assert.NotEqual("0", abandoned.Output.Trim());
     }
 
     [SkippableFact]
