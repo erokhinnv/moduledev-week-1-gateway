@@ -129,6 +129,15 @@ public sealed class WorkflowIntegrationTests
             "SELECT workflow.start_process('workflow-smoke', 'forged', '{}'::jsonb);",
             role: "workflow_worker");
         Assert.NotEqual(0, start.ExitCode);
+
+        // Встроенное действие-проба объявлено SECURITY DEFINER и пишет в таблицу. Права PUBLIC на
+        // него отзываются ЯВНО, в той же миграции, где оно создано: общий REVOKE перечисляет схемы
+        // поимённо и по построению не может покрыть схему, добавленную следующей миграцией.
+        var probeAccess = IntegrationEnvironment.Psql(
+            "SELECT has_function_privilege('public', 'training.canary_v1(jsonb,jsonb)', 'EXECUTE')::text " +
+            "|| ' ' || has_schema_privilege('public', 'training', 'USAGE')::text;");
+        Assert.Equal(0, probeAccess.ExitCode);
+        Assert.Equal("false false", LastLine(probeAccess.Output));
     }
 
     /// <summary>
@@ -495,6 +504,8 @@ public sealed class WorkflowIntegrationTests
     [InlineData("UPDATE workflow.step_instance SET step_key = 'rewritten'")]
     [InlineData("DELETE FROM workflow.process_instance")]
     [InlineData("DELETE FROM workflow.workflow_job")]
+    [InlineData("DELETE FROM workflow.worker_principal")]
+    [InlineData("UPDATE workflow.step_instance SET step_type = 'MANUAL'")]
     public void StateIdentityCannotBeRewrittenEvenByTheOwner(string statement)
     {
         Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
@@ -589,6 +600,140 @@ public sealed class WorkflowIntegrationTests
             "AND event_type IN ('TaskAttemptFailed', 'TaskFailed', 'TaskAbandoned');");
         Assert.Equal(0, events.ExitCode);
         Assert.Equal("TaskAttemptFailed,TaskFailed", LastLine(events.Output));
+    }
+
+    /// <summary>
+    /// Закрепление процесса за версией карты — главное обещание версионирования: активация другой
+    /// версии меняет выбор только для НОВЫХ экземпляров. Обещание держит триггер, и подменять
+    /// нужно на РЕАЛЬНО существующую версию: подмена на случайный uuid упёрлась бы во внешний ключ
+    /// и тест проходил бы по неверной причине — даже если бы триггер убрали.
+    /// </summary>
+    [SkippableFact]
+    public void ThePinnedFlowVersionOfALiveProcessCannotBeSwitched()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var processId = StartSmokeProcess($"itest-pin-{Guid.NewGuid():N}");
+
+        // Обе версии карты опубликованы, поэтому «чужая, но существующая» версия точно есть.
+        var other = IntegrationEnvironment.Psql(
+            "SELECT count(*) FROM workflow.flow_version v " +
+            "JOIN workflow.process_instance p ON p.flow_id = v.flow_id " +
+            $"WHERE p.process_id = '{processId}' AND v.flow_version_id <> p.flow_version_id;");
+        Assert.Equal(0, other.ExitCode);
+        Assert.NotEqual("0", LastLine(other.Output));
+
+        var switched = IntegrationEnvironment.Psql(
+            "UPDATE workflow.process_instance p SET flow_version_id = (" +
+            "  SELECT v.flow_version_id FROM workflow.flow_version v " +
+            "  WHERE v.flow_id = p.flow_id AND v.flow_version_id <> p.flow_version_id LIMIT 1) " +
+            $"WHERE p.process_id = '{processId}';");
+
+        Assert.NotEqual(0, switched.ExitCode);
+    }
+
+    /// <summary>
+    /// Принятый сигнал — доказательство идемпотентной доставки: именно с его отпечатком
+    /// сравнивается повтор, чтобы отличить дубликат от конфликта. Переписанный отпечаток превратил
+    /// бы конфликт в дубликат, переписанный процесс перенёс бы сообщение на чужой процесс, а
+    /// повторное открытие применённого сигнала позволило бы применить его дважды.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("UPDATE workflow.workflow_signal SET body_hash = repeat('c', 64)")]
+    [InlineData("UPDATE workflow.workflow_signal SET process_id = gen_random_uuid()")]
+    [InlineData("UPDATE workflow.workflow_signal SET signal_type = 'other.type'")]
+    [InlineData("UPDATE workflow.workflow_signal SET status = 'ACCEPTED', applied_at = NULL")]
+    [InlineData("DELETE FROM workflow.workflow_signal")]
+    public void AnAcceptedSignalCannotBeRewritten(string statement)
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        // Сигнал обязан существовать и быть УЖЕ ПРИМЕНЁННЫМ: только тогда осмысленна и попытка
+        // переписать его тело, и попытка открыть его заново.
+        var businessKey = $"itest-signal-immutable-{Guid.NewGuid():N}";
+        var processId = StartSmokeProcess(businessKey);
+        Assert.True(WaitForState(processId, "WAITING_SIGNAL"), "process did not reach WAITING_SIGNAL");
+
+        var messageId = $"itest-immutable-{Guid.NewGuid():N}";
+        var accepted = IntegrationEnvironment.Psql(
+            $"SELECT workflow.accept_signal('{processId}', 'training.completed', '{messageId}', " +
+            "'{}'::jsonb) ->> 'status';");
+        Assert.Equal(0, accepted.ExitCode);
+        Assert.Equal("ok", LastLine(accepted.Output));
+
+        var applied = IntegrationEnvironment.Psql(
+            $"SELECT status FROM autocheck.signals WHERE message_id = '{messageId}';");
+        Assert.Equal("APPLIED", LastLine(applied.Output));
+
+        var rewrite = IntegrationEnvironment.Psql($"{statement} WHERE message_id = '{messageId}';");
+
+        Assert.NotEqual(0, rewrite.ExitCode);
+    }
+
+    /// <summary>
+    /// Форма шага закреплена ограничениями САМОЙ таблицы, а не только проверками функции
+    /// публикации: это последний рубеж для строки, вставленной в обход всего остального.
+    /// Проверка идёт внутри транзакции с откатом — определения карт удалять нельзя, и тест не
+    /// имеет права оставлять за собой опубликованную версию.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("wait_signal без signal_type", "'WAIT_SIGNAL', NULL, 'GO', '[]'")]
+    [InlineData("wait_signal без outcome", "'WAIT_SIGNAL', 'a.b', NULL, '[]'")]
+    [InlineData("end без outcome", "'END', NULL, NULL, '[]'")]
+    [InlineData("manual с пустым списком исходов", "'MANUAL', NULL, NULL, '[]'")]
+    [InlineData("automatic с чужими полями", "'AUTOMATIC', 'a.b', 'GO', '[]'")]
+    public void StepShapeIsEnforcedByTheTableItself(string reason, string columns)
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var name = $"itest-shape-{Guid.NewGuid():N}".Substring(0, 40);
+        var probe = IntegrationEnvironment.Psql(
+            "BEGIN; " +
+            "WITH f AS (" +
+            $"  INSERT INTO workflow.flow_definition (flow_name) VALUES ('{name}') RETURNING flow_id), " +
+            "v AS (" +
+            "  INSERT INTO workflow.flow_version (flow_id, version, start_step_key, map, map_hash) " +
+            $"  SELECT flow_id, 1, 's', '{{}}'::jsonb, repeat('a', 64) FROM f RETURNING flow_version_id) " +
+            "INSERT INTO workflow.step_definition " +
+            "  (flow_version_id, step_key, step_type, signal_type, outcome, allowed_outcomes) " +
+            $"SELECT flow_version_id, 's', {columns}::jsonb FROM v; " +
+            "ROLLBACK;");
+
+        Assert.True(probe.ExitCode != 0, $"хранилище приняло шаг: {reason}");
+    }
+
+    /// <summary>
+    /// Абсолютный потолок попыток не имеет права зависеть от того, лежит ли в таблице строка
+    /// настроек: предохранитель, исчезающий вместе со строкой данных, — это не предохранитель.
+    /// Всё внутри одной транзакции с откатом, поэтому настройки контура остаются нетронутыми.
+    /// </summary>
+    [SkippableFact]
+    public void TheAttemptCeilingSurvivesAMissingSettingsRow()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var processId = StartSmokeProcess($"itest-ceiling-nosettings-{Guid.NewGuid():N}");
+        Assert.True(WaitForState(processId, "WAITING_SIGNAL"), "process did not reach WAITING_SIGNAL");
+
+        var probe = IntegrationEnvironment.Psql(
+            "BEGIN; " +
+            "DELETE FROM workflow.runtime_setting; " +
+            "UPDATE workflow.workflow_job SET state = 'READY', attempt_count = 999, " +
+            "  lease_owner = NULL, lease_until = NULL, next_attempt_at = now() " +
+            $"WHERE process_id = '{processId}'; " +
+            "SELECT jsonb_array_length(workflow.claim_jobs('itest-nosettings', 1, 1000)); " +
+            "SELECT state || ' ' || coalesce(dead_reason, '-') FROM workflow.workflow_job " +
+            $"WHERE process_id = '{processId}'; " +
+            "ROLLBACK;");
+
+        Assert.Equal(0, probe.ExitCode);
+
+        // Последняя строка вывода — тег ROLLBACK, поэтому результат ищется по всему выводу.
+        Assert.Contains("DEAD attempt_ceiling", probe.Output, StringComparison.Ordinal);
+
+        // Откат обязан вернуть строку настроек на место: иначе тест сломал бы контур соседям.
+        var settings = IntegrationEnvironment.Psql("SELECT count(*) FROM workflow.runtime_setting;");
+        Assert.Equal("1", LastLine(settings.Output));
     }
 
     /// <summary>Последняя непустая строка вывода psql — сам результат, без эха служебных команд.</summary>

@@ -29,7 +29,11 @@ public sealed class WorkerOptions
     /// <summary>Имя активного failpoint или пустая строка.</summary>
     public required string Failpoint { get; init; }
 
-    /// <summary>Бюджет времени на завершение задания после успешного действия.</summary>
+    /// <summary>
+    /// ПОТОЛОК бюджета границы завершения, а не сам бюджет: фактический считается из остатка
+    /// аренды (см. <see cref="LeaseBudget"/>). Раньше это значение было бюджетом целиком, и в
+    /// тестовом профиле оно превышало всю аренду впятеро.
+    /// </summary>
     public int FinishTimeoutMs { get; init; } = 10_000;
 
     /// <summary>Верхняя граница размера конверта, возвращённого api.invoke.</summary>
