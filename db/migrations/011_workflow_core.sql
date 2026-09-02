@@ -33,6 +33,26 @@ INSERT INTO workflow.worker_principal (principal, consumer, scopes)
 VALUES ('workflow-worker', 'workflow-engine', '["workflow:execute", "workflow:read"]'::jsonb)
 ON CONFLICT (principal) DO NOTHING;
 
+-- Удалить эту строку нельзя. Дескриптор аренды собирается внутренним соединением с ней
+-- (см. claim_jobs в 013): без строки КАЖДЫЙ захват возвращал бы пустой дескриптор, исполнитель
+-- молча пропускал бы каждое задание, и вся очередь дошла бы до потолка попыток без единой записи
+-- о причине. Предохранитель ставится там, где возникает причина, а не там, где видно следствие.
+CREATE OR REPLACE FUNCTION workflow.worker_principal_no_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $fn$
+BEGIN
+    RAISE EXCEPTION 'the trusted worker principal cannot be deleted'
+        USING ERRCODE = 'restrict_violation';
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS worker_principal_no_delete ON workflow.worker_principal;
+CREATE TRIGGER worker_principal_no_delete
+    BEFORE DELETE ON workflow.worker_principal
+    FOR EACH ROW EXECUTE FUNCTION workflow.worker_principal_no_delete();
+
 -------------------------------------------------------------------------------
 -- Признак test profile, известный САМОЙ базе.
 --
@@ -134,7 +154,21 @@ CREATE TABLE IF NOT EXISTS workflow.step_definition (
     signal_type        text,
     outcome            text,
     allowed_outcomes   jsonb NOT NULL DEFAULT '[]'::jsonb,
-    CONSTRAINT step_definition_unique UNIQUE (flow_version_id, step_key)
+    CONSTRAINT step_definition_unique UNIQUE (flow_version_id, step_key),
+    -- Форма шага — часть контракта хранилища, а не соглашение вызывающего. Функция публикации
+    -- выдана ОТДЕЛЬНОЙ роли (см. 015), поэтому «карту уже проверила JSON Schema в CLI» здесь
+    -- доказательством не является: карта, пришедшая прямым вызовом workflow.publish_flow, обязана
+    -- пройти те же локальные инварианты. Достижимость и покрытие исходов остаются за валидатором —
+    -- это свойства графа, а не строки.
+    CONSTRAINT step_definition_signal_shape CHECK (
+        step_type <> 'WAIT_SIGNAL' OR (signal_type IS NOT NULL AND outcome IS NOT NULL)),
+    CONSTRAINT step_definition_end_shape CHECK (
+        step_type <> 'END' OR outcome IS NOT NULL),
+    CONSTRAINT step_definition_manual_shape CHECK (
+        step_type <> 'MANUAL' OR (
+            jsonb_typeof(allowed_outcomes) = 'array' AND jsonb_array_length(allowed_outcomes) >= 1)),
+    CONSTRAINT step_definition_automatic_shape CHECK (
+        step_type <> 'AUTOMATIC' OR (signal_type IS NULL AND outcome IS NULL))
 );
 
 DROP TRIGGER IF EXISTS step_definition_no_delete ON workflow.step_definition;
@@ -202,6 +236,41 @@ CREATE TABLE IF NOT EXISTS workflow.process_instance (
 
 CREATE INDEX IF NOT EXISTS process_instance_state ON workflow.process_instance (state);
 
+-- Закрепление за версией — не комментарий, а инвариант, и держать его обязано хранилище.
+-- Операционным состоянием процесса являются только state, current_step_key и updated_at; всё
+-- остальное — его личность. Переписанный data_hash сломал бы идемпотентность повторного запуска
+-- (см. 012), а переписанный flow_version_id перевёл бы живой процесс на чужую карту, и граница
+-- завершения начала бы искать переходы в ней.
+CREATE OR REPLACE FUNCTION workflow.process_instance_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $fn$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'process instances cannot be deleted'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    IF (NEW.process_id, NEW.flow_id, NEW.flow_version_id, NEW.business_key,
+        NEW.data, NEW.data_hash, NEW.created_at)
+       IS DISTINCT FROM
+       (OLD.process_id, OLD.flow_id, OLD.flow_version_id, OLD.business_key,
+        OLD.data, OLD.data_hash, OLD.created_at)
+    THEN
+        RAISE EXCEPTION 'process identity and pinned flow version are immutable'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS process_instance_identity ON workflow.process_instance;
+CREATE TRIGGER process_instance_identity
+    BEFORE UPDATE OR DELETE ON workflow.process_instance
+    FOR EACH ROW EXECUTE FUNCTION workflow.process_instance_identity();
+
 -- Карты ациклические, поэтому один шаг посещается не более одного раза за процесс: уникальность
 -- (process_id, step_key) превращает это свойство графа в гарантию хранилища.
 CREATE TABLE IF NOT EXISTS workflow.step_instance (
@@ -218,6 +287,38 @@ CREATE TABLE IF NOT EXISTS workflow.step_instance (
 );
 
 CREATE INDEX IF NOT EXISTS step_instance_process ON workflow.step_instance (process_id, entered_at);
+
+-- У экземпляра шага меняются только state, outcome и completed_at: чем этот шаг является и
+-- когда в него вошли — свершившийся факт.
+CREATE OR REPLACE FUNCTION workflow.step_instance_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $fn$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'step instances cannot be deleted'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    IF (NEW.step_instance_id, NEW.process_id, NEW.step_definition_id,
+        NEW.step_key, NEW.step_type, NEW.entered_at)
+       IS DISTINCT FROM
+       (OLD.step_instance_id, OLD.process_id, OLD.step_definition_id,
+        OLD.step_key, OLD.step_type, OLD.entered_at)
+    THEN
+        RAISE EXCEPTION 'step instance identity is immutable'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS step_instance_identity ON workflow.step_instance;
+CREATE TRIGGER step_instance_identity
+    BEFORE UPDATE OR DELETE ON workflow.step_instance
+    FOR EACH ROW EXECUTE FUNCTION workflow.step_instance_identity();
 
 -- Одна логическая работа одного automatic-шага. execution_id — стабильный ключ идемпотентности
 -- предметного эффекта: он не меняется ни при retry, ни при reclaim, поэтому повторный вызов
@@ -253,6 +354,44 @@ CREATE INDEX IF NOT EXISTS workflow_job_lease
     WHERE state = 'LEASED';
 
 CREATE INDEX IF NOT EXISTS workflow_job_process ON workflow.workflow_job (process_id);
+
+-- execution_id — ключ идемпотентности предметного эффекта, и на его неизменности держится всё
+-- рассуждение о безопасности доставки at-least-once. Если бы его можно было переписать, повторная
+-- попытка того же задания создала бы ВТОРОЙ эффект, а история осталась бы правдоподобной.
+CREATE OR REPLACE FUNCTION workflow.workflow_job_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $fn$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'workflow jobs cannot be deleted'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    IF (NEW.job_id, NEW.process_id, NEW.step_instance_id, NEW.execution_id, NEW.created_at)
+       IS DISTINCT FROM
+       (OLD.job_id, OLD.process_id, OLD.step_instance_id, OLD.execution_id, OLD.created_at)
+    THEN
+        RAISE EXCEPTION 'job identity and idempotency key are immutable'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    -- Версия аренды только растёт: убывающая версия обесценила бы fencing, потому что
+    -- «опоздавшее» завершение снова подошло бы под текущее право.
+    IF NEW.lease_version < OLD.lease_version THEN
+        RAISE EXCEPTION 'lease version cannot go backwards'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS workflow_job_identity ON workflow.workflow_job;
+CREATE TRIGGER workflow_job_identity
+    BEFORE UPDATE OR DELETE ON workflow.workflow_job
+    FOR EACH ROW EXECUTE FUNCTION workflow.workflow_job_identity();
 
 -- Попытка выполнения. Номер попытки растёт вместе с attempt_count, lease_version — вместе с
 -- правом на завершение. Строка попытки только дополняется: изменить её можно ровно один раз,
@@ -322,6 +461,43 @@ CREATE TABLE IF NOT EXISTS workflow.workflow_signal (
 CREATE INDEX IF NOT EXISTS workflow_signal_pending
     ON workflow.workflow_signal (process_id, signal_type, received_at)
     WHERE status = 'ACCEPTED';
+
+-- Принятый сигнал — доказательство идемпотентной доставки: именно с его body_hash сравнивается
+-- повтор, чтобы отличить дубликат от конфликта. Единственное допустимое изменение — однократный
+-- переход ACCEPTED -> APPLIED. Переписанный body_hash превратил бы конфликт в дубликат, а
+-- переписанный process_id перенёс бы принятое сообщение на чужой процесс.
+CREATE OR REPLACE FUNCTION workflow.workflow_signal_append_only()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $fn$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'accepted signals cannot be deleted'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    IF (NEW.message_id, NEW.process_id, NEW.signal_type, NEW.body, NEW.body_hash, NEW.received_at)
+       IS DISTINCT FROM
+       (OLD.message_id, OLD.process_id, OLD.signal_type, OLD.body, OLD.body_hash, OLD.received_at)
+    THEN
+        RAISE EXCEPTION 'accepted signal identity is immutable'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    IF OLD.status = 'APPLIED' AND NEW.status <> 'APPLIED' THEN
+        RAISE EXCEPTION 'an applied signal cannot be reopened'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS workflow_signal_append_only ON workflow.workflow_signal;
+CREATE TRIGGER workflow_signal_append_only
+    BEFORE UPDATE OR DELETE ON workflow.workflow_signal
+    FOR EACH ROW EXECUTE FUNCTION workflow.workflow_signal_append_only();
 
 -- История переходов только дополняется: ни UPDATE, ни DELETE не разрешены никому, включая владельца.
 CREATE TABLE IF NOT EXISTS workflow.workflow_event (

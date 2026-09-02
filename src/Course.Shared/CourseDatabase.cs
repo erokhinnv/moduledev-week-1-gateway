@@ -18,7 +18,16 @@ public static class CourseDatabase
         /// <summary>Основной набор: runtime для api, роль миграций для cli.</summary>
         public static readonly Credentials Default = new("COURSE_POSTGRES_USER", "COURSE_POSTGRES_PASSWORD");
 
-        /// <summary>Отдельный набор роли публикации, которым пользуются только команды action *.</summary>
+        /// <summary>
+        /// Набор роли ПУБЛИКАЦИИ: им идут команды каталога действий и карт процессов.
+        ///
+        /// Отката к основному набору здесь СОЗНАТЕЛЬНО нет, хотя технически он бы сработал: роль
+        /// миграций входит в course_owner и опубликовать может всё. Именно поэтому откат и опасен —
+        /// он не ломается, он молча возвращает объединение прав миграции и публикации, то есть
+        /// ровно то разделение, ради которого эти учётные данные и заведены. Граница безопасности,
+        /// исчезающая без единого признака, хуже отсутствующей: об отсутствующей хотя бы известно.
+        /// Незаданные переменные обязаны быть понятной ошибкой конфигурации — как и у роли операций.
+        /// </summary>
         public static readonly Credentials Publication = new("COURSE_PUBLISHER_USER", "COURSE_PUBLISHER_PASSWORD");
 
         /// <summary>
@@ -33,15 +42,6 @@ public static class CourseDatabase
         /// </summary>
         public static readonly Credentials Operation = new("COURSE_OPERATOR_USER", "COURSE_OPERATOR_PASSWORD");
 
-        /// <summary>
-        /// Набор публикации, если он задан, иначе основной. Возврат к основному нужен для
-        /// совместимости: контур, развёрнутый до разделения ролей, продолжает работать на одних
-        /// учётных данных, просто без выигрыша от разделения.
-        /// </summary>
-        public static Credentials PublicationOrDefault()
-            => string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(Publication.UserVariable))
-                ? Default
-                : Publication;
     }
 
     /// <summary>

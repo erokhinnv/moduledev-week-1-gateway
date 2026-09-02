@@ -21,6 +21,13 @@ public sealed class LeasedJob
 
     public required long LeaseVersion { get; init; }
 
+    /// <summary>
+    /// Момент, до которого действует право на завершение. Это не подсказка: всё, что исполнитель
+    /// делает СВЕРХ самого действия, обязано укладываться в остаток аренды, иначе работа идёт уже
+    /// после того, как задание может быть перехвачено.
+    /// </summary>
+    public required DateTimeOffset LeaseUntil { get; init; }
+
     public required Guid ProcessId { get; init; }
 
     public required string StepKey { get; init; }
@@ -61,6 +68,7 @@ public sealed class LeasedJob
         AttemptId = Guid.Parse(descriptor["attemptId"]!.GetValue<string>()),
         AttemptNumber = descriptor["attemptNumber"]!.GetValue<int>(),
         LeaseVersion = descriptor["leaseVersion"]!.GetValue<long>(),
+        LeaseUntil = ReadInstant(descriptor["leaseUntil"]),
         ProcessId = Guid.Parse(descriptor["processId"]!.GetValue<string>()),
         StepKey = descriptor["stepKey"]?.GetValue<string>() ?? string.Empty,
         Module = descriptor["module"]?.GetValue<string>() ?? string.Empty,
@@ -80,6 +88,22 @@ public sealed class LeasedJob
         InputMapping = ReadMapping(descriptor["inputMapping"]),
         ProcessData = descriptor["processData"]?.DeepClone(),
     };
+
+    /// <summary>
+    /// Срок аренды приходит из PostgreSQL как timestamptz. Отсутствующее или нечитаемое значение
+    /// не должно давать «аренда уже истекла»: тогда исполнитель урезал бы бюджет завершения до
+    /// минимума на ровном месте. Неизвестный срок трактуется как «дальний».
+    /// </summary>
+    private static DateTimeOffset ReadInstant(JsonNode? node)
+        => node is JsonValue value
+           && value.TryGetValue<string>(out var text)
+           && DateTimeOffset.TryParse(
+               text,
+               System.Globalization.CultureInfo.InvariantCulture,
+               System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+               out var parsed)
+            ? parsed
+            : DateTimeOffset.MaxValue;
 
     private static string[] ReadStrings(JsonNode? node)
         => node is JsonArray array

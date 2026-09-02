@@ -22,6 +22,8 @@ public sealed class WorkflowWorker(WorkerOptions options)
 
     private NpgsqlConnection? _connection;
     private bool _failpointReached;
+    private bool _incompleteDescriptorReported;
+    private bool _missingLeaseDeadlineReported;
     private long _consecutiveFailures;
 
     /// <summary>
@@ -112,7 +114,20 @@ public sealed class WorkflowWorker(WorkerOptions options)
             return [];
         }
 
-        return array.OfType<JsonObject>().Select(LeasedJob.FromDescriptor).ToArray();
+        var jobs = array.OfType<JsonObject>().Select(LeasedJob.FromDescriptor).ToArray();
+
+        // Аренда, выданная без описания, — это захваченное задание, которое исполнитель не станет
+        // ни выполнять, ни отвергать: оно будет перезахватываться до потолка попыток. Такое
+        // расхождение может быть только следствием сломанного состояния на стороне базы, и
+        // молчать о нём нельзя — иначе единственным следом останется загадочная смерть задания.
+        if (jobs.Length != array.Count && !_incompleteDescriptorReported)
+        {
+            _incompleteDescriptorReported = true;
+            Log($"claim returned an incomplete descriptor instance={options.InstanceId} " +
+                $"leased={array.Count} usable={jobs.Length}");
+        }
+
+        return jobs;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -244,8 +259,14 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 await ReachFailpointAsync(FailpointAfterAction);
             }
 
+            // Бюджет границы завершения считается из ОСТАТКА аренды, а не из константы: постоянный
+            // бюджет в тестовом профиле превышал всю аренду в несколько раз, то есть граница имела
+            // право работать дольше, чем существует само право на завершение. Нижний порог оставлен
+            // намеренно: истёкшая по часам аренда всё ещё действительна, пока её никто не перехватил,
+            // а finish_job сверяет версию аренды, а не время.
+            var finishBudgetMs = FinishBudgetMs(job);
             await ExecuteAsync(
-                connection, transaction, $"SET LOCAL statement_timeout = {options.FinishTimeoutMs}", cancellationToken);
+                connection, transaction, $"SET LOCAL statement_timeout = {finishBudgetMs}", cancellationToken);
 
             var durationMs = (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             var dispatch = Dispatch(job, correlationId, payloadHash, outcome.ActionVersion, started, succeeded: true);
@@ -253,12 +274,31 @@ public sealed class WorkflowWorker(WorkerOptions options)
             var finish = await FinishAsync(connection, transaction, job, outcome, dispatch, cancellationToken);
             if (finish?["status"]?.GetValue<string>() != "ok")
             {
-                // Право на завершение потеряно, пока действие выполнялось. Откат — единственный
-                // корректный исход: задание уже перехвачено другим арендатором.
                 await transaction.RollbackAsync(CancellationToken.None);
+
+                var refusal = finish?["code"]?.GetValue<string>() ?? ContractCodes.WorkflowBoundaryFailed;
                 Log($"finish refused instance={options.InstanceId} job={job.JobId} " +
-                    $"code={finish?["code"]?.GetValue<string>() ?? "unknown"}");
-                return AttemptResult.Done;
+                    $"attempt={job.AttemptNumber} code={refusal}");
+
+                // Потерянная аренда — единственный отказ, при котором сообщать больше нечего:
+                // заданием владеет другой арендатор, и любая наша запись была бы тем самым
+                // «опоздавшим» завершением, против которого и стоит fencing.
+                if (refusal == ContractCodes.WorkflowLeaseStale)
+                {
+                    return AttemptResult.Done;
+                }
+
+                // Любой другой отказ означает, что аренда ещё наша, а карта и действие не
+                // согласованы: например, закреплённая версия не объявляет перехода для
+                // возвращённого исхода. Повторы этого не исправят. Молчаливый выход оставил бы
+                // задание в LEASED до истечения срока и превратил бы постоянное рассогласование в
+                // цикл перезахватов, который кончается потолком попыток — то есть диагностикой,
+                // скрывающей настоящую причину.
+                return new AttemptResult(
+                    false,
+                    refusal,
+                    false,
+                    Dispatch(job, correlationId, payloadHash, outcome.ActionVersion, started, succeeded: false));
             }
 
             await transaction.CommitAsync(CancellationToken.None);
@@ -305,6 +345,22 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 $"failure={Redaction.Describe(exception)}");
             throw;
         }
+    }
+
+    /// <summary>Бюджет границы завершения для этого задания, плюс отчёт о непрочитанном сроке.</summary>
+    private int FinishBudgetMs(LeasedJob job)
+    {
+        // Нечитаемый срок аренды возвращает прежнее поведение — постоянный бюджет. Это безопасный
+        // откат, но именно тот дефект, ради которого бюджет и стал производным, поэтому он обязан
+        // быть слышен: тихая деградация предохранителя неотличима от его отсутствия.
+        if (job.LeaseUntil == DateTimeOffset.MaxValue && !_missingLeaseDeadlineReported)
+        {
+            _missingLeaseDeadlineReported = true;
+            Log("lease deadline is unreadable, finish budget falls back to the configured maximum " +
+                $"instance={options.InstanceId}");
+        }
+
+        return LeaseBudget.FinishMs(job.LeaseUntil, DateTimeOffset.UtcNow, options.FinishTimeoutMs);
     }
 
     /// <summary>

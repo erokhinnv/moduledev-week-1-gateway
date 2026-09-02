@@ -35,6 +35,13 @@ DECLARE
     -- ключом идемпотентности действия и абсолютным потолком попыток.
     c_lease_factor constant integer := 3;
 
+    -- Значения потолка попыток по умолчанию. Они дублируют DEFAULT колонок runtime_setting не по
+    -- невнимательности: потолок — предохранитель, и он не имеет права зависеть от того, лежит ли
+    -- в таблице строка. Без этих значений отсутствующая настройка давала бы NULL, сравнение
+    -- attempt_count >= NULL — тоже NULL, и предохранитель молча переставал бы существовать.
+    c_default_ceiling_factor  constant integer := 3;
+    c_default_ceiling_minimum constant integer := 10;
+
     v_now        timestamptz := clock_timestamp();
     v_floor_ms   integer := greatest(coalesce(p_lease_ms, 30000), 250);
     v_lease      interval;
@@ -89,8 +96,9 @@ BEGIN
         -- мёртвым вместо бесконечно живого — и помечается ОТДЕЛЬНОЙ причиной смерти, чтобы не
         -- выдавать «задание не доходит до отчёта» за «действие стабильно отказывает».
         v_cap := greatest(
-            coalesce(v_task.max_attempts, 1) * v_setting.attempt_ceiling_factor,
-            v_setting.attempt_ceiling_minimum);
+            coalesce(v_task.max_attempts, 1)
+                * coalesce(v_setting.attempt_ceiling_factor, c_default_ceiling_factor),
+            coalesce(v_setting.attempt_ceiling_minimum, c_default_ceiling_minimum));
 
         SELECT * INTO v_job FROM workflow.workflow_job WHERE job_id = v_id;
 
@@ -690,7 +698,9 @@ DECLARE
 BEGIN
     BEGIN
         v_process_id := (p_payload ->> 'processId')::uuid;
-    EXCEPTION WHEN OTHERS THEN
+    -- Ловится ровно нечитаемый идентификатор. WHEN OTHERS отнёс бы сюда и внутренний сбой, то есть
+    -- сообщил бы вызывающему «твой ввод неверен» в случае, когда неверна была база.
+    EXCEPTION WHEN invalid_text_representation THEN
         RETURN jsonb_build_object(
             'status', 'error',
             'code', 'payload.invalid',

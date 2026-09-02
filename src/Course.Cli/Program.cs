@@ -595,17 +595,17 @@ internal static class CourseCli
             maxPoolSize: 4);
 
     /// <summary>
-    /// Подключение от лица роли ПУБЛИКАЦИИ (course_publisher). Ей выданы EXECUTE ровно на пять
-    /// функций управления каталогом — ни DDL, ни доступа к предметным таблицам, ни api.invoke.
-    /// Если переменные публикации не заданы, используется основной набор: контур, развёрнутый до
-    /// разделения ролей, продолжает работать, просто без выигрыша от разделения.
+    /// Подключение от лица роли ПУБЛИКАЦИИ (course_publisher). Ей выданы EXECUTE ровно на функции
+    /// управления каталогом действий и картами — ни DDL, ни доступа к предметным таблицам, ни
+    /// api.invoke. Отката к основному набору нет намеренно: он бы сработал (роль миграций входит в
+    /// course_owner), и именно поэтому опасен — разделение прав исчезло бы молча.
     /// </summary>
     private static NpgsqlDataSource CreatePublicationDataSource()
         => CourseDatabase.CreateDataSource(
             connectTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_CONNECT_TIMEOUT", 5),
             commandTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_COMMAND_TIMEOUT", 120),
             maxPoolSize: 4,
-            credentials: CourseDatabase.Credentials.PublicationOrDefault());
+            credentials: CourseDatabase.Credentials.Publication);
 
     /// <summary>
     /// Подключение от лица роли ОПЕРАЦИЙ (course_operator). Ею идут команды, двигающие процессы:

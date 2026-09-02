@@ -12,7 +12,8 @@ public sealed record WorkflowActionFact(
     IReadOnlyList<string> RequiredPolicy,
     IReadOnlyList<string> Outcomes,
     string IdempotencyMode,
-    string IdempotencyScope);
+    string IdempotencyScope,
+    JsonNode? RequestSchema);
 
 /// <summary>Всё авторитетное состояние, нужное валидатору карты: каталог и права исполнителя.</summary>
 public sealed record WorkflowPublicationFacts(
@@ -44,7 +45,8 @@ public sealed record WorkflowPublicationFacts(
                     ReadStrings(item["requiredPolicy"]),
                     ReadStrings(item["outcomes"]),
                     item["idempotencyMode"]?.GetValue<string>() ?? "none",
-                    item["idempotencyScope"]?.GetValue<string>() ?? "none"));
+                    item["idempotencyScope"]?.GetValue<string>() ?? "none",
+                    item["requestSchema"]?.DeepClone()));
             }
         }
 
@@ -197,6 +199,8 @@ public static class WorkflowMapValidator
                     $"version {task.ActionVersion}, which declares idempotency_mode 'none'; " +
                     "at-least-once delivery would create a second domain effect on reclaim");
             }
+
+            violations.AddRange(ValidateRequestCoverage(stepKey, task, fact.RequestSchema));
         }
 
         var missingScopes = task.RequiredPolicy
@@ -217,6 +221,62 @@ public static class WorkflowMapValidator
         }
 
         violations.AddRange(ValidateMapping(stepKey, task));
+        return violations;
+    }
+
+    /// <summary>
+    /// Обязательные поля запроса действия обязаны собираться самой картой.
+    ///
+    /// Проверить их в рантайме уже поздно: опубликованная версия неизменяема, и шаг, чей payload
+    /// не может пройти схему запроса, будет отказывать на КАЖДОМ запуске — тратить весь бюджет
+    /// повторов и класть процесс в FAILED с payload.invalid. Это ровно тот класс ошибок, который
+    /// обязан обнаруживаться по авторитетному состоянию каталога до публикации, а не после.
+    ///
+    /// Проверяется только верхний уровень: указатель '/a/b' покрывает обязательное свойство 'a',
+    /// а требования вложенных схем зависят от данных процесса, которых на момент публикации нет.
+    /// </summary>
+    private static IEnumerable<string> ValidateRequestCoverage(
+        string stepKey,
+        WorkflowTask task,
+        JsonNode? requestSchema)
+    {
+        var violations = new List<string>();
+
+        if (requestSchema is not JsonObject schema || schema["required"] is not JsonArray required)
+        {
+            return violations;
+        }
+
+        var produced = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var constant in task.InputConstants)
+        {
+            produced.Add(constant.Key);
+        }
+
+        foreach (var pair in task.InputMapping)
+        {
+            if (JsonPointer.TryParse(pair.Key, out var tokens) && tokens.Length > 0)
+            {
+                produced.Add(tokens[0]);
+            }
+        }
+
+        var missing = required
+            .OfType<JsonValue>()
+            .Select(item => item.TryGetValue<string>(out var name) ? name : null)
+            .Where(name => name is not null && !produced.Contains(name))
+            .Select(name => name!)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+        if (missing.Length > 0)
+        {
+            violations.Add(
+                $"step '{stepKey}' never produces required request field(s) " +
+                $"[{string.Join(", ", missing)}] of action {task.RouteKey} version {task.ActionVersion}");
+        }
+
         return violations;
     }
 
@@ -355,18 +415,18 @@ public static class WorkflowMapValidator
         }
 
         // Ацикличность: цикл в обязательной части сделал бы процесс незавершимым.
-        var state = new Dictionary<string, int>(StringComparer.Ordinal);
-        if (steps.Keys.Any(key => HasCycle(key, edges, state)))
+        if (HasCycle(steps.Keys, edges))
         {
             violations.Add("the map contains a cycle");
             return violations;
         }
 
-        // Тупики: из достижимого не-end шага обязан существовать путь до end.
-        var terminating = new Dictionary<string, bool>(StringComparer.Ordinal);
+        // Тупики: из достижимого не-end шага обязан существовать путь до end. Считается одним
+        // обходом «снизу вверх» — от end-шагов по обратным рёбрам.
+        var terminating = Terminating(map, steps);
         foreach (var key in reachable.Where(steps.ContainsKey).Order(StringComparer.Ordinal))
         {
-            if (!Terminates(key, steps, edges, terminating))
+            if (!terminating.Contains(key))
             {
                 violations.Add($"step '{key}' has no path to an end step");
             }
@@ -375,57 +435,98 @@ public static class WorkflowMapValidator
         return violations;
     }
 
+    /// <summary>
+    /// Поиск цикла явным стеком, а не рекурсией. Карта приходит из файла, а не из кода, и её
+    /// размер контрактом не ограничен: прямая рекурсия по цепочке шагов роняла бы процесс
+    /// публикации переполнением стека, которое даже нельзя перехватить.
+    /// </summary>
     private static bool HasCycle(
-        string key,
-        IReadOnlyDictionary<string, string[]> edges,
-        Dictionary<string, int> state)
+        IEnumerable<string> roots,
+        IReadOnlyDictionary<string, string[]> edges)
     {
-        if (state.TryGetValue(key, out var mark))
-        {
-            return mark == 1;
-        }
+        const int open = 1;
+        const int closed = 2;
 
-        state[key] = 1;
-        foreach (var next in edges.TryGetValue(key, out var targets) ? targets : [])
+        var state = new Dictionary<string, int>(StringComparer.Ordinal);
+        var stack = new Stack<(string Key, int Index)>();
+
+        foreach (var root in roots)
         {
-            if (HasCycle(next, edges, state))
+            if (state.ContainsKey(root))
             {
-                return true;
+                continue;
+            }
+
+            state[root] = open;
+            stack.Push((root, 0));
+
+            while (stack.Count > 0)
+            {
+                var (key, index) = stack.Pop();
+                var targets = edges.TryGetValue(key, out var value) ? value : [];
+
+                if (index >= targets.Length)
+                {
+                    state[key] = closed;
+                    continue;
+                }
+
+                stack.Push((key, index + 1));
+
+                var next = targets[index];
+                if (!state.TryGetValue(next, out var mark))
+                {
+                    state[next] = open;
+                    stack.Push((next, 0));
+                }
+                else if (mark == open)
+                {
+                    return true;
+                }
             }
         }
 
-        state[key] = 2;
         return false;
     }
 
-    private static bool Terminates(
-        string key,
-        IReadOnlyDictionary<string, WorkflowStep> steps,
-        IReadOnlyDictionary<string, string[]> edges,
-        Dictionary<string, bool> memo)
+    /// <summary>
+    /// Шаги, из которых существует путь до end. Обход идёт от end-шагов по ОБРАТНЫМ рёбрам:
+    /// одно прохождение вширь вместо рекурсивной проверки каждого шага по отдельности.
+    /// </summary>
+    private static HashSet<string> Terminating(
+        WorkflowMap map,
+        IReadOnlyDictionary<string, WorkflowStep> steps)
     {
-        if (memo.TryGetValue(key, out var known))
+        var incoming = map.Transitions
+            .GroupBy(transition => transition.To, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(transition => transition.From).Distinct(StringComparer.Ordinal).ToArray(),
+                StringComparer.Ordinal);
+
+        var terminating = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<string>();
+
+        foreach (var step in map.Steps.Where(step => step.Type == WorkflowStepType.End))
         {
-            return known;
+            if (terminating.Add(step.Key))
+            {
+                queue.Enqueue(step.Key);
+            }
         }
 
-        if (!steps.TryGetValue(key, out var step))
+        while (queue.Count > 0)
         {
-            memo[key] = false;
-            return false;
+            var current = queue.Dequeue();
+            foreach (var previous in incoming.TryGetValue(current, out var sources) ? sources : [])
+            {
+                if (steps.ContainsKey(previous) && terminating.Add(previous))
+                {
+                    queue.Enqueue(previous);
+                }
+            }
         }
 
-        if (step.Type == WorkflowStepType.End)
-        {
-            memo[key] = true;
-            return true;
-        }
-
-        // Граф уже доказан ациклическим, поэтому рекурсия завершается без дополнительной защиты.
-        memo[key] = false;
-        var result = (edges.TryGetValue(key, out var targets) ? targets : [])
-            .Any(next => Terminates(next, steps, edges, memo));
-        memo[key] = result;
-        return result;
+        return terminating;
     }
 }

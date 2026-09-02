@@ -53,7 +53,12 @@ SELECT
     j.lease_version::bigint   AS lease_version,
     j.lease_until             AS lease_until,
     j.attempt_count::integer  AS attempt_count,
-    j.next_attempt_at         AS next_attempt_at
+    j.next_attempt_at         AS next_attempt_at,
+    -- Причина смерти задания вводилась именно для того, чтобы отличать «действие стабильно
+    -- отказывает» от «задание не доходит до отчёта». Держать её только в приватной таблице
+    -- означало бы сделать это различие невидимым тому наблюдателю, ради которого проекция и
+    -- существует. Дополнительное диагностическое поле контрактом не является (см. шапку файла).
+    j.dead_reason::text       AS dead_reason
 FROM workflow.workflow_job j;
 
 CREATE OR REPLACE VIEW autocheck.attempts AS

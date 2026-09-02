@@ -29,7 +29,8 @@ public sealed class WorkflowMapTests
                 RequiredPolicy: ["workflow:execute"],
                 Outcomes: ["ROUTE_SIGNAL_72125C4E", "ROUTE_MANUAL_503E0EA7"],
                 IdempotencyMode: "required",
-                IdempotencyScope: "principal_action"),
+                IdempotencyScope: "principal_action",
+                RequestSchema: FixtureRequestSchema),
             new WorkflowActionFact(
                 "module_5abe942c84",
                 "action_5cd90325f0",
@@ -39,8 +40,17 @@ public sealed class WorkflowMapTests
                 RequiredPolicy: ["workflow:execute"],
                 Outcomes: ["ROUTE_SIGNAL_72125C4E", "ROUTE_MANUAL_503E0EA7"],
                 IdempotencyMode: "required",
-                IdempotencyScope: "principal_action"),
+                IdempotencyScope: "principal_action",
+                RequestSchema: FixtureRequestSchema),
         ]);
+
+    /// <summary>
+    /// Схема запроса берётся из манифеста ПРОВЕРЯЮЩЕГО, а не выдумывается тестом: проверка
+    /// покрытия обязательных полей должна доказываться на тех же данных, что поедут на сдачу.
+    /// </summary>
+    private static JsonNode? FixtureRequestSchema
+        => JsonNode.Parse(File.ReadAllText(Path.Combine(
+               FixtureRoot, "..", "manifests", "3c363d117b40.action.json")))!["request_schema"];
 
     private static string FixtureRoot
     {
@@ -147,6 +157,87 @@ public sealed class WorkflowMapTests
         var violations = WorkflowMapValidator.Validate(WorkflowMap.FromDocument(document), facts);
 
         Assert.Contains(violations, item => item.Contains("idempotency_mode 'none'", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Карта обязана уметь собрать ОБЯЗАТЕЛЬНЫЕ поля запроса действия. Иначе шаг публикуется
+    /// неизменяемой версией, которая не может выполниться ни разу: каждый запуск тратит весь
+    /// бюджет повторов и кладёт процесс в FAILED с payload.invalid — и обнаруживается это только
+    /// в рантайме, когда исправить версию уже нельзя.
+    /// </summary>
+    [Fact]
+    public void MapMustProduceEveryRequiredRequestField()
+    {
+        var document = WorkflowMapReader.ReadDocument(Path.Combine(FixtureRoot, "3c363d117b40-v1.flow.json"));
+        var mapping = document["steps"]!.AsArray()
+            .Select(item => item!.AsObject())
+            .First(step => step["type"]!.GetValue<string>() == "automatic")["task"]!["input_mapping"]!
+            .AsObject();
+
+        Assert.True(mapping.Remove("/value_c6e4ac8e"));
+
+        var violations = WorkflowMapValidator.Validate(WorkflowMap.FromDocument(document), Facts);
+
+        Assert.Contains(
+            violations,
+            item => item.Contains("required request field(s) [value_c6e4ac8e]", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Размер карты контрактом не ограничен, а документ приходит из файла. Обход графа обязан
+    /// оставаться итеративным: рекурсия по длинной цепочке шагов роняла бы процесс публикации
+    /// переполнением стека, которого нельзя ни перехватить, ни продиагностировать.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeepChainsAreWalkedWithoutRecursion(bool closeTheLoop)
+    {
+        const int length = 5_000;
+
+        var steps = new JsonArray();
+        var transitions = new JsonArray();
+        for (var index = 0; index < length; index++)
+        {
+            steps.Add(new JsonObject
+            {
+                ["key"] = $"s{index}",
+                ["type"] = "manual",
+                ["allowed_outcomes"] = new JsonArray("GO"),
+            });
+
+            transitions.Add(new JsonObject
+            {
+                ["from"] = $"s{index}",
+                ["outcome"] = "GO",
+                ["to"] = index + 1 < length ? $"s{index + 1}" : closeTheLoop ? "s0" : "done",
+            });
+        }
+
+        steps.Add(new JsonObject { ["key"] = "done", ["type"] = "end", ["outcome"] = "DONE" });
+
+        var document = new JsonObject
+        {
+            ["contract_version"] = "course-1",
+            ["flow_name"] = "deep-chain",
+            ["version"] = 1,
+            ["start_step"] = "s0",
+            ["steps"] = steps,
+            ["transitions"] = transitions,
+        };
+
+        Assert.True(SchemaValidator.TryValidate(WorkflowContracts.WorkflowMapSchema, document, out _));
+
+        var violations = WorkflowMapValidator.Validate(WorkflowMap.FromDocument(document), Facts);
+
+        if (closeTheLoop)
+        {
+            Assert.Contains(violations, item => item.Contains("cycle", StringComparison.Ordinal));
+        }
+        else
+        {
+            Assert.Empty(violations);
+        }
     }
 
     private static string Canonical(JsonNode node)

@@ -430,6 +430,167 @@ public sealed class WorkflowIntegrationTests
         Assert.Equal("1", signals.Output.Trim());
     }
 
+    /// <summary>
+    /// Контракт карты обязан держаться и тогда, когда публикуют минуя CLI. JSON Schema живёт в
+    /// клиенте, а workflow.publish_flow — граница, выданная отдельной роли: карта, пришедшая
+    /// прямым вызовом SQL, до сих пор не проходила ни одной проверки формы. Automatic-шаг без
+    /// task дал бы задание без контракта задачи — исполнитель не может ни выполнить его, ни
+    /// отвергнуть, и оно перезахватывалось бы до потолка попыток без единой записи в журнале.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(
+        "an automatic step without a task",
+        "{\"contract_version\":\"course-1\",\"flow_name\":\"itest-bad-a\",\"version\":1," +
+        "\"start_step\":\"s\",\"steps\":[{\"key\":\"s\",\"type\":\"automatic\"}," +
+        "{\"key\":\"e\",\"type\":\"end\",\"outcome\":\"DONE\"}]," +
+        "\"transitions\":[{\"from\":\"s\",\"outcome\":\"OK\",\"to\":\"e\"}]}")]
+    [InlineData(
+        "a task on a step that is not automatic",
+        "{\"contract_version\":\"course-1\",\"flow_name\":\"itest-bad-b\",\"version\":1," +
+        "\"start_step\":\"s\",\"steps\":[{\"key\":\"s\",\"type\":\"manual\"," +
+        "\"allowed_outcomes\":[\"OK\"],\"task\":{}}," +
+        "{\"key\":\"e\",\"type\":\"end\",\"outcome\":\"DONE\"}]," +
+        "\"transitions\":[{\"from\":\"s\",\"outcome\":\"OK\",\"to\":\"e\"}]}")]
+    [InlineData(
+        "a start step the map does not declare",
+        "{\"contract_version\":\"course-1\",\"flow_name\":\"itest-bad-c\",\"version\":1," +
+        "\"start_step\":\"ghost\",\"steps\":[{\"key\":\"s\",\"type\":\"manual\"," +
+        "\"allowed_outcomes\":[\"OK\"]},{\"key\":\"e\",\"type\":\"end\",\"outcome\":\"DONE\"}]," +
+        "\"transitions\":[{\"from\":\"s\",\"outcome\":\"OK\",\"to\":\"e\"}]}")]
+    [InlineData(
+        "a transition into a step the map does not declare",
+        "{\"contract_version\":\"course-1\",\"flow_name\":\"itest-bad-d\",\"version\":1," +
+        "\"start_step\":\"s\",\"steps\":[{\"key\":\"s\",\"type\":\"manual\"," +
+        "\"allowed_outcomes\":[\"OK\"]},{\"key\":\"e\",\"type\":\"end\",\"outcome\":\"DONE\"}]," +
+        "\"transitions\":[{\"from\":\"s\",\"outcome\":\"OK\",\"to\":\"ghost\"}]}")]
+    public void StorageRejectsAMalformedMapEvenWithoutTheClient(string reason, string map)
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var published = IntegrationEnvironment.Psql(
+            $"SELECT workflow.publish_flow($${map}$$::jsonb) ->> 'code';");
+
+        Assert.Equal(0, published.ExitCode);
+        Assert.Equal("workflow.map_invalid", LastLine(published.Output));
+
+        // Отклонённая публикация обязана не оставить ни одной строки определения.
+        var leftovers = IntegrationEnvironment.Psql(
+            "SELECT count(*) FROM autocheck.flow_versions WHERE flow_name LIKE 'itest-bad-%';");
+
+        Assert.Equal(0, leftovers.ExitCode);
+        Assert.True("0" == LastLine(leftovers.Output), $"rejecting {reason} left rows behind");
+    }
+
+    /// <summary>
+    /// Личность состояния неизменяема. На неизменности execution_id держится всё рассуждение о
+    /// безопасности доставки at-least-once, на data_hash — идемпотентность повторного запуска, а
+    /// на flow_version_id — само закрепление процесса за версией карты. Свойство, которое можно
+    /// тихо переписать одним UPDATE от владельца, доказательством не является.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("UPDATE workflow.workflow_job SET execution_id = gen_random_uuid()")]
+    [InlineData("UPDATE workflow.workflow_job SET lease_version = 0 WHERE lease_version > 0")]
+    [InlineData("UPDATE workflow.process_instance SET data_hash = repeat('b', 64)")]
+    [InlineData("UPDATE workflow.process_instance SET business_key = 'rewritten'")]
+    [InlineData("UPDATE workflow.step_instance SET step_key = 'rewritten'")]
+    [InlineData("DELETE FROM workflow.process_instance")]
+    [InlineData("DELETE FROM workflow.workflow_job")]
+    public void StateIdentityCannotBeRewrittenEvenByTheOwner(string statement)
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        // Строковые триггеры не срабатывают на нуле строк, поэтому процесс обязан существовать:
+        // иначе тест доказывал бы лишь то, что менять было нечего.
+        var processId = StartSmokeProcess($"itest-identity-{Guid.NewGuid():N}");
+        Assert.False(string.IsNullOrWhiteSpace(processId));
+
+        var rewrite = IntegrationEnvironment.Psql($"{statement};");
+
+        Assert.NotEqual(0, rewrite.ExitCode);
+    }
+
+    /// <summary>
+    /// Отказ границы завершения, не связанный с потерей аренды, обязан быть СООБЩЁН, а не пережит
+    /// молча.
+    ///
+    /// Сценарий берётся из реальности: закреплённая версия карты не объявляет перехода для того
+    /// исхода, который вернуло действие. Аренда при этом всё ещё наша, и повторы делу не помогут.
+    /// Если исполнитель просто выйдет, задание останется LEASED до истечения срока, будет
+    /// перезахвачено, и так до абсолютного потолка попыток — то есть умрёт с причиной
+    /// `attempt_ceiling`, которая скрывает настоящую («карта и действие не согласованы») и не
+    /// оставит в истории ни одного TaskAttemptFailed. Проверяется именно это различие.
+    ///
+    /// Карта публикуется НАПРЯМУЮ через SQL: полноту покрытия исходов доказывает валидатор карты
+    /// в CLI, а он такую карту не пропустит. Хранилище её принимает сознательно — покрытие
+    /// исходов это свойство графа, а не строки, и рантайм обязан вести себя честно и на карте,
+    /// опубликованной в обход клиента.
+    /// </summary>
+    [SkippableFact]
+    public void AnUnknownOutcomeIsReportedInsteadOfSilentlyReclaimed()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        const string flow = "itest-unknown-outcome";
+        var businessKey = $"itest-outcome-{Guid.NewGuid():N}";
+
+        // Действие вернёт ROUTE_SIGNAL (mode отличен от "manual"), а переход объявлен только для
+        // ROUTE_MANUAL. Всё остальное в карте корректно, поэтому хранилище её принимает.
+        var map =
+            "{\"contract_version\":\"course-1\",\"flow_name\":\"" + flow + "\",\"version\":1," +
+            "\"start_step\":\"invoke\",\"steps\":[" +
+            "{\"key\":\"invoke\",\"type\":\"automatic\",\"task\":{\"service\":\"postgres\"," +
+            "\"module\":\"training\",\"action\":\"canary\",\"action_version\":1," +
+            "\"required_policy\":[\"workflow:execute\"],\"timeout_ms\":1600," +
+            "\"retry\":{\"max_attempts\":1,\"delays_ms\":[]}," +
+            "\"input_mapping\":{\"/mode\":\"/mode\",\"/value\":\"/value\"}," +
+            "\"input_constants\":{\"marker\":\"itest\"}}}," +
+            "{\"key\":\"done\",\"type\":\"end\",\"outcome\":\"COMPLETED\"}]," +
+            "\"transitions\":[{\"from\":\"invoke\",\"outcome\":\"ROUTE_MANUAL\",\"to\":\"done\"}]}";
+
+        var published = IntegrationEnvironment.Psql($"SELECT workflow.publish_flow($${map}$$::jsonb) ->> 'status';");
+        Assert.Equal(0, published.ExitCode);
+        Assert.Equal("ok", LastLine(published.Output));
+
+        var activated = IntegrationEnvironment.Psql(
+            $"SELECT workflow.activate_flow('{flow}', 1) ->> 'status';");
+        Assert.Equal(0, activated.ExitCode);
+        Assert.Equal("ok", LastLine(activated.Output));
+
+        var started = IntegrationEnvironment.Psql(
+            $"SELECT workflow.start_process('{flow}', '{businessKey}', " +
+            "'{\"mode\":\"signal\",\"value\":\"v\"}'::jsonb) #>> '{result,processId}';");
+        Assert.Equal(0, started.ExitCode);
+        var processId = LastLine(started.Output);
+        Assert.False(string.IsNullOrWhiteSpace(processId));
+
+        // Процесс обязан упасть быстро — по отчёту исполнителя, а не по истечению аренд.
+        Assert.True(
+            WaitForState(processId, "FAILED"),
+            "the process did not fail after the completion boundary refused the outcome");
+
+        // Настоящая причина сохранена: попытка отчиталась своим кодом, а не растворилась.
+        var attempt = IntegrationEnvironment.Psql(
+            "SELECT a.status || ' ' || coalesce(a.error_code, '-') FROM autocheck.attempts a " +
+            $"JOIN autocheck.jobs j ON j.job_id = a.job_id WHERE j.process_id = '{processId}';");
+        Assert.Equal(0, attempt.ExitCode);
+        Assert.Equal("FAILED workflow.unknown_outcome", LastLine(attempt.Output));
+
+        // И смерть задания отнесена к бюджету отказов, а не к потолку попыток.
+        var job = IntegrationEnvironment.Psql(
+            "SELECT state || ' ' || coalesce(dead_reason, '-') || ' attempts=' || attempt_count " +
+            $"FROM autocheck.jobs WHERE process_id = '{processId}';");
+        Assert.Equal(0, job.ExitCode);
+        Assert.Equal("DEAD failure_budget attempts=1", LastLine(job.Output));
+
+        // История содержит отчёт о попытке, а не только загадочное исчезновение задания.
+        var events = IntegrationEnvironment.Psql(
+            "SELECT string_agg(DISTINCT event_type, ',' ORDER BY event_type) " +
+            $"FROM autocheck.workflow_events WHERE process_id = '{processId}' " +
+            "AND event_type IN ('TaskAttemptFailed', 'TaskFailed', 'TaskAbandoned');");
+        Assert.Equal(0, events.ExitCode);
+        Assert.Equal("TaskAttemptFailed,TaskFailed", LastLine(events.Output));
+    }
+
     /// <summary>Последняя непустая строка вывода psql — сам результат, без эха служебных команд.</summary>
     private static string LastLine(string output)
         => output

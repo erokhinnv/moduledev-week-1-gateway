@@ -39,7 +39,9 @@ C4Container
 | Runtime | Подпись и форма claims JWT, policy, request schema, outcome и response schema | `api` |
 | Worker | Mapping по указателям RFC 6901, request schema, объявленность исхода, response schema | `worker-*` |
 | Database | Разрешение target только из каталога, повторная проверка policy, точная сигнатура функции, идемпотентность | `api.invoke` |
+| Publication | Форма шага (`automatic` → `task`, `wait_signal` → `signal_type` и `outcome`, `end` → `outcome`), объявленность `start_step` и обоих концов каждого перехода | `workflow.publish_flow`, CHECK `workflow.step_definition` |
 | Lease | Совпадение задания, владельца, версии аренды и состояния до единой записи | `workflow.finish_job` |
+| Identity | Неизменяемость `execution_id`, закрепления процесса за версией, тела принятого сигнала и невозможность отмотать `lease_version` назад | триггеры `workflow.*_identity` |
 | Roles | `course_runtime` без DML и без доступа к схеме `workflow`; `workflow_worker` — четыре функции и ноль DML; `course_publisher` меняет только определения, `course_operator` — только исполнение; owner `SECURITY DEFINER` имеет `NOLOGIN` | PostgreSQL |
 
 ## Поток одного HTTP-вызова

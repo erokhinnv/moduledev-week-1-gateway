@@ -39,14 +39,25 @@ AS $fn$
                     -- публикации карты: без него executionId перестаёт быть ключом предметного
                     -- эффекта, и at-least-once доставка задания создаёт второй эффект.
                     'idempotencyMode', coalesce(av.idempotency_mode, 'none'),
-                    'idempotencyScope', coalesce(av.idempotency_scope, 'none')
+                    'idempotencyScope', coalesce(av.idempotency_scope, 'none'),
+                    -- Схема запроса нужна валидатору не для проверки данных процесса (их ещё нет),
+                    -- а для проверки САМОЙ КАРТЫ: константы и mapping шага обязаны покрывать
+                    -- обязательные поля действия. Иначе шаг публикуется неизменяемой версией,
+                    -- которая не может выполниться ни разу.
+                    'requestSchema', av.request_schema
                 ))
                 FROM (
                     SELECT DISTINCT
                         step -> 'task' ->> 'module' AS module,
                         step -> 'task' ->> 'action' AS action,
                         step -> 'task' ->> 'action_version' AS version
-                    FROM jsonb_array_elements(coalesce(p_map -> 'steps', '[]'::jsonb)) AS step
+                    -- Развернуть можно только массив: документ произвольной формы обязан дать
+                    -- пустой ответ, а не ошибку SQL на границе, выданной отдельной роли.
+                    FROM jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(p_map -> 'steps') = 'array'
+                             THEN p_map -> 'steps'
+                             ELSE '[]'::jsonb
+                        END) AS step
                     WHERE step ->> 'type' = 'automatic'
                       AND jsonb_typeof(step -> 'task') = 'object'
                 ) AS keys
@@ -90,12 +101,71 @@ BEGIN
 
     BEGIN
         v_version := (p_map ->> 'version')::integer;
-    EXCEPTION WHEN OTHERS THEN
+    EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+        -- Ловится ровно нечитаемое число. WHEN OTHERS выдал бы внутренний сбой за ошибку ввода и
+        -- сообщил бы «карта неверна» там, где неверна была база.
         v_version := NULL;
     END;
 
     IF v_flow_name IS NULL OR v_version IS NULL OR v_start IS NULL THEN
         RETURN workflow.failure('workflow.map_invalid', 'flow_name, version and start_step are required');
+    END IF;
+
+    IF jsonb_typeof(p_map -> 'steps') IS DISTINCT FROM 'array'
+       OR jsonb_typeof(p_map -> 'transitions') IS DISTINCT FROM 'array'
+    THEN
+        RETURN workflow.failure('workflow.map_invalid', 'steps and transitions must be arrays');
+    END IF;
+
+    ---------------------------------------------------------------------------
+    -- Локальные инварианты карты проверяются ЗДЕСЬ, а не только в CLI.
+    --
+    -- Эта функция — граница, выданная роли публикации, а JSON Schema живёт в клиенте: карта,
+    -- пришедшая прямым вызовом, до сих пор не проходила ни одной из этих проверок. Пропущенный
+    -- task у automatic-шага давал бы задание без контракта задачи, которое исполнитель не может
+    -- ни выполнить, ни отвергнуть; переход в необъявленный шаг — процесс, который встаёт намертво
+    -- при первом же продвижении. Всё это выводится из самого документа, поэтому отказ происходит
+    -- до первой записи и не оставляет следов. Достижимость, ацикличность и покрытие исходов
+    -- остаются за валидатором: это свойства графа, а не документа.
+    ---------------------------------------------------------------------------
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_map -> 'steps') AS step
+        WHERE (step ->> 'type') = 'automatic'
+          AND jsonb_typeof(step -> 'task') IS DISTINCT FROM 'object'
+    ) THEN
+        RETURN workflow.failure('workflow.map_invalid', 'an automatic step must declare a task');
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_map -> 'steps') AS step
+        WHERE (step ->> 'type') IS DISTINCT FROM 'automatic'
+          AND step ? 'task'
+    ) THEN
+        RETURN workflow.failure('workflow.map_invalid', 'only an automatic step may declare a task');
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_map -> 'steps') AS step
+        WHERE (step ->> 'key') = v_start
+    ) THEN
+        RETURN workflow.failure('workflow.map_invalid', 'start_step is not declared by the map');
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_map -> 'transitions') AS edge
+        WHERE NOT EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(p_map -> 'steps') AS step
+                  WHERE (step ->> 'key') = (edge ->> 'from'))
+           OR NOT EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(p_map -> 'steps') AS step
+                  WHERE (step ->> 'key') = (edge ->> 'to'))
+    ) THEN
+        RETURN workflow.failure(
+            'workflow.map_invalid', 'a transition references a step the map does not declare');
     END IF;
 
     -- Публикация одной карты сериализуется на время транзакции: параллельные publish одного

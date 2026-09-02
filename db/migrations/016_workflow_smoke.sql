@@ -10,11 +10,19 @@ CREATE SCHEMA IF NOT EXISTS training;
 
 COMMENT ON SCHEMA training IS 'Built-in idempotent probe action used by the workflow-smoke map';
 
+-- Отзыв прав PUBLIC делается ПО МЕСТУ, а не один раз в 015: тот REVOKE перечисляет схемы api и
+-- workflow и по построению не может покрыть схему, добавленную следующей миграцией. Полагаться
+-- при этом на ALTER DEFAULT PRIVILEGES из инициализации кластера для границы доверия недостаточно —
+-- по той же причине, по которой это сказано в 015.
+REVOKE ALL ON SCHEMA training FROM PUBLIC;
+
 CREATE TABLE IF NOT EXISTS training.canary_effect (
     execution_id text PRIMARY KEY,
     value        text NOT NULL,
     created_at   timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+
+REVOKE ALL ON training.canary_effect FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION training.canary_v1(p_context jsonb, p_payload jsonb)
 RETURNS jsonb
@@ -73,3 +81,7 @@ BEGIN
     );
 END;
 $fn$;
+
+-- Функция объявлена SECURITY DEFINER и пишет в таблицу, поэтому отзыв идёт ПОСЛЕ её создания:
+-- вызвать её должен уметь только api.invoke от имени владельца.
+REVOKE EXECUTE ON FUNCTION training.canary_v1(jsonb, jsonb) FROM PUBLIC;
