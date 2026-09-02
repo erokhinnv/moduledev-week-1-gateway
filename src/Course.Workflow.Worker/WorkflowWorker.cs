@@ -24,8 +24,13 @@ public sealed class WorkflowWorker(WorkerOptions options)
     private bool _failpointReached;
     private long _consecutiveFailures;
 
-    /// <summary>Результат одной попытки: доведена ли она до конца и с каким кодом отказа.</summary>
-    private sealed record AttemptResult(bool Settled, string Code, bool Retryable)
+    /// <summary>
+    /// Результат одной попытки: доведена ли она до конца, с каким кодом отказа и с каким
+    /// техническим следом. След присутствует только у попыток, в которых действие ДЕЙСТВИТЕЛЬНО
+    /// вызывалось: отказ маппинга или недоступность версии вызовом не являются, и запись о них
+    /// в журнал вызовов была бы вымыслом.
+    /// </summary>
+    private sealed record AttemptResult(bool Settled, string Code, bool Retryable, JsonObject? Dispatch = null)
     {
         public static readonly AttemptResult Done = new(true, "ok", false);
     }
@@ -127,7 +132,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
 
         if (!job.ActionAvailable || job.RequestSchema is null || job.ResponseSchema is null)
         {
-            await FailAsync(connection, job, ContractCodes.WorkflowActionUnavailable, false, cancellationToken);
+            await FailAsync(connection, job, ContractCodes.WorkflowActionUnavailable, false, null, cancellationToken);
             return;
         }
 
@@ -136,14 +141,14 @@ public sealed class WorkflowWorker(WorkerOptions options)
         if (!WorkflowPayload.TryBuild(job.InputConstants, job.InputMapping, job.ProcessData, out var payload, out var missing))
         {
             Log($"mapping source missing instance={options.InstanceId} job={job.JobId} pointer={missing}");
-            await FailAsync(connection, job, ContractCodes.WorkflowMappingMissing, false, cancellationToken);
+            await FailAsync(connection, job, ContractCodes.WorkflowMappingMissing, false, null, cancellationToken);
             return;
         }
 
         // Сформированный payload проходит схему запроса действия ДО обращения к api.invoke.
         if (!SchemaValidator.TryValidate(job.RequestSchema, payload, out _))
         {
-            await FailAsync(connection, job, ContractCodes.PayloadInvalid, false, cancellationToken);
+            await FailAsync(connection, job, ContractCodes.PayloadInvalid, false, null, cancellationToken);
             return;
         }
 
@@ -155,7 +160,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
 
         // Транзакция действия уже откачена. Отдельная транзакция сохраняет попытку и расписание
         // повтора: сам факт неудачи обязан пережить откат предметного эффекта.
-        await FailAsync(connection, job, attempt.Code, attempt.Retryable, cancellationToken);
+        await FailAsync(connection, job, attempt.Code, attempt.Retryable, attempt.Dispatch, cancellationToken);
     }
 
     /// <summary>
@@ -218,13 +223,15 @@ public sealed class WorkflowWorker(WorkerOptions options)
             if (outcome.Status != RegisteredActionStatus.Succeeded)
             {
                 // Объявленная ошибка или нарушение контракта откатывают предметный эффект целиком.
+                // Технический след при этом не теряется: его запишет отдельная транзакция fail_job.
                 await transaction.RollbackAsync(CancellationToken.None);
                 Log($"attempt rejected instance={options.InstanceId} job={job.JobId} " +
                     $"attempt={job.AttemptNumber} code={outcome.Code} retryable={outcome.Retryable}");
                 return new AttemptResult(
                     false,
                     outcome.Code,
-                    outcome.Status == RegisteredActionStatus.DomainError && outcome.Retryable);
+                    outcome.Status == RegisteredActionStatus.DomainError && outcome.Retryable,
+                    Dispatch(job, correlationId, payloadHash, outcome.ActionVersion, started));
             }
 
             // Failpoint «после действия, до завершения»: эффект уже выполнен ВНУТРИ транзакции,
@@ -238,18 +245,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 connection, transaction, $"SET LOCAL statement_timeout = {options.FinishTimeoutMs}", cancellationToken);
 
             var durationMs = (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            var dispatch = new JsonObject
-            {
-                ["correlationId"] = correlationId.ToString(),
-                ["requestId"] = job.ExecutionId.ToString(),
-                ["module"] = job.Module,
-                ["action"] = job.Action,
-                ["version"] = outcome.ActionVersion ?? job.ActionVersion,
-                ["principal"] = job.Principal,
-                ["consumer"] = job.Consumer,
-                ["payloadHash"] = payloadHash,
-                ["durationMs"] = durationMs,
-            };
+            var dispatch = Dispatch(job, correlationId, payloadHash, outcome.ActionVersion, started);
 
             var finish = await FinishAsync(connection, transaction, job, outcome, dispatch, cancellationToken);
             if (finish?["status"]?.GetValue<string>() != "ok")
@@ -271,21 +267,65 @@ public sealed class WorkflowWorker(WorkerOptions options)
         {
             await SafeRollbackAsync(transaction);
             Log($"attempt timed out instance={options.InstanceId} job={job.JobId} attempt={job.AttemptNumber}");
-            return new AttemptResult(false, ContractCodes.ActionTimeout, true);
+            return new AttemptResult(
+                false,
+                ContractCodes.ActionTimeout,
+                true,
+                Dispatch(job, correlationId, payloadHash, job.ActionVersion, started));
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             await SafeRollbackAsync(transaction);
-            return new AttemptResult(false, ContractCodes.ActionTimeout, true);
+            return new AttemptResult(
+                false,
+                ContractCodes.ActionTimeout,
+                true,
+                Dispatch(job, correlationId, payloadHash, job.ActionVersion, started));
+        }
+        catch (PostgresException exception)
+        {
+            // Сервер ответил отказом — соединение цело, и попытку можно честно закрыть. Это
+            // важно: сбой ВНУТРИ границы завершения (например несогласованная карта) не тратит
+            // бюджет max_attempts, и без явного отчёта задание перезахватывалось бы бесконечно.
+            await SafeRollbackAsync(transaction);
+            Log($"attempt rejected by database instance={options.InstanceId} job={job.JobId} " +
+                $"attempt={job.AttemptNumber} failure={Redaction.Describe(exception)}");
+            return new AttemptResult(false, ContractCodes.WorkflowBoundaryFailed, false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            // Сбой самого соединения: состояние транзакции неизвестно, сообщить о нём тем же
+            // соединением нельзя. Задание остаётся арендованным и будет перехвачено по истечении
+            // срока — теперь под защитой абсолютного потолка попыток в claim_jobs.
             await SafeRollbackAsync(transaction);
             Log($"attempt failed instance={options.InstanceId} job={job.JobId} " +
                 $"failure={Redaction.Describe(exception)}");
             throw;
         }
     }
+
+    /// <summary>
+    /// Технический след одного вызова зарегистрированного действия. Наружу выходит только
+    /// отпечаток payload, но никогда сам payload.
+    /// </summary>
+    private static JsonObject Dispatch(
+        LeasedJob job,
+        Guid correlationId,
+        string payloadHash,
+        int? executedVersion,
+        long startedAt)
+        => new()
+        {
+            ["correlationId"] = correlationId.ToString(),
+            ["requestId"] = job.ExecutionId.ToString(),
+            ["module"] = job.Module,
+            ["action"] = job.Action,
+            ["version"] = executedVersion ?? job.ActionVersion,
+            ["principal"] = job.Principal,
+            ["consumer"] = job.Consumer,
+            ["payloadHash"] = payloadHash,
+            ["durationMs"] = (int)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+        };
 
     private async Task<JsonObject?> FinishAsync(
         NpgsqlConnection connection,
@@ -315,15 +355,17 @@ public sealed class WorkflowWorker(WorkerOptions options)
         LeasedJob job,
         string code,
         bool retryable,
+        JsonObject? dispatch,
         CancellationToken cancellationToken)
     {
         await using var command = new NpgsqlCommand(
-            "SELECT workflow.fail_job($1, $2, $3, $4, $5)::text", connection);
+            "SELECT workflow.fail_job($1, $2, $3, $4, $5, $6)::text", connection);
         command.Parameters.Add(Uuid(job.JobId));
         command.Parameters.Add(Text(options.InstanceId));
         command.Parameters.Add(BigInt(job.LeaseVersion));
         command.Parameters.Add(Text(code));
         command.Parameters.Add(Boolean(retryable));
+        command.Parameters.Add(NullableJsonb(dispatch?.ToJsonString()));
         command.CommandTimeout = 15;
 
         var raw = await command.ExecuteScalarAsync(cancellationToken) as string;
@@ -468,4 +510,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
 
     private static NpgsqlParameter Jsonb(string value)
         => new() { NpgsqlDbType = NpgsqlDbType.Jsonb, Value = value };
+
+    private static NpgsqlParameter NullableJsonb(string? value)
+        => new() { NpgsqlDbType = NpgsqlDbType.Jsonb, Value = (object?)value ?? DBNull.Value };
 }

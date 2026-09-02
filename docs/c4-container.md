@@ -14,7 +14,7 @@ C4Container
     System_Boundary(stack, "Docker Compose stack") {
         Container(gateway, "gateway", "C# ASP.NET Core", "Единственный публичный порт 8080. Whitelist маршрутов, прозрачная передача контрактных заголовков, health. Не содержит каталог и предметную логику")
         Container(api, "api", "C# ASP.NET Core", "Generic action runtime. JWT, server-side context, request/response schema validation, одна Npgsql-транзакция, OpenAPI из манифестов")
-        Container(cli, "cli", "C# console", "Course CLI: checksummed migrations, публикация манифестов и карт, trusted-команды процессов. Владеет publication credentials")
+        Container(cli, "cli", "C# console", "Course CLI: checksummed migrations, публикация манифестов и карт, trusted-команды процессов. Тремя разными ролями: миграций, публикации и операций")
         Container(workera, "worker-a", "C# console", "Сменный исполнитель процессов. Аренда задания, вызов зарегистрированного действия, сообщение исхода. lease owner worker-a")
         Container(workerb, "worker-b", "C# console", "Тот же образ, lease owner worker-b. Отличается только идентификатором арендатора")
         ContainerDb(postgres, "postgres", "PostgreSQL 17", "Авторитетное состояние: каталог действий, идемпотентность, dispatch, определения карт, процессы, задания, попытки, сигналы и история, схема autocheck")
@@ -24,7 +24,7 @@ C4Container
     Rel(gateway, api, "Проксирует запрос и контрактные заголовки", "HTTP по Compose DNS http://api:8080")
     Rel(api, postgres, "SELECT api.invoke(...), api.resolve_action(...), api.record_dispatch(...)", "Npgsql, роль course_runtime")
     Rel(operator, cli, "migration apply, action publish/activate, flow publish/activate/start/signal", "docker compose run cli")
-    Rel(cli, postgres, "DDL, публикация каталога и карт, trusted-команды процессов", "Npgsql, роли course_migrator и course_publisher")
+    Rel(cli, postgres, "DDL, публикация каталога и карт, trusted-команды процессов", "Npgsql, роли course_migrator, course_publisher и course_operator")
     Rel(workera, postgres, "claim_jobs → api.invoke → finish_job / fail_job", "Npgsql, роль workflow_worker")
     Rel(workerb, postgres, "claim_jobs → api.invoke → finish_job / fail_job", "Npgsql, роль workflow_worker")
 
@@ -40,7 +40,7 @@ C4Container
 | Worker | Mapping по указателям RFC 6901, request schema, объявленность исхода, response schema | `worker-*` |
 | Database | Разрешение target только из каталога, повторная проверка policy, точная сигнатура функции, идемпотентность | `api.invoke` |
 | Lease | Совпадение задания, владельца, версии аренды и состояния до единой записи | `workflow.finish_job` |
-| Roles | `course_runtime` без DML к предметным таблицам; `workflow_worker` — четыре функции и ноль DML; owner `SECURITY DEFINER` имеет `NOLOGIN` | PostgreSQL |
+| Roles | `course_runtime` без DML и без доступа к схеме `workflow`; `workflow_worker` — четыре функции и ноль DML; `course_publisher` меняет только определения, `course_operator` — только исполнение; owner `SECURITY DEFINER` имеет `NOLOGIN` | PostgreSQL |
 
 ## Поток одного HTTP-вызова
 
@@ -84,7 +84,7 @@ sequenceDiagram
     participant P as PostgreSQL
 
     WA->>P: SELECT workflow.claim_jobs('worker-a', 1, lease)
-    P->>P: FOR UPDATE SKIP LOCKED; lease_version++; attempt_count++; новая попытка RUNNING
+    P->>P: FOR UPDATE SKIP LOCKED; срок = max(lease, timeout_ms + запас); lease_version++; attempt_count++
     P-->>WA: закреплённый контракт: версия действия, схемы, outcomes, policy, mapping, данные процесса
     WB->>P: SELECT workflow.claim_jobs('worker-b', 1, lease)
     P-->>WB: пусто, задание арендовано
@@ -102,8 +102,8 @@ sequenceDiagram
         WA->>P: COMMIT
     else ошибка действия, нарушение контракта или таймаут
         WA->>P: ROLLBACK
-        WA->>P: SELECT workflow.fail_job(jobId, owner, leaseVersion, code, retryable)
-        P->>P: попытка FAILED → RETRY_WAIT с задержкой или DEAD, шаг и процесс FAILED, событие TaskFailed
+        WA->>P: SELECT workflow.fail_job(jobId, owner, leaseVersion, code, retryable, dispatch)
+        P->>P: попытка FAILED → след ERROR → RETRY_WAIT с задержкой или DEAD, событие TaskFailed
     end
 ```
 

@@ -27,7 +27,9 @@ public sealed class WorkflowMapTests
                 Found: true,
                 Enabled: true,
                 RequiredPolicy: ["workflow:execute"],
-                Outcomes: ["ROUTE_SIGNAL_72125C4E", "ROUTE_MANUAL_503E0EA7"]),
+                Outcomes: ["ROUTE_SIGNAL_72125C4E", "ROUTE_MANUAL_503E0EA7"],
+                IdempotencyMode: "required",
+                IdempotencyScope: "principal_action"),
             new WorkflowActionFact(
                 "module_5abe942c84",
                 "action_5cd90325f0",
@@ -35,7 +37,9 @@ public sealed class WorkflowMapTests
                 Found: true,
                 Enabled: false,
                 RequiredPolicy: ["workflow:execute"],
-                Outcomes: ["ROUTE_SIGNAL_72125C4E", "ROUTE_MANUAL_503E0EA7"]),
+                Outcomes: ["ROUTE_SIGNAL_72125C4E", "ROUTE_MANUAL_503E0EA7"],
+                IdempotencyMode: "required",
+                IdempotencyScope: "principal_action"),
         ]);
 
     private static string FixtureRoot
@@ -120,6 +124,59 @@ public sealed class WorkflowMapTests
 
         var violations = WorkflowMapValidator.Validate(WorkflowMap.FromDocument(document), Facts);
         Assert.NotEmpty(violations);
+    }
+
+    /// <summary>
+    /// Действие без идемпотентности нельзя связать с automatic-шагом: доставка задания
+    /// at-least-once, и «ровно один предметный эффект» держится ключом идемпотентности действия,
+    /// а не движком. Отказ обязан наступать на публикации, а не при первом же перехвате аренды.
+    /// </summary>
+    [Fact]
+    public void ActionWithoutIdempotencyCannotBackAnAutomaticStep()
+    {
+        var document = WorkflowMapReader.ReadDocument(Path.Combine(FixtureRoot, "3c363d117b40-v1.flow.json"));
+        var facts = Facts with
+        {
+            Actions =
+            [
+                Facts.Actions[0] with { IdempotencyMode = "none", IdempotencyScope = "none" },
+                Facts.Actions[1],
+            ],
+        };
+
+        var violations = WorkflowMapValidator.Validate(WorkflowMap.FromDocument(document), facts);
+
+        Assert.Contains(violations, item => item.Contains("idempotency_mode 'none'", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Сигнал адресуется типом, а не шагом. Два ожидания одного типа сделали бы получателя
+    /// раннего сигнала зависящим от порядка обхода карты.
+    /// </summary>
+    [Fact]
+    public void TwoWaitStepsCannotShareOneSignalType()
+    {
+        var document = WorkflowMapReader.ReadDocument(Path.Combine(FixtureRoot, "3c363d117b40-v1.flow.json"));
+
+        // Ручной шаг превращается во второе ожидание того же типа: граф остаётся корректным,
+        // ломается только однозначность адресации сигнала.
+        var steps = document["steps"]!.AsArray();
+        var manual = steps.First(step => step!["type"]!.GetValue<string>() == "manual")!.AsObject();
+        var manualKey = manual["key"]!.GetValue<string>();
+        var manualOutcome = manual["allowed_outcomes"]!.AsArray()[0]!.GetValue<string>();
+        var index = steps.IndexOf(manual);
+        steps.RemoveAt(index);
+        steps.Insert(index, new JsonObject
+        {
+            ["key"] = manualKey,
+            ["type"] = "wait_signal",
+            ["signal_type"] = "signal_f21581.received_f1fa89",
+            ["outcome"] = manualOutcome,
+        });
+
+        var violations = WorkflowMapValidator.Validate(WorkflowMap.FromDocument(document), Facts);
+
+        Assert.Contains(violations, item => item.Contains("more than one wait_signal step", StringComparison.Ordinal));
     }
 
     private static string Canonical(JsonNode node)

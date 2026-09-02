@@ -74,6 +74,13 @@ public static class ContractCodes
     public const string WorkflowActionUnavailable = "workflow.action_unavailable";
 
     /// <summary>
+    /// Граница исполнения отказала способом, который не является предметной ошибкой действия:
+    /// например несогласованность закреплённой карты, обнаруженная уже во время завершения.
+    /// Повтор такой попытки бессмыслен, поэтому она неповторяема.
+    /// </summary>
+    public const string WorkflowBoundaryFailed = "workflow.boundary_failed";
+
+    /// <summary>
     /// HTTP-статус для кода ошибки, который НЕ входит в техническую матрицу выше — то есть для
     /// предметного (доменного) кода ошибки, объявленного самой зарегистрированной функцией
     /// (например "operation.not_found" из payment.operation_get_v1). Раз код не технический,

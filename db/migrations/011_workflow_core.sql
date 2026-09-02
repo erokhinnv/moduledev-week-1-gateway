@@ -34,6 +34,24 @@ VALUES ('workflow-worker', 'workflow-engine', '["workflow:execute", "workflow:re
 ON CONFLICT (principal) DO NOTHING;
 
 -------------------------------------------------------------------------------
+-- Признак test profile, известный САМОЙ базе.
+--
+-- Проба fencing (flow test-finish) обходит исполнителя и завершает чужое задание. Ограничивать
+-- её переменной окружения клиента бессмысленно: граница доверия проходит по базе, а не по тому,
+-- какой процесс запустил psql. Флаг проставляется командой bootstrap из COURSE_TEST_PROFILE и
+-- проверяется внутри самой функции-пробы.
+-------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS workflow.runtime_setting (
+    singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    test_profile boolean NOT NULL DEFAULT false,
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO workflow.runtime_setting (singleton, test_profile)
+VALUES (true, false)
+ON CONFLICT (singleton) DO NOTHING;
+
+-------------------------------------------------------------------------------
 -- Определение процесса
 -------------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS workflow.flow_definition (

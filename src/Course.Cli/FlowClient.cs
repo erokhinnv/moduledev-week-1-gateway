@@ -76,8 +76,10 @@ public sealed class FlowClient(NpgsqlDataSource dataSource)
             Jsonb(payload));
 
     /// <summary>
-    /// Проба fencing из test profile. Вызывает ТУ ЖЕ границу завершения, что и worker, поэтому
-    /// проверяет настоящий инвариант, а не отдельную тестовую ветку кода.
+    /// Проба fencing из test profile. Внутри вызывает ТУ ЖЕ границу завершения, что и worker,
+    /// поэтому проверяет настоящий инвариант, а не отдельную тестовую ветку кода. Доступность
+    /// самой пробы решает база по серверному признаку test profile, а не переменная окружения
+    /// клиента: обход арендатора — это вопрос прав, а не того, кто запустил процесс.
     /// </summary>
     public Task<JsonObject> TestFinishAsync(
         Guid jobId,
@@ -87,7 +89,7 @@ public sealed class FlowClient(NpgsqlDataSource dataSource)
         JsonNode result,
         CancellationToken cancellationToken)
         => CallAsync(
-            "SELECT workflow.finish_job($1, $2, $3, $4, $5, NULL)::text",
+            "SELECT workflow.test_finish_job($1, $2, $3, $4, $5)::text",
             cancellationToken,
             Uuid(jobId),
             Text(owner),

@@ -5,6 +5,7 @@ name: moduledev-week-2
 #   gateway            - публичный C# ASP.NET Core шлюз, единственный сервис с host-портом
 #   api                - внутренний C# движок исполнения действий, доступен только по сети Compose
 #   cli                - Course CLI: миграции, публикация действий и карт, trusted-команды процессов
+#                        (тремя разными ролями: миграций, публикации и операций)
 #   postgres           - авторитетное состояние в именованном томе (volume)
 #   worker-a, worker-b - два экземпляра ОДНОГО образа сменного исполнителя процессов
 #
@@ -28,6 +29,7 @@ services:
       COURSE_MIGRATOR_PASSWORD: ${COURSE_MIGRATOR_PASSWORD:-course_local_migrator}
       COURSE_PUBLISHER_PASSWORD: ${COURSE_PUBLISHER_PASSWORD:-course_local_publisher}
       COURSE_RUNTIME_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
+      COURSE_OPERATOR_PASSWORD: ${COURSE_OPERATOR_PASSWORD:-course_local_operator}
       COURSE_WORKER_PASSWORD: ${COURSE_WORKER_PASSWORD:-course_local_worker}
       POSTGRES_INITDB_ARGS: --data-checksums
     volumes:
@@ -58,6 +60,10 @@ services:
       # ни очереди заданий — только каталог действий, определения карт и trusted-команды.
       COURSE_PUBLISHER_USER: course_publisher
       COURSE_PUBLISHER_PASSWORD: ${COURSE_PUBLISHER_PASSWORD:-course_local_publisher}
+      # Роль ОПЕРАЦИЙ: под ней идут команды, двигающие процессы (flow start/get/signal и проба
+      # fencing). Публиковать карты или действия она не может — и наоборот.
+      COURSE_OPERATOR_USER: course_operator
+      COURSE_OPERATOR_PASSWORD: ${COURSE_OPERATOR_PASSWORD:-course_local_operator}
       COURSE_APPLICATION_NAME: course-cli
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
     depends_on:
@@ -149,6 +155,9 @@ services:
   # арендатор просто на него ссылается.
   worker-b:
     image: moduledev-week-2-workflow-worker:local
+    # Образ собирает worker-a; тянуть его из реестра нечего и незачем, поэтому попытка pull
+    # должна быть явной ошибкой конфигурации, а не невнятным отказом сети.
+    pull_policy: never
     environment:
       COURSE_WORKER_ID: worker-b
       COURSE_POSTGRES_HOST: postgres

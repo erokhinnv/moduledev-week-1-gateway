@@ -24,14 +24,21 @@ SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
 DECLARE
+    -- Запас поверх объявленного бюджета действия: он покрывает ожидание соединения, сборку
+    -- payload, проверку схемы запроса и саму границу завершения.
+    c_lease_margin_ms constant integer := 500;
+
     v_now        timestamptz := clock_timestamp();
-    v_lease      interval := make_interval(secs => greatest(coalesce(p_lease_ms, 30000), 250) / 1000.0);
+    v_floor_ms   integer := greatest(coalesce(p_lease_ms, 30000), 250);
+    v_lease      interval;
     v_limit      integer := least(greatest(coalesce(p_limit, 1), 1), 16);
     v_ids        uuid[];
     v_id         uuid;
     v_job        workflow.workflow_job%ROWTYPE;
+    v_task       workflow.task_definition%ROWTYPE;
     v_attempt_id uuid;
     v_expired    integer;
+    v_cap        integer;
     v_descriptor jsonb;
     v_result     jsonb := '[]'::jsonb;
 BEGIN
@@ -57,6 +64,61 @@ BEGIN
 
     FOREACH v_id IN ARRAY v_ids
     LOOP
+        -- Закреплённый картой контракт задачи нужен ДО выдачи аренды: из него берётся бюджет
+        -- времени, а значит и минимальный разумный срок аренды.
+        SELECT t.* INTO v_task
+        FROM workflow.workflow_job j
+        JOIN workflow.step_instance si ON si.step_instance_id = j.step_instance_id
+        JOIN workflow.task_definition t ON t.step_definition_id = si.step_definition_id
+        WHERE j.job_id = v_id;
+
+        -- Абсолютный потолок попыток. Бюджет max_attempts тратят только отказы действия,
+        -- поэтому сбой, который не доходит до fail_job (например исключение внутри границы
+        -- завершения), иначе перезахватывался бы вечно. Потолок делает такой job наблюдаемо
+        -- мёртвым вместо бесконечно живого.
+        v_cap := greatest(coalesce(v_task.max_attempts, 1) * 3, 10);
+
+        SELECT * INTO v_job FROM workflow.workflow_job WHERE job_id = v_id;
+
+        IF v_job.attempt_count >= v_cap THEN
+            UPDATE workflow.task_attempt
+            SET status = 'STALE', finished_at = clock_timestamp()
+            WHERE job_id = v_id AND status = 'RUNNING';
+
+            UPDATE workflow.workflow_job
+            SET state = 'DEAD', lease_owner = NULL, lease_until = NULL, updated_at = now()
+            WHERE job_id = v_id;
+
+            UPDATE workflow.step_instance
+            SET state = 'FAILED', completed_at = clock_timestamp()
+            WHERE step_instance_id = v_job.step_instance_id AND state <> 'FAILED';
+
+            UPDATE workflow.process_instance
+            SET state = 'FAILED', updated_at = now()
+            WHERE process_id = v_job.process_id AND state <> 'FAILED';
+
+            PERFORM workflow.record_event(
+                v_job.process_id, v_job.step_instance_id, 'TaskFailed',
+                jsonb_build_object(
+                    'jobId', v_job.job_id,
+                    'errorCode', 'workflow.attempt_limit_exhausted',
+                    'attemptCount', v_job.attempt_count
+                )
+            );
+            PERFORM workflow.record_event(
+                v_job.process_id, v_job.step_instance_id, 'ProcessFailed',
+                jsonb_build_object('errorCode', 'workflow.attempt_limit_exhausted')
+            );
+
+            CONTINUE;
+        END IF;
+
+        -- Аренда обязана переживать объявленный бюджет действия. Иначе второй исполнитель
+        -- перехватывает задание на середине работы первого, оба уходят в один и тот же
+        -- executionId и упираются в строку идемпотентности друг друга.
+        v_lease := make_interval(
+            secs => greatest(v_floor_ms, coalesce(v_task.timeout_ms, 0) + c_lease_margin_ms) / 1000.0);
+
         -- Истёкшая аренда оставляет попытку в статусе STALE: она увеличила attempt_count, но
         -- НЕ расходует бюджет отказов max_attempts — сбоя действия не было, было исчезновение
         -- арендатора.
@@ -292,7 +354,8 @@ CREATE OR REPLACE FUNCTION workflow.fail_job(
     p_owner text,
     p_lease_version bigint,
     p_error_code text,
-    p_retryable boolean DEFAULT false
+    p_retryable boolean DEFAULT false,
+    p_dispatch jsonb DEFAULT NULL
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -338,6 +401,30 @@ BEGIN
       AND status = 'RUNNING';
 
     v_failures := v_job.failure_count + 1;
+
+    -- Технический след неуспешного вызова. Он пишется ЭТОЙ транзакцией, а не откаченной
+    -- транзакцией действия, поэтому переживает откат предметного эффекта. Строка появляется
+    -- только если действие реально вызывалось: отказ маппинга или недоступность версии не
+    -- являются вызовом и следа не оставляют.
+    IF p_dispatch IS NOT NULL AND jsonb_typeof(p_dispatch) = 'object' THEN
+        INSERT INTO api.dispatch (
+            correlation_id, request_id, module, action, version,
+            principal, consumer, payload_hash, status, error_code, duration_ms
+        )
+        VALUES (
+            (p_dispatch ->> 'correlationId')::uuid,
+            p_dispatch ->> 'requestId',
+            p_dispatch ->> 'module',
+            p_dispatch ->> 'action',
+            (p_dispatch ->> 'version')::integer,
+            p_dispatch ->> 'principal',
+            p_dispatch ->> 'consumer',
+            p_dispatch ->> 'payloadHash',
+            'ERROR',
+            v_code,
+            (p_dispatch ->> 'durationMs')::integer
+        );
+    END IF;
 
     PERFORM workflow.record_event(
         v_job.process_id, v_job.step_instance_id, 'TaskAttemptFailed',
@@ -405,6 +492,52 @@ END;
 $fn$;
 
 -------------------------------------------------------------------------------
+-- Проба fencing из test profile.
+--
+-- Она вызывает ТУ ЖЕ production-границу завершения, что и исполнитель, поэтому проверяет
+-- настоящий инвариант, а не отдельную тестовую ветку. Но доступность самой пробы решается
+-- признаком, который знает БАЗА: ограничивать обход арендатора переменной окружения клиента
+-- значило бы проводить границу доверия по тому, кто запустил процесс, а не по правам в базе.
+-------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION workflow.set_test_profile(p_enabled boolean)
+RETURNS void
+LANGUAGE sql
+SET search_path = pg_catalog
+AS $fn$
+    UPDATE workflow.runtime_setting
+    SET test_profile = coalesce(p_enabled, false), updated_at = now()
+    WHERE singleton;
+$fn$;
+
+CREATE OR REPLACE FUNCTION workflow.test_finish_job(
+    p_job_id uuid,
+    p_owner text,
+    p_lease_version bigint,
+    p_outcome text,
+    p_result jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $fn$
+DECLARE
+    v_enabled boolean;
+BEGIN
+    SELECT test_profile INTO v_enabled FROM workflow.runtime_setting WHERE singleton;
+
+    IF NOT coalesce(v_enabled, false) THEN
+        RETURN workflow.failure(
+            'workflow.test_profile_required',
+            'the fencing probe is available only under the test profile');
+    END IF;
+
+    -- Проба намеренно не передаёт технический след: она не является исполнением действия.
+    RETURN workflow.finish_job(p_job_id, p_owner, p_lease_version, p_outcome, p_result, NULL);
+END;
+$fn$;
+
+-------------------------------------------------------------------------------
 -- Диагностика: компактная выгрузка процесса, шагов, заданий и попыток.
 -- Используется и командой flow get, и зарегистрированным действием workflow.get.
 -------------------------------------------------------------------------------
@@ -423,7 +556,20 @@ AS $fn$
             'state', p.state,
             'currentStepKey', p.current_step_key,
             'createdAt', p.created_at,
-            'updatedAt', p.updated_at
+            'updatedAt', p.updated_at,
+            -- Диагностика обязана оставаться читаемой и при разросшейся истории: ответ действия
+            -- ограничен COURSE_MAX_RESULT_BYTES, и без потолка выборки workflow.get переставал бы
+            -- отвечать ровно на тех процессах, ради которых его и открывают.
+            'truncated', (
+                SELECT count(*) > 200 FROM workflow.step_instance s WHERE s.process_id = p.process_id
+            ) OR (
+                SELECT count(*) > 200 FROM workflow.workflow_job j WHERE j.process_id = p.process_id
+            ) OR (
+                SELECT count(*) > 200
+                FROM workflow.task_attempt a
+                JOIN workflow.workflow_job j ON j.job_id = a.job_id
+                WHERE j.process_id = p.process_id
+            )
         ),
         'steps', coalesce((
             SELECT jsonb_agg(jsonb_build_object(
@@ -435,8 +581,12 @@ AS $fn$
                 'enteredAt', s.entered_at,
                 'completedAt', s.completed_at
             ) ORDER BY s.entered_at, s.step_instance_id)
-            FROM workflow.step_instance s
-            WHERE s.process_id = p.process_id
+            FROM (
+                SELECT * FROM workflow.step_instance
+                WHERE process_id = p.process_id
+                ORDER BY entered_at, step_instance_id
+                LIMIT 200
+            ) AS s
         ), '[]'::jsonb),
         'jobs', coalesce((
             SELECT jsonb_agg(jsonb_build_object(
@@ -450,8 +600,12 @@ AS $fn$
                 'attemptCount', j.attempt_count,
                 'nextAttemptAt', j.next_attempt_at
             ) ORDER BY j.created_at, j.job_id)
-            FROM workflow.workflow_job j
-            WHERE j.process_id = p.process_id
+            FROM (
+                SELECT * FROM workflow.workflow_job
+                WHERE process_id = p.process_id
+                ORDER BY created_at, job_id
+                LIMIT 200
+            ) AS j
         ), '[]'::jsonb),
         'attempts', coalesce((
             SELECT jsonb_agg(jsonb_build_object(
@@ -466,9 +620,13 @@ AS $fn$
                 'startedAt', a.started_at,
                 'finishedAt', a.finished_at
             ) ORDER BY a.started_at, a.attempt_number)
-            FROM workflow.task_attempt a
-            JOIN workflow.workflow_job j ON j.job_id = a.job_id
-            WHERE j.process_id = p.process_id
+            FROM (
+                SELECT a.* FROM workflow.task_attempt a
+                JOIN workflow.workflow_job j ON j.job_id = a.job_id
+                WHERE j.process_id = p.process_id
+                ORDER BY a.started_at, a.attempt_number
+                LIMIT 200
+            ) AS a
         ), '[]'::jsonb)
     )
     FROM workflow.process_instance p

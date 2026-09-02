@@ -10,7 +10,9 @@ public sealed record WorkflowActionFact(
     bool Found,
     bool Enabled,
     IReadOnlyList<string> RequiredPolicy,
-    IReadOnlyList<string> Outcomes);
+    IReadOnlyList<string> Outcomes,
+    string IdempotencyMode,
+    string IdempotencyScope);
 
 /// <summary>Всё авторитетное состояние, нужное валидатору карты: каталог и права исполнителя.</summary>
 public sealed record WorkflowPublicationFacts(
@@ -40,7 +42,9 @@ public sealed record WorkflowPublicationFacts(
                     item["found"]?.GetValue<bool>() ?? false,
                     item["enabled"]?.GetValue<bool>() ?? false,
                     ReadStrings(item["requiredPolicy"]),
-                    ReadStrings(item["outcomes"])));
+                    ReadStrings(item["outcomes"]),
+                    item["idempotencyMode"]?.GetValue<string>() ?? "none",
+                    item["idempotencyScope"]?.GetValue<string>() ?? "none"));
             }
         }
 
@@ -108,8 +112,24 @@ public static class WorkflowMapValidator
             }
         }
 
-        // 5. Контракт действия каждой automatic-задачи: существование, включённость, точное
-        //    совпадение policy и достаточность server-side scopes исполнителя.
+        // 5. Тип сигнала однозначно определяет шаг ожидания. Принятый сигнал адресуется типом, а
+        //    не шагом, поэтому два wait_signal одного типа сделали бы получателя раннего сигнала
+        //    зависящим от порядка обхода — то есть неопределённым.
+        var duplicateSignals = map.Steps
+            .Where(step => step.Type == WorkflowStepType.WaitSignal && step.SignalType is not null)
+            .GroupBy(step => step.SignalType!, StringComparer.Ordinal)
+            .Where(group => group.Count() > 1)
+            .Select(group => group.Key)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (duplicateSignals.Length > 0)
+        {
+            violations.Add(
+                $"signal types are declared by more than one wait_signal step: {string.Join(", ", duplicateSignals)}");
+        }
+
+        // 6. Контракт действия каждой automatic-задачи: существование, включённость, точное
+        //    совпадение policy, достаточность server-side scopes исполнителя и идемпотентность.
         var stepOutcomes = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.Ordinal);
         foreach (var step in map.Steps)
         {
@@ -122,7 +142,7 @@ public static class WorkflowMapValidator
             stepOutcomes[step.Key] = step.DeclaredOutcomes(actionOutcomes);
         }
 
-        // 6. Ровно один переход на каждый объявленный исход и ни одного лишнего перехода.
+        // 7. Ровно один переход на каждый объявленный исход и ни одного лишнего перехода.
         violations.AddRange(ValidateOutcomeCoverage(map, steps, stepOutcomes));
 
         if (violations.Count > 0)
@@ -130,7 +150,7 @@ public static class WorkflowMapValidator
             return violations;
         }
 
-        // 7. Достижимость, ацикличность и отсутствие тупиков считаются только на связном графе,
+        // 8. Достижимость, ацикличность и отсутствие тупиков считаются только на связном графе,
         //    иначе диагностика превращается в шум от уже найденных ошибок.
         violations.AddRange(ValidateGraph(map, steps));
 
@@ -173,6 +193,18 @@ public static class WorkflowMapValidator
             if (actionOutcomes.Length == 0)
             {
                 violations.Add($"step '{stepKey}' references an action without declared outcomes");
+            }
+
+            // Доставка задания — at-least-once, и «ровно один предметный эффект» держится не
+            // движком, а ключом идемпотентности действия. Действие без идемпотентности при
+            // первом же перехвате истёкшей аренды создаст второй эффект, поэтому связать с ним
+            // automatic-шаг нельзя вообще: это отказ на публикации, а не сбой в рантайме.
+            if (fact.IdempotencyMode == "none")
+            {
+                violations.Add(
+                    $"step '{stepKey}' binds an automatic task to action {task.RouteKey} " +
+                    $"version {task.ActionVersion}, which declares idempotency_mode 'none'; " +
+                    "at-least-once delivery would create a second domain effect on reclaim");
             }
         }
 

@@ -297,6 +297,13 @@ BEGIN
         RETURN workflow.ok(workflow.process_summary(v_process.process_id));
     END IF;
 
+    -- Выбор активной версии сериализуется с activate тем же advisory-замком по имени карты.
+    -- Без него процесс, вставка которого зафиксировалась ПОСЛЕ коммита activate, мог оказаться
+    -- закреплён за прежней версией, и утверждение «activate действует на новые экземпляры»
+    -- переставало быть точным на границе. Оба вызова берут этот замок первым, поэтому порядок
+    -- захвата одинаков и взаимоблокировки не возникает.
+    PERFORM pg_advisory_xact_lock(hashtext('workflow.flow'), hashtext(p_flow_name));
+
     SELECT * INTO v_version
     FROM workflow.flow_version
     WHERE flow_id = v_flow.flow_id AND is_active;
@@ -453,6 +460,27 @@ BEGIN
         )
         VALUES (p_message_id, p_process_id, p_signal_type, v_body, v_hash, 'ACCEPTED');
     EXCEPTION WHEN unique_violation THEN
+        -- Гонка двух доставок одного сообщения. Победила чужая транзакция — разбираем её
+        -- результат ровно теми же правилами, что и обычный повтор выше: идентичный сигнал
+        -- обязан остаться duplicate, а не превратиться в конфликт из-за одновременности.
+        SELECT * INTO v_existing
+        FROM workflow.workflow_signal
+        WHERE message_id = p_message_id;
+
+        IF FOUND
+           AND v_existing.process_id = p_process_id
+           AND v_existing.signal_type = p_signal_type
+           AND v_existing.body_hash = v_hash
+        THEN
+            RETURN workflow.ok(jsonb_build_object(
+                'resource', 'signal',
+                'processId', v_existing.process_id,
+                'messageId', v_existing.message_id,
+                'signalType', v_existing.signal_type,
+                'status', 'duplicate'
+            ));
+        END IF;
+
         RETURN workflow.failure(
             'workflow.signal_conflict',
             'message id was already used for a different signal');

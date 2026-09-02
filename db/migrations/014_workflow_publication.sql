@@ -34,7 +34,12 @@ AS $fn$
                     'found', av.action_version_id IS NOT NULL,
                     'enabled', coalesce(av.enabled, false),
                     'requiredPolicy', coalesce(av.required_policy, '[]'::jsonb),
-                    'outcomes', coalesce(av.outcomes, '[]'::jsonb)
+                    'outcomes', coalesce(av.outcomes, '[]'::jsonb),
+                    -- Режим идемпотентности действия — не справочная информация, а условие
+                    -- публикации карты: без него executionId перестаёт быть ключом предметного
+                    -- эффекта, и at-least-once доставка задания создаёт второй эффект.
+                    'idempotencyMode', coalesce(av.idempotency_mode, 'none'),
+                    'idempotencyScope', coalesce(av.idempotency_scope, 'none')
                 ))
                 FROM (
                     SELECT DISTINCT

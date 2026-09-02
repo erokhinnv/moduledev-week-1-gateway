@@ -106,7 +106,8 @@ REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA api FROM PUBLIC;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA workflow FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA workflow FROM PUBLIC;
 
-GRANT USAGE ON SCHEMA workflow TO course_runtime;
+-- USAGE на схему workflow runtime-роли НЕ выдаётся: представления autocheck исполняются от
+-- имени своего владельца, поэтому для чтения проекций доступ к нижележащей схеме не нужен.
 GRANT SELECT ON autocheck.flow_versions   TO course_runtime;
 GRANT SELECT ON autocheck.processes       TO course_runtime;
 GRANT SELECT ON autocheck.steps           TO course_runtime;
@@ -124,7 +125,7 @@ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION api.invoke(text, text, integer, jsonb, jsonb) TO workflow_worker';
         EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.claim_jobs(text, integer, integer) TO workflow_worker';
         EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.finish_job(uuid, text, bigint, text, jsonb, jsonb) TO workflow_worker';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.fail_job(uuid, text, bigint, text, boolean) TO workflow_worker';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.fail_job(uuid, text, bigint, text, boolean, jsonb) TO workflow_worker';
         EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA api FROM workflow_worker';
         EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA workflow FROM workflow_worker';
         EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA autocheck FROM workflow_worker';
@@ -138,18 +139,33 @@ $$;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'course_publisher') THEN
-        -- Роль публикации управляет определениями карт и локальными trusted-командами CLI.
-        -- Она НЕ получает claim_jobs: очередь принадлежит worker'у, а не публикатору.
+        -- Роль ПУБЛИКАЦИИ управляет только определениями: каталогом действий и картами.
+        -- Ни запуска процессов, ни сигналов, ни завершения заданий она не может — иначе
+        -- компрометация учётных данных публикации давала бы управление исполнением.
         EXECUTE 'GRANT USAGE ON SCHEMA workflow TO course_publisher';
         EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.publication_facts(jsonb) TO course_publisher';
         EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.publish_flow(jsonb) TO course_publisher';
         EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.activate_flow(text, integer) TO course_publisher';
         EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.list_flows() TO course_publisher';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.start_process(text, text, jsonb) TO course_publisher';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.accept_signal(uuid, text, text, jsonb) TO course_publisher';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.describe_process_envelope(uuid) TO course_publisher';
-        -- flow test-finish вызывает ту же production-границу завершения, что и worker.
-        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.finish_job(uuid, text, bigint, text, jsonb, jsonb) TO course_publisher';
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'course_operator') THEN
+        -- Роль ОПЕРАЦИЙ двигает процессы, но не меняет определения: опубликовать или
+        -- активировать карту она не может. Обратное разделение к роли публикации.
+        EXECUTE 'GRANT USAGE ON SCHEMA workflow TO course_operator';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.start_process(text, text, jsonb) TO course_operator';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.accept_signal(uuid, text, text, jsonb) TO course_operator';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.describe_process_envelope(uuid) TO course_operator';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.list_flows() TO course_operator';
+        -- Проба fencing вызывает ту же границу завершения, что и worker, но сама доступна
+        -- только при серверном признаке test profile (см. workflow.test_finish_job).
+        EXECUTE 'GRANT EXECUTE ON FUNCTION workflow.test_finish_job(uuid, text, bigint, text, jsonb) TO course_operator';
+    ELSE
+        RAISE NOTICE 'course_operator role is absent, operator grants skipped';
     END IF;
 END;
 $$;

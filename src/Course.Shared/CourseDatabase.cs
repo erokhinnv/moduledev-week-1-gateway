@@ -22,6 +22,13 @@ public static class CourseDatabase
         public static readonly Credentials Publication = new("COURSE_PUBLISHER_USER", "COURSE_PUBLISHER_PASSWORD");
 
         /// <summary>
+        /// Набор роли ОПЕРАЦИЙ: им идут команды, двигающие процессы (start, signal, get и проба
+        /// fencing). Публиковать карты или действия эта роль не может — разделение ровно обратное
+        /// роли публикации, чтобы ни один набор учётных данных не давал и определения, и исполнение.
+        /// </summary>
+        public static readonly Credentials Operation = new("COURSE_OPERATOR_USER", "COURSE_OPERATOR_PASSWORD");
+
+        /// <summary>
         /// Набор публикации, если он задан, иначе основной. Возврат к основному нужен для
         /// совместимости: контур, развёрнутый до разделения ролей, продолжает работать на одних
         /// учётных данных, просто без выигрыша от разделения.
@@ -30,6 +37,16 @@ public static class CourseDatabase
             => string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(Publication.UserVariable))
                 ? Default
                 : Publication;
+
+        /// <summary>
+        /// Набор операций, если он задан, иначе набор публикации. Тот же приём совместимости:
+        /// контур, развёрнутый до появления роли оператора, продолжает работать на прежних
+        /// учётных данных — просто без выигрыша от разделения.
+        /// </summary>
+        public static Credentials OperationOrPublication()
+            => string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(Operation.UserVariable))
+                ? PublicationOrDefault()
+                : Operation;
     }
 
     /// <summary>

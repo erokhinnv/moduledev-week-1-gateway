@@ -131,6 +131,116 @@ public sealed class WorkflowIntegrationTests
         Assert.NotEqual(0, start.ExitCode);
     }
 
+    /// <summary>
+    /// Определения и исполнение разведены по разным ролям: ни один набор учётных данных не даёт
+    /// сразу и публикацию карты, и управление процессами.
+    /// </summary>
+    [SkippableFact]
+    public void PublicationAndOperationRolesAreSeparated()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        // Публикатор не двигает процессы и не завершает задания.
+        var publisherStart = IntegrationEnvironment.Psql(
+            "SELECT workflow.start_process('workflow-smoke', 'forbidden', '{}'::jsonb);",
+            role: "course_publisher");
+        Assert.NotEqual(0, publisherStart.ExitCode);
+
+        var publisherSignal = IntegrationEnvironment.Psql(
+            "SELECT workflow.accept_signal(gen_random_uuid(), 'training.completed', 'forbidden', '{}'::jsonb);",
+            role: "course_publisher");
+        Assert.NotEqual(0, publisherSignal.ExitCode);
+
+        var publisherFinish = IntegrationEnvironment.Psql(
+            "SELECT workflow.finish_job(gen_random_uuid(), 'worker-a', 1, 'X', '{}'::jsonb, NULL);",
+            role: "course_publisher");
+        Assert.NotEqual(0, publisherFinish.ExitCode);
+
+        // Оператор двигает процессы, но не меняет определения.
+        var operatorPublish = IntegrationEnvironment.Psql(
+            "SELECT workflow.publish_flow('{}'::jsonb);", role: "course_operator");
+        Assert.NotEqual(0, operatorPublish.ExitCode);
+
+        var operatorActivate = IntegrationEnvironment.Psql(
+            "SELECT workflow.activate_flow('workflow-smoke', 1);", role: "course_operator");
+        Assert.NotEqual(0, operatorActivate.ExitCode);
+
+        // И при этом каждая роль действительно может делать своё дело.
+        var publisherList = IntegrationEnvironment.Psql(
+            "SELECT jsonb_array_length(workflow.list_flows());", role: "course_publisher");
+        Assert.Equal(0, publisherList.ExitCode);
+
+        var operatorRead = IntegrationEnvironment.Psql(
+            "SELECT workflow.describe_process_envelope(gen_random_uuid()) ->> 'status';",
+            role: "course_operator");
+        Assert.Equal(0, operatorRead.ExitCode);
+    }
+
+    /// <summary>
+    /// Проба fencing обходит арендатора, поэтому решать, разрешена ли она, обязана база — а не
+    /// переменная окружения того, кто запустил клиент.
+    /// </summary>
+    [SkippableFact]
+    public void FencingProbeRequiresTheServerSideTestProfile()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var profile = IntegrationEnvironment.Psql(
+            "SELECT test_profile FROM workflow.runtime_setting;");
+        Assert.Equal(0, profile.ExitCode);
+        Skip.If(profile.Output.Trim() == "t", "the stack runs under the test profile");
+
+        // Даже от лица роли оператора, которой проба выдана, вне test profile она отказывает.
+        var probe = IntegrationEnvironment.Psql(
+            "SELECT workflow.test_finish_job(gen_random_uuid(), 'worker-a', 1, 'X', '{}'::jsonb) ->> 'code';",
+            role: "course_operator");
+
+        Assert.Equal(0, probe.ExitCode);
+
+        // Запрос от лица роли выполняется как "SET ROLE ...; <sql>", поэтому psql печатает ещё и
+        // эхо SET: значимой является последняя непустая строка вывода.
+        Assert.Equal("workflow.test_profile_required", LastLine(probe.Output));
+    }
+
+    /// <summary>
+    /// Бюджет max_attempts тратят только отказы действия, поэтому сбой, не доходящий до fail_job,
+    /// иначе перезахватывался бы вечно. Абсолютный потолок делает такое задание наблюдаемо
+    /// мёртвым вместо бесконечно живого.
+    /// </summary>
+    [SkippableFact]
+    public void AttemptCeilingKillsAJobThatNeverReportsFailure()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var businessKey = $"itest-ceiling-{Guid.NewGuid():N}";
+        var processId = StartSmokeProcess(businessKey);
+        Assert.True(
+            WaitForState(processId, "WAITING_SIGNAL"),
+            $"process {processId} did not reach WAITING_SIGNAL");
+
+        // Задание уже завершено; возвращаем его в очередь с исчерпанным потолком попыток.
+        var seeded = IntegrationEnvironment.Psql(
+            "UPDATE workflow.workflow_job SET state = 'READY', attempt_count = 999, " +
+            "lease_owner = NULL, lease_until = NULL, next_attempt_at = now() " +
+            $"WHERE process_id = '{processId}';");
+        Assert.Equal(0, seeded.ExitCode);
+
+        // Кто бы ни забрал его первым — рабочий исполнитель или этот вызов — исход один.
+        IntegrationEnvironment.Psql("SELECT jsonb_array_length(workflow.claim_jobs('itest-probe', 1, 1000));");
+
+        var settled = WaitForState(processId, "FAILED");
+        Assert.True(settled, $"process {processId} did not settle as FAILED");
+
+        var job = IntegrationEnvironment.Psql(
+            $"SELECT state FROM autocheck.jobs WHERE process_id = '{processId}';");
+        Assert.Equal("DEAD", job.Output.Trim());
+
+        var failed = IntegrationEnvironment.Psql(
+            "SELECT count(*) FROM autocheck.workflow_events " +
+            $"WHERE process_id = '{processId}' AND event_type = 'TaskFailed';");
+        Assert.NotEqual("0", failed.Output.Trim());
+    }
+
     [SkippableFact]
     public void ConcurrentActivateLeavesExactlyOneActiveVersion()
     {
@@ -209,6 +319,50 @@ public sealed class WorkflowIntegrationTests
         Assert.Contains("conflict", conflict?["code"]?.GetValue<string>() ?? string.Empty);
     }
 
+    /// <summary>
+    /// Одновременная повторная доставка одного сообщения обязана оставаться идемпотентной.
+    /// Гонка не должна превращать честный повтор в конфликт: клиент с ретраями увидел бы отказ
+    /// там, где контракт обещает duplicate.
+    /// </summary>
+    [SkippableFact]
+    public void ConcurrentIdenticalSignalsStayIdempotent()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var fixtures = IntegrationEnvironment.FixturesDirectory;
+        var businessKey = $"itest-signal-race-{Guid.NewGuid():N}";
+        var processId = StartSmokeProcess(businessKey);
+        Assert.True(
+            WaitForState(processId, "WAITING_SIGNAL"),
+            $"process {processId} did not reach WAITING_SIGNAL");
+
+        var messageId = $"{businessKey}-msg";
+        var deliveries = Enumerable.Range(0, 6)
+            .Select(_ => Task.Run(() => IntegrationEnvironment.Cli(
+                fixtures, "flow", "signal", processId,
+                "--type", "training.completed",
+                "--message-id", messageId,
+                "--payload", "/itest/data/smoke-signal.json")))
+            .ToArray();
+        Task.WaitAll(deliveries.Cast<Task>().ToArray());
+
+        var statuses = new List<string>();
+        foreach (var delivery in deliveries)
+        {
+            var (exitCode, envelope) = delivery.Result;
+            Assert.True(exitCode == 0, $"a concurrent signal delivery failed: {envelope?.ToJsonString()}");
+            statuses.Add(envelope?["result"]?["status"]?.GetValue<string>() ?? string.Empty);
+        }
+
+        // Ровно одна доставка приняла сигнал, остальные увидели повтор.
+        Assert.Equal(1, statuses.Count(status => status == "accepted"));
+        Assert.Equal(5, statuses.Count(status => status == "duplicate"));
+
+        var stored = IntegrationEnvironment.Psql(
+            $"SELECT count(*) FROM autocheck.signals WHERE message_id = '{messageId}';");
+        Assert.Equal("1", stored.Output.Trim());
+    }
+
     [SkippableFact]
     public void SmokeFlowReachesCompletedThroughSignal()
     {
@@ -268,6 +422,12 @@ public sealed class WorkflowIntegrationTests
             $"SELECT count(*) FROM autocheck.signals WHERE process_id = '{processId}';");
         Assert.Equal("1", signals.Output.Trim());
     }
+
+    /// <summary>Последняя непустая строка вывода psql — сам результат, без эха служебных команд.</summary>
+    private static string LastLine(string output)
+        => output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .LastOrDefault() ?? string.Empty;
 
     /// <summary>
     /// Запускает процесс встроенной карты под заданным business key. Запуск идемпотентен, поэтому

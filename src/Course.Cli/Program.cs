@@ -290,7 +290,7 @@ internal static class CourseCli
             ? FlowReader.ReadJsonObject(dataPath, "process data")
             : new JsonObject();
 
-        await using var dataSource = CreatePublicationDataSource();
+        await using var dataSource = CreateOperationDataSource();
         var result = await new FlowClient(dataSource).StartAsync(flowName, businessKey, data, cancellationToken);
         result["operation"] = "started";
         return result;
@@ -301,7 +301,7 @@ internal static class CourseCli
         CancellationToken cancellationToken)
     {
         var processId = ParseUuid(RequirePositional(positional, "flow get", "<process-id>"), "process id");
-        await using var dataSource = CreatePublicationDataSource();
+        await using var dataSource = CreateOperationDataSource();
         return await new FlowClient(dataSource).GetAsync(processId, cancellationToken);
     }
 
@@ -325,7 +325,7 @@ internal static class CourseCli
         }
 
         var payload = FlowReader.ReadJsonObject(payloadPath, "signal payload");
-        await using var dataSource = CreatePublicationDataSource();
+        await using var dataSource = CreateOperationDataSource();
         return await new FlowClient(dataSource)
             .SignalAsync(processId, signalType, messageId, payload, cancellationToken);
     }
@@ -363,7 +363,7 @@ internal static class CourseCli
         }
 
         var result = FlowReader.ReadJsonObject(resultPath, "task result");
-        await using var dataSource = CreatePublicationDataSource();
+        await using var dataSource = CreateOperationDataSource();
         return await new FlowClient(dataSource)
             .TestFinishAsync(jobId, owner, leaseVersion, outcome, result, cancellationToken);
     }
@@ -433,6 +433,10 @@ internal static class CourseCli
         await WaitForDatabaseAsync(migrationSource, cancellationToken);
 
         var migration = await new MigrationRunner(migrationSource).ApplyAsync(migrations, cancellationToken);
+
+        // Профиль исполнения записывается в саму базу: проба fencing обходит арендатора, и
+        // решать, разрешена ли она, обязана база, а не переменная окружения клиента.
+        await SetTestProfileAsync(migrationSource, cancellationToken);
 
         await using var publicationSource = CreatePublicationDataSource();
         var catalog = new CatalogClient(publicationSource);
@@ -520,6 +524,24 @@ internal static class CourseCli
     }
 
     /// <summary>
+    /// Записывает признак test profile в авторитетное состояние. Выполняется ролью миграций:
+    /// это установочная настройка контура того же класса, что и сама схема, а не операция
+    /// публикации или исполнения.
+    /// </summary>
+    private static async Task SetTestProfileAsync(
+        NpgsqlDataSource dataSource,
+        CancellationToken cancellationToken)
+    {
+        await using var command = dataSource.CreateCommand("SELECT workflow.set_test_profile($1)");
+        command.Parameters.Add(new NpgsqlParameter
+        {
+            NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Boolean,
+            Value = Env.Optional("COURSE_TEST_PROFILE", "0") == "1",
+        });
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Ждёт, пока PostgreSQL станет доступен, простым опросом раз в секунду. Нужно потому что
     /// сервис cli в Docker Compose стартует сразу после того, как контейнер postgres прошёл
     /// собственный healthcheck, но самому PostgreSQL может понадобиться ещё немного времени,
@@ -584,6 +606,19 @@ internal static class CourseCli
             commandTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_COMMAND_TIMEOUT", 120),
             maxPoolSize: 4,
             credentials: CourseDatabase.Credentials.PublicationOrDefault());
+
+    /// <summary>
+    /// Подключение от лица роли ОПЕРАЦИЙ (course_operator). Ею идут команды, двигающие процессы:
+    /// start, get, signal и проба fencing. Публиковать карты или действия эта роль не может, а
+    /// публикатор не может двигать процессы — ни один набор учётных данных не даёт сразу и
+    /// определение, и исполнение.
+    /// </summary>
+    private static NpgsqlDataSource CreateOperationDataSource()
+        => CourseDatabase.CreateDataSource(
+            connectTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_CONNECT_TIMEOUT", 5),
+            commandTimeoutSeconds: Env.OptionalInt("COURSE_POSTGRES_COMMAND_TIMEOUT", 120),
+            maxPoolSize: 4,
+            credentials: CourseDatabase.Credentials.OperationOrPublication());
 
     /// <summary>Печатает итоговый JSON-конверт в реальный stdout (переданный отдельно от подменённого Console.Out).</summary>
     private static void Write(TextWriter stdout, JsonNode envelope)

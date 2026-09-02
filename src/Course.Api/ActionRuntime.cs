@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Course.Shared;
@@ -381,69 +380,52 @@ public sealed class ActionRuntime(
             envelopeText = await invoke.ExecuteScalarAsync(budget.Token) as string;
         }
 
-        // Отсечка по размеру до разбора: см. комментарий у MaxResultBytes.
-        if (envelopeText is not null && Encoding.UTF8.GetByteCount(envelopeText) > MaxResultBytes)
+        // Разбор конверта общий с исполнителем процессов: правила «что считать успехом,
+        // предметной ошибкой и нарушением контракта» обязаны совпадать дословно на обоих путях
+        // исполнения одного и того же действия. Держать их в двух местах означало бы рано или
+        // поздно разойтись в трактовке одного конверта.
+        var interpreted = RegisteredAction.Interpret(
+            envelopeText, manifest.Outcomes, manifest.ResponseSchema, MaxResultBytes);
+
+        if (interpreted.Status == RegisteredActionStatus.ContractViolation)
         {
+            // Нарушение контракта зарегистрированной функции: неизвестный исход, результат мимо
+            // схемы ответа или конверт не той формы. Любой случай — полный откат.
             await transaction.RollbackAsync(CancellationToken.None);
             evidence.Status = "ERROR";
             evidence.ErrorCode = ContractCodes.ContractViolation;
             return Failure(
                 ContractCodes.ContractViolation,
-                "action result exceeds the configured size limit",
+                interpreted.Message,
                 correlationId,
-                manifest.Version);
+                interpreted.ActionVersion ?? manifest.Version);
         }
 
-        if (envelopeText is null || JsonNode.Parse(envelopeText) is not JsonObject envelope)
-        {
-            // api.invoke обязан вернуть валидный JSON-конверт. Если этого не произошло —
-            // это нарушение контракта самой функции каталога, а не предметной ошибки клиента.
-            await transaction.RollbackAsync(CancellationToken.None);
-            evidence.Status = "ERROR";
-            evidence.ErrorCode = ContractCodes.ContractViolation;
-            return Failure(ContractCodes.ContractViolation, "action returned a non contractual envelope", correlationId, manifest.Version);
-        }
-
-        if (envelope["status"]?.GetValue<string>() != "ok")
+        if (interpreted.Status == RegisteredActionStatus.DomainError)
         {
             // Любой объявленный сбой (status=error) полностью откатывает весь предметный эффект
             // ЕЩЁ ДО того, как клиенту будет отправлен ответ. Например, если платёжная функция
             // вернула ошибку уже после того, как успела что-то вставить в таблицу — эта вставка
             // будет отменена транзакцией целиком.
             await transaction.RollbackAsync(CancellationToken.None);
-
-            var code = envelope["code"]?.GetValue<string>() ?? ContractCodes.InternalError;
-            var message = envelope["message"]?.GetValue<string>() ?? "action returned a domain error";
-            var retryable = envelope["retryable"]?.GetValue<bool>() ?? false;
-
             evidence.Status = "ERROR";
-            evidence.ErrorCode = code;
+            evidence.ErrorCode = interpreted.Code;
 
             return new ActionResponse(
-                ContractCodes.HttpStatus(code),
-                Envelope.Error(code, message, correlationId, manifest.Version, retryable));
-        }
-
-        // Признак повтора по ключу идемпотентности. Такой результат был исполнен и полностью
-        // проверен РАНЬШЕ — возможно, другой версией действия, если с тех пор сменилась версия
-        // по умолчанию. Мерить его сегодняшним манифестом нельзя: список исходов и схема ответа
-        // у текущей версии могут быть другими, и честный сохранённый результат выглядел бы
-        // нарушением контракта.
-        var replayed = envelope["replayed"] is JsonValue replayFlag &&
-                       replayFlag.TryGetValue<bool>(out var replayValue) &&
-                       replayValue;
-
-        int? executedVersion = null;
-        if (envelope["meta"]?["actionVersion"] is JsonValue versionValue &&
-            versionValue.TryGetValue<int>(out var parsedExecutedVersion))
-        {
-            executedVersion = parsedExecutedVersion;
+                ContractCodes.HttpStatus(interpreted.Code),
+                Envelope.Error(
+                    interpreted.Code,
+                    interpreted.Message,
+                    correlationId,
+                    manifest.Version,
+                    interpreted.Retryable));
         }
 
         // Страховка к явной версии, переданной выше: свежее исполнение обязано подтвердить, что
         // отработала именно та версия, по схеме и политике которой запрос был проверен. Для
-        // повтора это требование неприменимо — там версия заведомо своя, историческая.
-        if (!replayed && executedVersion != manifest.Version)
+        // повтора это требование неприменимо — там версия заведомо своя, историческая, и мерить
+        // сохранённый результат сегодняшним манифестом нельзя.
+        if (!interpreted.Replayed && interpreted.ActionVersion != manifest.Version)
         {
             await transaction.RollbackAsync(CancellationToken.None);
             evidence.Status = "ERROR";
@@ -456,44 +438,11 @@ public sealed class ActionRuntime(
         }
 
         // Наружу и в технический след идёт версия, которая результат действительно произвела.
-        var reportedVersion = executedVersion ?? manifest.Version;
+        var reportedVersion = interpreted.ActionVersion ?? manifest.Version;
+        var replayed = interpreted.Replayed;
+        var outcome = interpreted.Outcome!;
+        var result = interpreted.Result!;
         evidence.Version = reportedVersion;
-
-        var outcome = envelope["outcome"]?.GetValue<string>();
-        var result = envelope["result"];
-
-        if (outcome is null || result is not JsonObject)
-        {
-            await transaction.RollbackAsync(CancellationToken.None);
-            evidence.Status = "ERROR";
-            evidence.ErrorCode = ContractCodes.ContractViolation;
-            return Failure(ContractCodes.ContractViolation, "action returned a non contractual result", correlationId, reportedVersion);
-        }
-
-        if (!replayed)
-        {
-            // Исход (outcome) обязан входить в список outcomes, объявленный в манифесте действия.
-            // Если функция вернула какой-то другой, неизвестный исход — это откат и 500-я ошибка
-            // action.contract_violation, а не тихое принятие непредвиденного результата.
-            if (!manifest.Outcomes.Contains(outcome, StringComparer.Ordinal))
-            {
-                await transaction.RollbackAsync(CancellationToken.None);
-                evidence.Status = "ERROR";
-                evidence.ErrorCode = ContractCodes.ContractViolation;
-                return Failure(ContractCodes.ContractViolation, "action returned an undeclared outcome", correlationId, manifest.Version);
-            }
-
-            // Результат (result) обязан пройти проверку по response_schema манифеста — точно так
-            // же, как payload запроса проверялся по request_schema на шаге 8. Любое нарушение —
-            // это полный откат.
-            if (!SchemaValidator.TryValidate(manifest.ResponseSchema, result, out _))
-            {
-                await transaction.RollbackAsync(CancellationToken.None);
-                evidence.Status = "ERROR";
-                evidence.ErrorCode = ContractCodes.ContractViolation;
-                return Failure(ContractCodes.ContractViolation, "action result does not match the response schema", correlationId, manifest.Version);
-            }
-        }
 
         // Все проверки пройдены — теперь и только теперь фиксируем транзакцию.
         await transaction.CommitAsync(budget.Token);
@@ -513,7 +462,7 @@ public sealed class ActionRuntime(
 
         return new ActionResponse(
             StatusCodes.Status200OK,
-            Envelope.Success(outcome, result.DeepClone(), correlationId, reportedVersion));
+            Envelope.Success(outcome, result, correlationId, reportedVersion));
     }
 
     /// <summary>Строит ответ об ошибке в едином формате контракта, автоматически проставляя признак "можно повторить" для временных сбоев.</summary>

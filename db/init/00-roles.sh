@@ -2,7 +2,7 @@
 # Инициализация кластера, выполняется РОВНО ОДИН РАЗ официальным entrypoint-скриптом образа
 # postgres, и только на пустом (только что созданном) томе данных.
 #
-# Создаёт четыре прикладные роли модели доверия проекта:
+# Создаёт прикладные роли модели доверия проекта:
 #   course_owner     - владелец (NOLOGIN, без права входа) каждой схемы, таблицы и функции
 #                      SECURITY DEFINER. Сам по себе он никогда не логинится — он лишь "держатель"
 #                      прав владения, а сессии от его имени выполняются CLI через SET ROLE.
@@ -12,6 +12,9 @@
 #                      course_owner, поэтому не может ни выполнить DDL, ни тронуть предметные
 #                      таблицы, ни вызвать api.invoke. Используется командами action *.
 #   course_runtime   - runtime-роль, используется ТОЛЬКО сервисом api (обработка HTTP-запросов).
+#   course_operator  - роль ОПЕРАЦИЙ над процессами: запуск, сигналы, чтение и trusted-проба
+#                      fencing. Не член course_owner и не имеет прав публикации, поэтому её
+#                      учётные данные не открывают ни DDL, ни каталог действий, ни карты.
 #   workflow_worker  - роль сменного исполнителя процессов (сервисы worker-a и worker-b). Ей
 #                      выдаются EXECUTE ровно на четыре функции-границы (claim_jobs, api.invoke,
 #                      finish_job, fail_job) и НИ ОДНОГО права на таблицы: см. 015_workflow_autocheck.
@@ -31,15 +34,17 @@ psql -v ON_ERROR_STOP=1 \
      -v migrator_password="$COURSE_MIGRATOR_PASSWORD" \
      -v publisher_password="$COURSE_PUBLISHER_PASSWORD" \
      -v runtime_password="$COURSE_RUNTIME_PASSWORD" \
-     -v worker_password="$COURSE_WORKER_PASSWORD" <<'EOSQL'
+     -v worker_password="$COURSE_WORKER_PASSWORD" \
+     -v operator_password="$COURSE_OPERATOR_PASSWORD" <<'EOSQL'
 CREATE ROLE course_owner NOLOGIN;
 CREATE ROLE course_migrator LOGIN PASSWORD :'migrator_password' IN ROLE course_owner;
 CREATE ROLE course_publisher LOGIN PASSWORD :'publisher_password';
 CREATE ROLE course_runtime LOGIN PASSWORD :'runtime_password';
+CREATE ROLE course_operator LOGIN PASSWORD :'operator_password';
 CREATE ROLE workflow_worker LOGIN PASSWORD :'worker_password';
 
 REVOKE ALL ON DATABASE :"dbname" FROM PUBLIC;
-GRANT CONNECT ON DATABASE :"dbname" TO course_owner, course_migrator, course_publisher, course_runtime, workflow_worker;
+GRANT CONNECT ON DATABASE :"dbname" TO course_owner, course_migrator, course_publisher, course_runtime, course_operator, workflow_worker;
 GRANT CREATE ON DATABASE :"dbname" TO course_owner;
 
 ALTER SCHEMA public OWNER TO course_owner;
