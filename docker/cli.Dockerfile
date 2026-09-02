@@ -24,9 +24,11 @@ COPY --from=build /app/publish ./
 # применяет их при первом старте контейнера, без обращения к внешним источникам.
 COPY db/migrations/ /app/db/migrations/
 COPY db/actions/ /app/db/actions/
+COPY db/flows/ /app/db/flows/
 ENV DOTNET_EnableDiagnostics=0 \
     COURSE_BOOTSTRAP_MIGRATIONS=/app/db/migrations \
-    COURSE_BOOTSTRAP_ACTIONS=/app/db/actions
+    COURSE_BOOTSTRAP_ACTIONS=/app/db/actions \
+    COURSE_BOOTSTRAP_FLOWS=/app/db/flows
 USER $APP_UID
 ENTRYPOINT ["dotnet", "/app/course.dll"]
 # Команда по умолчанию при "docker compose up": накатить миграции и опубликовать встроенные

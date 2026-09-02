@@ -1,0 +1,76 @@
+{
+  "contract_version": "course-1",
+  "flow_name": "workflow-smoke",
+  "version": 1,
+  "start_step": "invoke",
+  "steps": [
+    {
+      "key": "invoke",
+      "type": "automatic",
+      "task": {
+        "service": "postgres",
+        "module": "training",
+        "action": "canary",
+        "action_version": 1,
+        "required_policy": [
+          "workflow:execute"
+        ],
+        "timeout_ms": 1600,
+        "retry": {
+          "max_attempts": 3,
+          "delays_ms": [
+            500,
+            1000
+          ]
+        },
+        "input_mapping": {
+          "/mode": "/mode",
+          "/value": "/value"
+        },
+        "input_constants": {
+          "marker": "workflow-smoke-v1"
+        }
+      }
+    },
+    {
+      "key": "wait_result",
+      "type": "wait_signal",
+      "signal_type": "training.completed",
+      "outcome": "RECEIVED"
+    },
+    {
+      "key": "review",
+      "type": "manual",
+      "allowed_outcomes": [
+        "APPROVED"
+      ]
+    },
+    {
+      "key": "done",
+      "type": "end",
+      "outcome": "COMPLETED"
+    }
+  ],
+  "transitions": [
+    {
+      "from": "invoke",
+      "outcome": "ROUTE_SIGNAL",
+      "to": "wait_result"
+    },
+    {
+      "from": "invoke",
+      "outcome": "ROUTE_MANUAL",
+      "to": "review"
+    },
+    {
+      "from": "wait_result",
+      "outcome": "RECEIVED",
+      "to": "done"
+    },
+    {
+      "from": "review",
+      "outcome": "APPROVED",
+      "to": "done"
+    }
+  ]
+}

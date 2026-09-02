@@ -1,19 +1,26 @@
-name: moduledev-week-1
+name: moduledev-week-2
 
-# Четыре сервиса, одна публичная точка входа.
+# Шесть сервисов, одна публичная точка входа.
 #
-#   gateway  - публичный C# ASP.NET Core шлюз, единственный сервис с опубликованным host-портом
-#   api      - внутренний C# движок исполнения действий, доступен только по сети Compose
-#   cli      - Course CLI: миграции и публикация действий, владеет учётными данными публикации
-#   postgres - авторитетное состояние в именованном томе (volume)
+#   gateway            - публичный C# ASP.NET Core шлюз, единственный сервис с host-портом
+#   api                - внутренний C# движок исполнения действий, доступен только по сети Compose
+#   cli                - Course CLI: миграции, публикация действий и карт, trusted-команды процессов
+#   postgres           - авторитетное состояние в именованном томе (volume)
+#   worker-a, worker-b - два экземпляра ОДНОГО образа сменного исполнителя процессов
 #
-# Пароли ниже — это значения по умолчанию для локальной разработки, а НЕ настоящие секреты.
-# Реальные значения задаются переменными окружения хоста, на котором запускается стек, а
-# проверка (check.sh) подменяет ключ подписи JWT через свой собственный override-файл Compose.
+# Пароли ниже — значения по умолчанию для локальной разработки, а НЕ настоящие секреты. Реальные
+# значения задаются переменными окружения хоста, а проверка (check.sh) подменяет ключ подписи JWT
+# через собственный override-файл Compose.
+#
+# Стек самодостаточен: ни одного bind mount, ни одного внешнего ресурса. Миграции, встроенные
+# манифесты действий, карты процессов и скрипт создания ролей копируются ВНУТРЬ образов на этапе
+# сборки, поэтому "docker compose up -d --build" на чистой машине не требует ручных шагов.
 
 services:
   postgres:
-    image: postgres:17-alpine
+    build:
+      context: .
+      dockerfile: docker/postgres.Dockerfile
     environment:
       POSTGRES_DB: course
       POSTGRES_USER: postgres
@@ -21,14 +28,12 @@ services:
       COURSE_MIGRATOR_PASSWORD: ${COURSE_MIGRATOR_PASSWORD:-course_local_migrator}
       COURSE_PUBLISHER_PASSWORD: ${COURSE_PUBLISHER_PASSWORD:-course_local_publisher}
       COURSE_RUNTIME_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
+      COURSE_WORKER_PASSWORD: ${COURSE_WORKER_PASSWORD:-course_local_worker}
       POSTGRES_INITDB_ARGS: --data-checksums
     volumes:
-      # Именованный том: данные PostgreSQL переживают удаление и пересоздание контейнеров
-      # gateway и api (и даже самого postgres, пока том не удалён явно).
+      # Именованный том: состояние процессов переживает пересоздание любого контейнера, включая
+      # оба worker'а — это ровно то свойство, которое проверяется сценарием recreate.
       - postgres-data:/var/lib/postgresql/data
-      # Скрипт создания ролей выполняется официальным entrypoint-образа один раз, только при
-      # первой инициализации ПУСТОГО тома данных.
-      - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d course"]
       interval: 3s
@@ -46,19 +51,20 @@ services:
       COURSE_POSTGRES_PORT: 5432
       COURSE_POSTGRES_DB: course
       # Роль МИГРАЦИЙ: нужна только команде migration apply, потому что DDL требует прав
-      # владельца. Сервису api эти учётные данные не передаются никогда.
+      # владельца. Сервисам api и worker эти учётные данные не передаются никогда.
       COURSE_POSTGRES_USER: course_migrator
       COURSE_POSTGRES_PASSWORD: ${COURSE_MIGRATOR_PASSWORD:-course_local_migrator}
-      # Роль ПУБЛИКАЦИИ: под ней идут все команды action *. Ей выданы EXECUTE ровно на пять
-      # функций управления каталогом — ни DDL, ни предметных таблиц, ни api.invoke.
+      # Роль ПУБЛИКАЦИИ: под ней идут команды action * и flow *. Ни DDL, ни предметных таблиц,
+      # ни очереди заданий — только каталог действий, определения карт и trusted-команды.
       COURSE_PUBLISHER_USER: course_publisher
       COURSE_PUBLISHER_PASSWORD: ${COURSE_PUBLISHER_PASSWORD:-course_local_publisher}
       COURSE_APPLICATION_NAME: course-cli
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
     depends_on:
       postgres:
         condition: service_healthy
     # По умолчанию контейнер cli выполняет команду "bootstrap" (см. CMD в docker/cli.Dockerfile)
-    # и завершается — restart: "no" означает "не перезапускать его после выхода".
+    # и завершается — restart "no" означает "не перезапускать его после выхода".
     restart: "no"
 
   api:
@@ -70,23 +76,21 @@ services:
       COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER:-moduledev-course}
       COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE:-moduledev-api}
       COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-local-development-signing-key-change-me-please}
-      # api подключается от лица RUNTIME-роли (course_runtime) — у неё нет прав на изменение
-      # каталога действий или структуры базы, только на выполнение api.invoke и чтение autocheck.
+      # api подключается от лица RUNTIME-роли (course_runtime): у неё нет прав менять каталог
+      # действий или структуру базы, только выполнять api.invoke и читать проверочные проекции.
       COURSE_POSTGRES_HOST: postgres
       COURSE_POSTGRES_PORT: 5432
       COURSE_POSTGRES_DB: course
       COURSE_POSTGRES_USER: course_runtime
       COURSE_POSTGRES_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
       COURSE_APPLICATION_NAME: course-api
-    # expose (в отличие от ports) делает порт доступным только другим сервисам ВНУТРИ сети
-    # Compose — снаружи хоста этот порт не виден вообще.
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+    # expose (в отличие от ports) делает порт видимым только другим сервисам ВНУТРИ сети Compose.
     expose:
       - "8080"
     depends_on:
       postgres:
         condition: service_healthy
-      # api стартует только ПОСЛЕ того, как cli успешно завершил bootstrap (миграции применены,
-      # встроенные действия опубликованы) — поэтому api никогда не увидит пустой/неинициализированный каталог.
       cli:
         condition: service_completed_successfully
     restart: unless-stopped
@@ -97,17 +101,66 @@ services:
       dockerfile: docker/gateway.Dockerfile
     environment:
       ASPNETCORE_URLS: http://+:8080
-      # Ключевой момент: адрес внутреннего api задан именем сервиса Compose ("api"), а НЕ через
-      # localhost — DNS этого имени разрешается сетью Docker Compose и продолжает работать даже
-      # если контейнер api был пересоздан и получил новый IP-адрес.
+      # Внутренний api адресуется именем сервиса Compose, а не через localhost: DNS этого имени
+      # разрешается сетью Docker и продолжает работать после пересоздания контейнера api.
       COURSE_API_BASE_URL: http://api:8080
-    # Единственный сервис во всём стеке с публикацией host-порта наружу.
     ports:
       - "8080:8080"
     depends_on:
       api:
         condition: service_started
     restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Два арендатора очереди заданий. Один образ, разные lease owner.
+  #
+  # depends_on намеренно НЕ объявлен: worker обязан переживать недоступность базы и незавершённые
+  # миграции самостоятельно (он просто продолжает опрашивать очередь), и тогда его пересоздание
+  # никогда не тянет за собой пересоздание postgres или api. Именно этого требуют сценарии
+  # аварийного завершения: проверка пересоздаёт worker'ов, не трогая авторитетное состояние.
+  #
+  # restart "no" — тоже осознанно: убитый worker должен ОСТАВАТЬСЯ убитым, иначе доказать
+  # перехват аренды вторым исполнителем было бы невозможно.
+  # --------------------------------------------------------------------------
+  worker-a:
+    image: moduledev-week-2-workflow-worker:local
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      # Идентификатор арендатора — единственное, чем два экземпляра отличаются друг от друга.
+      COURSE_WORKER_ID: worker-a
+      COURSE_POSTGRES_HOST: postgres
+      COURSE_POSTGRES_PORT: 5432
+      COURSE_POSTGRES_DB: course
+      # Минимально привилегированная роль: EXECUTE ровно на четыре функции-границы и ни одного
+      # права на таблицы (см. 015_workflow_autocheck.sql).
+      COURSE_POSTGRES_USER: workflow_worker
+      COURSE_POSTGRES_PASSWORD: ${COURSE_WORKER_PASSWORD:-course_local_worker}
+      COURSE_APPLICATION_NAME: course-worker
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+    stop_grace_period: 5s
+    restart: "no"
+
+  # Сборка объявлена ТОЛЬКО у worker-a. Это не экономия строк: два build-раздела с одним и тем же
+  # тегом образа собираются параллельно и гонятся за одну и ту же ссылку — сборка периодически
+  # падает с «image ... already exists». Один образ должен собираться ровно один раз, а второй
+  # арендатор просто на него ссылается.
+  worker-b:
+    image: moduledev-week-2-workflow-worker:local
+    environment:
+      COURSE_WORKER_ID: worker-b
+      COURSE_POSTGRES_HOST: postgres
+      COURSE_POSTGRES_PORT: 5432
+      COURSE_POSTGRES_DB: course
+      COURSE_POSTGRES_USER: workflow_worker
+      COURSE_POSTGRES_PASSWORD: ${COURSE_WORKER_PASSWORD:-course_local_worker}
+      COURSE_APPLICATION_NAME: course-worker
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+    stop_grace_period: 5s
+    restart: "no"
 
 volumes:
   postgres-data:

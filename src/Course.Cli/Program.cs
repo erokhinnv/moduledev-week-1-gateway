@@ -16,6 +16,14 @@ internal static class CourseCli
         course.sh action list
         course.sh action activate <module.action> --version <version>
         course.sh action disable <module.action> --version <version> [--replacement-version <version>]
+        course.sh flow validate <map>
+        course.sh flow publish <map>
+        course.sh flow list
+        course.sh flow activate <flow> --version <version>
+        course.sh flow start <flow> --business-key <key> [--data <file>]
+        course.sh flow get <process-id>
+        course.sh flow signal <process-id> --type <type> --message-id <id> --payload <file>
+        course.sh flow test-finish <job-id> --owner <owner> --lease-version <version> --outcome <outcome> --result <file>
         course.sh bootstrap
         """;
 
@@ -91,6 +99,14 @@ internal static class CourseCli
             ("action", "list") => await ActionListAsync(cancellationToken),
             ("action", "activate") => await ActionActivateAsync(positional, line, cancellationToken),
             ("action", "disable") => await ActionDisableAsync(positional, line, cancellationToken),
+            ("flow", "validate") => await FlowValidateAsync(positional, cancellationToken),
+            ("flow", "publish") => await FlowPublishAsync(positional, cancellationToken),
+            ("flow", "list") => await FlowListAsync(cancellationToken),
+            ("flow", "activate") => await FlowActivateAsync(positional, line, cancellationToken),
+            ("flow", "start") => await FlowStartAsync(positional, line, cancellationToken),
+            ("flow", "get") => await FlowGetAsync(positional, cancellationToken),
+            ("flow", "signal") => await FlowSignalAsync(positional, line, cancellationToken),
+            ("flow", "test-finish") => await FlowTestFinishAsync(positional, line, cancellationToken),
             _ => throw new CliException(ContractCodes.RequestInvalid, $"unknown command: {string.Join(' ', positional)}"),
         };
     }
@@ -195,6 +211,210 @@ internal static class CourseCli
         return await new CatalogClient(dataSource).DisableAsync(module, action, version, replacement, cancellationToken);
     }
 
+    // -------------------------------------------------------------------------------------
+    // Команды карт процессов.
+    //
+    // Ни одна из них не содержит знания о конкретной карте: validate доказывает контракт,
+    // publish сохраняет неизменяемую версию, activate выбирает версию для новых экземпляров,
+    // а start/get/signal работают с уже закреплённой версией конкретного процесса.
+    // -------------------------------------------------------------------------------------
+
+    /// <summary>Команда "flow validate &lt;map&gt;": доказывает контракт карты, ничего не записывая.</summary>
+    private static async Task<JsonObject> FlowValidateAsync(
+        IReadOnlyList<string> positional,
+        CancellationToken cancellationToken)
+    {
+        var map = ReadMapArgument(positional, "flow validate");
+        await using var dataSource = CreatePublicationDataSource();
+        await ValidateSemanticsAsync(new FlowClient(dataSource), map, cancellationToken);
+
+        return new JsonObject
+        {
+            ["resource"] = "flow",
+            ["operation"] = "validated",
+            ["flowName"] = map.FlowName,
+            ["flowVersion"] = map.Version,
+        };
+    }
+
+    /// <summary>Команда "flow publish &lt;map&gt;": публикует неизменяемую версию карты (без активации).</summary>
+    private static async Task<JsonObject> FlowPublishAsync(
+        IReadOnlyList<string> positional,
+        CancellationToken cancellationToken)
+    {
+        var map = ReadMapArgument(positional, "flow publish");
+        await using var dataSource = CreatePublicationDataSource();
+        var client = new FlowClient(dataSource);
+
+        // Публикация невалидной карты обязана не оставлять следов, поэтому проверка идёт до
+        // единственного записывающего вызова, а не внутри него.
+        await ValidateSemanticsAsync(client, map, cancellationToken);
+        return await client.PublishAsync(map.Document, cancellationToken);
+    }
+
+    private static async Task<JsonObject> FlowListAsync(CancellationToken cancellationToken)
+    {
+        await using var dataSource = CreatePublicationDataSource();
+        return await new FlowClient(dataSource).ListAsync(cancellationToken);
+    }
+
+    private static async Task<JsonObject> FlowActivateAsync(
+        IReadOnlyList<string> positional,
+        CommandLine line,
+        CancellationToken cancellationToken)
+    {
+        var flowName = RequirePositional(positional, "flow activate", "<flow>");
+        if (!line.TryInteger("--version", out var version) || version < 1)
+        {
+            throw new CliException(ContractCodes.RequestInvalid, "flow activate requires --version <version>");
+        }
+
+        await using var dataSource = CreatePublicationDataSource();
+        return await new FlowClient(dataSource).ActivateAsync(flowName, version, cancellationToken);
+    }
+
+    private static async Task<JsonObject> FlowStartAsync(
+        IReadOnlyList<string> positional,
+        CommandLine line,
+        CancellationToken cancellationToken)
+    {
+        var flowName = RequirePositional(positional, "flow start", "<flow>");
+        var businessKey = line.Value("--business-key");
+        if (string.IsNullOrWhiteSpace(businessKey))
+        {
+            throw new CliException(ContractCodes.RequestInvalid, "flow start requires --business-key <key>");
+        }
+
+        // Без --data процесс стартует с пустым объектом данных.
+        var data = line.Value("--data") is { } dataPath
+            ? FlowReader.ReadJsonObject(dataPath, "process data")
+            : new JsonObject();
+
+        await using var dataSource = CreatePublicationDataSource();
+        var result = await new FlowClient(dataSource).StartAsync(flowName, businessKey, data, cancellationToken);
+        result["operation"] = "started";
+        return result;
+    }
+
+    private static async Task<JsonObject> FlowGetAsync(
+        IReadOnlyList<string> positional,
+        CancellationToken cancellationToken)
+    {
+        var processId = ParseUuid(RequirePositional(positional, "flow get", "<process-id>"), "process id");
+        await using var dataSource = CreatePublicationDataSource();
+        return await new FlowClient(dataSource).GetAsync(processId, cancellationToken);
+    }
+
+    private static async Task<JsonObject> FlowSignalAsync(
+        IReadOnlyList<string> positional,
+        CommandLine line,
+        CancellationToken cancellationToken)
+    {
+        var processId = ParseUuid(RequirePositional(positional, "flow signal", "<process-id>"), "process id");
+        var signalType = line.Value("--type");
+        var messageId = line.Value("--message-id");
+        var payloadPath = line.Value("--payload");
+
+        if (string.IsNullOrWhiteSpace(signalType) ||
+            string.IsNullOrWhiteSpace(messageId) ||
+            string.IsNullOrWhiteSpace(payloadPath))
+        {
+            throw new CliException(
+                ContractCodes.RequestInvalid,
+                "flow signal requires --type, --message-id and --payload");
+        }
+
+        var payload = FlowReader.ReadJsonObject(payloadPath, "signal payload");
+        await using var dataSource = CreatePublicationDataSource();
+        return await new FlowClient(dataSource)
+            .SignalAsync(processId, signalType, messageId, payload, cancellationToken);
+    }
+
+    /// <summary>
+    /// Команда "flow test-finish": проба fencing. Доступна только в test profile и вызывает ту же
+    /// production-границу завершения, что и worker — иначе проверялась бы отдельная ветка кода,
+    /// а не настоящий инвариант.
+    /// </summary>
+    private static async Task<JsonObject> FlowTestFinishAsync(
+        IReadOnlyList<string> positional,
+        CommandLine line,
+        CancellationToken cancellationToken)
+    {
+        if (Env.Optional("COURSE_TEST_PROFILE", "0") != "1")
+        {
+            throw new CliException(
+                ContractCodes.RequestInvalid,
+                "flow test-finish is only available under COURSE_TEST_PROFILE=1");
+        }
+
+        var jobId = ParseUuid(RequirePositional(positional, "flow test-finish", "<job-id>"), "job id");
+        var owner = line.Value("--owner");
+        var outcome = line.Value("--outcome");
+        var resultPath = line.Value("--result");
+
+        if (string.IsNullOrWhiteSpace(owner) ||
+            string.IsNullOrWhiteSpace(outcome) ||
+            string.IsNullOrWhiteSpace(resultPath) ||
+            !long.TryParse(line.Value("--lease-version"), out var leaseVersion))
+        {
+            throw new CliException(
+                ContractCodes.RequestInvalid,
+                "flow test-finish requires --owner, --lease-version, --outcome and --result");
+        }
+
+        var result = FlowReader.ReadJsonObject(resultPath, "task result");
+        await using var dataSource = CreatePublicationDataSource();
+        return await new FlowClient(dataSource)
+            .TestFinishAsync(jobId, owner, leaseVersion, outcome, result, cancellationToken);
+    }
+
+    /// <summary>
+    /// Семантическая проверка карты по авторитетному состоянию каталога и правам исполнителя.
+    /// Схема доказывает форму документа, а смысл — только эта проверка.
+    /// </summary>
+    private static async Task ValidateSemanticsAsync(
+        FlowClient client,
+        WorkflowMap map,
+        CancellationToken cancellationToken)
+    {
+        var facts = WorkflowPublicationFacts.FromResult(
+            await client.PublicationFactsAsync(map.Document, cancellationToken));
+
+        var violations = WorkflowMapValidator.Validate(map, facts);
+        if (violations.Count == 0)
+        {
+            return;
+        }
+
+        throw new CliException(
+            ContractCodes.WorkflowMapInvalid,
+            "workflow map does not satisfy the course-1 semantic contract",
+            new JsonObject
+            {
+                ["violations"] = new JsonArray(violations.Take(20)
+                    .Select(item => (JsonNode)item)
+                    .ToArray()),
+            });
+    }
+
+    private static WorkflowMap ReadMapArgument(IReadOnlyList<string> positional, string command)
+        => FlowReader.ReadMap(RequirePositional(positional, command, "<map>"));
+
+    private static string RequirePositional(IReadOnlyList<string> positional, string command, string what)
+    {
+        if (positional.Count < 3 || string.IsNullOrWhiteSpace(positional[2]))
+        {
+            throw new CliException(ContractCodes.RequestInvalid, $"{command} requires {what}");
+        }
+
+        return positional[2];
+    }
+
+    private static Guid ParseUuid(string value, string what)
+        => Guid.TryParse(value, out var parsed)
+            ? parsed
+            : throw new CliException(ContractCodes.RequestInvalid, $"{what} must be a UUID");
+
     /// <summary>
     /// Команда "bootstrap" — путь автоматического старта всего стека Docker Compose: сначала
     /// накатываются базовые миграции (db/migrations), затем публикуются встроенные манифесты
@@ -228,13 +448,75 @@ internal static class CourseCli
             }
         }
 
+        // Встроенные карты процессов публикуются после действий: карта ссылается на версию
+        // действия, и валидатор обязан увидеть её уже опубликованной.
+        var flows = await BootstrapFlowsAsync(catalogSource: publicationSource, cancellationToken);
+
         return new JsonObject
         {
             ["resource"] = "runtime",
             ["operation"] = "bootstrapped",
             ["migration"] = migration,
             ["actions"] = published,
+            ["flows"] = flows,
         };
+    }
+
+    /// <summary>
+    /// Публикует встроенные карты и активирует младшую версию каждой карты, у которой активной
+    /// версии ещё нет. Повторный bootstrap не переключает выбор, сделанный оператором вручную.
+    /// </summary>
+    private static async Task<JsonArray> BootstrapFlowsAsync(
+        NpgsqlDataSource catalogSource,
+        CancellationToken cancellationToken)
+    {
+        var published = new JsonArray();
+        var directory = new DirectoryInfo(Env.Optional("COURSE_BOOTSTRAP_FLOWS", "/app/db/flows"));
+        if (!directory.Exists)
+        {
+            return published;
+        }
+
+        var client = new FlowClient(catalogSource);
+        var files = directory.GetFiles("*.json")
+            .Concat(directory.GetFiles("*.yaml"))
+            .Concat(directory.GetFiles("*.yml"))
+            .OrderBy(item => item.Name, StringComparer.Ordinal)
+            .ToArray();
+
+        foreach (var file in files)
+        {
+            var map = FlowReader.ReadMap(file.FullName);
+            await ValidateSemanticsAsync(client, map, cancellationToken);
+            published.Add(await client.PublishAsync(map.Document, cancellationToken));
+        }
+
+        var listed = await client.ListAsync(cancellationToken);
+        var items = listed["items"] as JsonArray ?? [];
+        var byFlow = items
+            .OfType<JsonObject>()
+            .GroupBy(item => item["flowName"]?.GetValue<string>() ?? string.Empty, StringComparer.Ordinal);
+
+        var activated = new JsonArray();
+        foreach (var group in byFlow)
+        {
+            if (group.Any(item => item["isActive"]?.GetValue<bool>() == true))
+            {
+                continue;
+            }
+
+            var version = group
+                .Select(item => item["flowVersion"]?.GetValue<int>() ?? int.MaxValue)
+                .Min();
+            activated.Add(await client.ActivateAsync(group.Key, version, cancellationToken));
+        }
+
+        foreach (var item in activated)
+        {
+            published.Add(item?.DeepClone());
+        }
+
+        return published;
     }
 
     /// <summary>

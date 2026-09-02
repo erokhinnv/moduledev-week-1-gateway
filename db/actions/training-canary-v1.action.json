@@ -1,0 +1,72 @@
+{
+  "contract_version": "course-1",
+  "module": "training",
+  "action": "canary",
+  "version": 1,
+  "http_method": "POST",
+  "target_schema": "training",
+  "target_function": "canary_v1",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "mode",
+      "value",
+      "marker"
+    ],
+    "properties": {
+      "mode": {
+        "enum": [
+          "signal",
+          "manual",
+          "retry"
+        ]
+      },
+      "value": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "marker": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      }
+    }
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "stored",
+      "echo",
+      "executionId"
+    ],
+    "properties": {
+      "stored": {
+        "type": "boolean"
+      },
+      "echo": {
+        "type": "string"
+      },
+      "executionId": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "outcomes": [
+    "ROUTE_SIGNAL",
+    "ROUTE_MANUAL"
+  ],
+  "required_policy": [
+    "workflow:execute"
+  ],
+  "idempotency_mode": "required",
+  "idempotency_scope": "principal_action",
+  "timeout_ms": 2000,
+  "enabled": true,
+  "is_default": true
+}

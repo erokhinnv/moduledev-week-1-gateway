@@ -59,6 +59,20 @@ public static class ContractCodes
     /// <summary>Файл миграции с таким именем уже применён, но с другой контрольной суммой.</summary>
     public const string MigrationConflict = "migration.conflict";
 
+    // --- Коды ошибок движка процессов (неделя 2) ---
+
+    /// <summary>Карта процесса не удовлетворяет семантическому контракту course-1.</summary>
+    public const string WorkflowMapInvalid = "workflow.map_invalid";
+
+    /// <summary>Источник данных, объявленный в input_mapping, отсутствует; действие не вызывается.</summary>
+    public const string WorkflowMappingMissing = "workflow.mapping_missing";
+
+    /// <summary>Аренда, дававшая право завершить задание, больше не действует.</summary>
+    public const string WorkflowLeaseStale = "workflow.lease_stale";
+
+    /// <summary>Закреплённая версия действия недоступна: не опубликована или выключена.</summary>
+    public const string WorkflowActionUnavailable = "workflow.action_unavailable";
+
     /// <summary>
     /// HTTP-статус для кода ошибки, который НЕ входит в техническую матрицу выше — то есть для
     /// предметного (доменного) кода ошибки, объявленного самой зарегистрированной функцией
