@@ -1,0 +1,65 @@
+{
+  "contract_version": "course-1",
+  "module": "workflow",
+  "action": "get",
+  "version": 1,
+  "http_method": "POST",
+  "target_schema": "workflow",
+  "target_function": "get_v1",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "processId"
+    ],
+    "properties": {
+      "processId": {
+        "type": "string",
+        "format": "uuid"
+      }
+    }
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "process",
+      "steps",
+      "jobs",
+      "attempts"
+    ],
+    "properties": {
+      "process": {
+        "type": "object",
+        "required": [
+          "processId",
+          "flowName",
+          "flowVersion",
+          "state"
+        ]
+      },
+      "steps": {
+        "type": "array"
+      },
+      "jobs": {
+        "type": "array"
+      },
+      "attempts": {
+        "type": "array"
+      }
+    }
+  },
+  "outcomes": [
+    "FOUND"
+  ],
+  "required_policy": [
+    "workflow:read"
+  ],
+  "idempotency_mode": "none",
+  "idempotency_scope": "none",
+  "timeout_ms": 5000,
+  "enabled": true,
+  "is_default": true
+}

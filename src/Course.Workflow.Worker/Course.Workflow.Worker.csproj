@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Workflow.Worker</AssemblyName>
+    <RootNamespace>Course.Workflow.Worker</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Course.Shared\Course.Shared.csproj" />
+  </ItemGroup>
+
+</Project>

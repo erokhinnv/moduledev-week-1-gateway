@@ -3,6 +3,15 @@
   <ItemGroup>
     <PackageReference Include="JsonSchema.Net" Version="9.4.0" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
+    <!-- Карта процесса публикуется в JSON или в YAML: это один и тот же контракт, записанный
+         двумя способами, поэтому читать нужно оба формата. -->
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+  </ItemGroup>
+
+  <!-- Схема карты процесса встраивается внутрь сборки: во время выполнения контракт не читается
+       с диска, поэтому его нельзя ослабить подменой файла рядом с контейнером. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\contracts\course-1\workflow-map.schema.json" LogicalName="workflow-map.schema.json" />
   </ItemGroup>
 
 </Project>
