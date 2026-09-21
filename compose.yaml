@@ -1,6 +1,6 @@
-name: moduledev-week-2
+name: moduledev-week-3
 
-# Шесть сервисов, одна публичная точка входа.
+# Десять сервисов, одна публичная точка входа.
 #
 #   gateway            - публичный C# ASP.NET Core шлюз, единственный сервис с host-портом
 #   api                - внутренний C# движок исполнения действий, доступен только по сети Compose
@@ -8,10 +8,14 @@ name: moduledev-week-2
 #                        (тремя разными ролями: миграций, публикации и операций)
 #   postgres           - авторитетное состояние в именованном томе (volume)
 #   worker-a, worker-b - два экземпляра ОДНОГО образа сменного исполнителя процессов
+#   outbox-dispatcher  - Python: durable Outbox (PostgreSQL) -> provider v0.2.0
+#   receipt-adapter    - Python, тот же образ: legacy callback provider -> signed receipt v1 -> gateway
+#   inbox-reconciler   - Python, тот же образ: фиксированная SQL-граница согласования Inbox
+#   provider-simulator - выданный внешний provider v0.2.0, закреплён по digest
 #
-# Пароли ниже — значения по умолчанию для локальной разработки, а НЕ настоящие секреты. Реальные
-# значения задаются переменными окружения хоста, а проверка (check.sh) подменяет ключ подписи JWT
-# через собственный override-файл Compose.
+# Пароли PostgreSQL ниже — явно обозначенные local-only значения для разработки, а НЕ настоящие
+# секреты; проверка всегда подменяет их synthetic-значениями. У JWT, HMAC, capability и токенов
+# значений по умолчанию нет вовсе: они приходят только из окружения запуска (см. README, «Запуск»).
 #
 # Стек самодостаточен: ни одного bind mount, ни одного внешнего ресурса. Миграции, встроенные
 # манифесты действий, карты процессов и скрипт создания ролей копируются ВНУТРЬ образов на этапе
@@ -31,6 +35,8 @@ services:
       COURSE_RUNTIME_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
       COURSE_OPERATOR_PASSWORD: ${COURSE_OPERATOR_PASSWORD:-course_local_operator}
       COURSE_WORKER_PASSWORD: ${COURSE_WORKER_PASSWORD:-course_local_worker}
+      COURSE_OUTBOX_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-course_local_outbox}
+      COURSE_INBOX_PASSWORD: ${COURSE_INBOX_PASSWORD:-course_local_inbox}
       POSTGRES_INITDB_ARGS: --data-checksums
     volumes:
       # Именованный том: состояние процессов переживает пересоздание любого контейнера, включая
@@ -79,9 +85,12 @@ services:
       dockerfile: docker/api.Dockerfile
     environment:
       ASPNETCORE_URLS: http://+:8080
-      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER:-moduledev-course}
-      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE:-moduledev-api}
-      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-local-development-signing-key-change-me-please}
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY}
+      # Ключ общей границы подписанных запросов: api проверяет X-Provider-Signature над точными
+      # байтами тела. Кроме api, этот секрет получает только receipt-adapter.
+      PROVIDER_HMAC_SECRET: ${PROVIDER_HMAC_SECRET}
       # api подключается от лица RUNTIME-роли (course_runtime): у неё нет прав менять каталог
       # действий или структуру базы, только выполнять api.invoke и читать проверочные проекции.
       COURSE_POSTGRES_HOST: postgres
@@ -111,7 +120,7 @@ services:
       # разрешается сетью Docker и продолжает работать после пересоздания контейнера api.
       COURSE_API_BASE_URL: http://api:8080
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${COURSE_GATEWAY_PORT:-8080}:8080"
     depends_on:
       api:
         condition: service_started
@@ -170,6 +179,83 @@ services:
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
     stop_grace_period: 5s
     restart: "no"
+
+  # --------------------------------------------------------------------------
+  # Python-периметр недели 3: ОДИН локально собранный образ, три entrypoint.
+  #
+  # Сборка объявлена только у outbox-dispatcher — по той же причине, что у worker-a: два build с
+  # одним тегом гоняются за одну ссылку. Остальные два сервиса ссылаются на уже собранный образ.
+  #
+  # Ни у одного Python-сервиса нет host-порта и depends_on: процессы сами переживают
+  # недоступность базы или gateway, а их пересоздание не тянет за собой пересоздание ядра.
+  # --------------------------------------------------------------------------
+  outbox-dispatcher:
+    image: moduledev-week-3-integration:local
+    build:
+      context: .
+      dockerfile: docker/integration.Dockerfile
+    command: ["outbox-dispatcher"]
+    environment:
+      PROVIDER_URL: ${PROVIDER_URL:-http://provider-simulator:8081}
+      OUTBOX_OWNER: ${OUTBOX_OWNER:-outbox-dispatcher}
+      COURSE_POSTGRES_HOST: postgres
+      COURSE_POSTGRES_PORT: 5432
+      COURSE_POSTGRES_DB: course
+      # Отдельная роль: EXECUTE ровно на delivery.claim_outbox / succeed_outbox / fail_outbox.
+      COURSE_POSTGRES_USER: outbox_dispatcher
+      COURSE_POSTGRES_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-course_local_outbox}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+    stop_grace_period: 5s
+    restart: unless-stopped
+
+  receipt-adapter:
+    image: moduledev-week-3-integration:local
+    command: ["receipt-adapter"]
+    # Ни одной переменной подключения к PostgreSQL: adapter физически не может тронуть состояние
+    # в обход generic API и не хранит ничего авторитетного.
+    environment:
+      PROVIDER_CALLBACK_CAPABILITY: ${PROVIDER_CALLBACK_CAPABILITY}
+      PROVIDER_CALLBACK_TOKEN: ${PROVIDER_CALLBACK_TOKEN}
+      PROVIDER_HMAC_SECRET: ${PROVIDER_HMAC_SECRET}
+      RECEIPT_API_URL: ${RECEIPT_API_URL:-http://gateway:8080/api/receipt/accept}
+      RECEIPT_ADAPTER_PORT: "8082"
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+    expose:
+      - "8082"
+    stop_grace_period: 5s
+    restart: unless-stopped
+
+  inbox-reconciler:
+    image: moduledev-week-3-integration:local
+    command: ["inbox-reconciler"]
+    environment:
+      COURSE_POSTGRES_HOST: postgres
+      COURSE_POSTGRES_PORT: 5432
+      COURSE_POSTGRES_DB: course
+      # Отдельная роль: EXECUTE ровно на delivery.reconcile_inbox.
+      COURSE_POSTGRES_USER: inbox_reconciler
+      COURSE_POSTGRES_PASSWORD: ${COURSE_INBOX_PASSWORD:-course_local_inbox}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+    stop_grace_period: 5s
+    restart: unless-stopped
+
+  # Выданный внешний компонент. Закреплён по digest: тег можно переписать, digest — нет.
+  provider-simulator:
+    image: ghcr.io/fintech-dev-lab/internship-provider-simulator:v0.2.0@sha256:70e5e0dd9ab8425be84de431ec74516f9bedf5d5529077358e2e2b2037fe0c74
+    environment:
+      # Provider не знает про receipt v1 и не подписывает callback: доверие к нему ограничено
+      # сетью Compose и непредсказуемым capability-сегментом пути.
+      CALLBACK_URL: http://receipt-adapter:8082/callbacks/provider-v02/${PROVIDER_CALLBACK_CAPABILITY}
+      SIMULATOR_MODE: ${PROVIDER_SIMULATOR_MODE:-success}
+      CALLBACK_DELAY: 200ms
+      CALLBACK_TIMEOUT: 1s
+      CALLBACK_MAX_ATTEMPTS: "5"
+      CALLBACK_RETRY_DELAY: 200ms
+      AUDIT_TOKEN: ${PROVIDER_AUDIT_TOKEN}
+    expose:
+      - "8081"
+    restart: unless-stopped
 
 volumes:
   postgres-data:

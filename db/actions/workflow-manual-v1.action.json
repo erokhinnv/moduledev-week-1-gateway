@@ -1,0 +1,94 @@
+{
+  "contract_version": "course-1",
+  "module": "workflow",
+  "action": "manual",
+  "version": 1,
+  "http_method": "POST",
+  "target_schema": "workflow",
+  "target_function": "manual_v1",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "processId",
+      "stepInstanceId",
+      "decision",
+      "reason"
+    ],
+    "properties": {
+      "processId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "stepInstanceId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "decision": {
+        "enum": [
+          "APPROVED",
+          "REJECTED"
+        ]
+      },
+      "reason": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      }
+    }
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "decisionId",
+      "processId",
+      "stepInstanceId",
+      "decision",
+      "source",
+      "principal"
+    ],
+    "properties": {
+      "decisionId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "processId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "stepInstanceId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "decision": {
+        "enum": [
+          "APPROVED",
+          "REJECTED"
+        ]
+      },
+      "source": {
+        "const": "MANUAL"
+      },
+      "principal": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      }
+    }
+  },
+  "outcomes": [
+    "APPROVED",
+    "REJECTED"
+  ],
+  "required_policy": [
+    "workflow:manual"
+  ],
+  "idempotency_mode": "required",
+  "idempotency_scope": "principal_action",
+  "timeout_ms": 5000,
+  "enabled": true,
+  "is_default": true
+}

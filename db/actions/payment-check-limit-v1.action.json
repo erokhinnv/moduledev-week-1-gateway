@@ -1,0 +1,63 @@
+{
+  "contract_version": "course-1",
+  "module": "payment",
+  "action": "check_limit",
+  "version": 1,
+  "http_method": "POST",
+  "target_schema": "payment",
+  "target_function": "check_limit_v1",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "operationId"
+    ],
+    "properties": {
+      "operationId": {
+        "type": "string",
+        "format": "uuid"
+      }
+    }
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "operationId",
+      "ruleVersion",
+      "decisionId"
+    ],
+    "properties": {
+      "operationId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "ruleVersion": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 63
+      },
+      "decisionId": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "uuid"
+      }
+    }
+  },
+  "outcomes": [
+    "WITHIN_LIMIT",
+    "REVIEW_REQUIRED"
+  ],
+  "required_policy": [
+    "payment:internal"
+  ],
+  "idempotency_mode": "required",
+  "idempotency_scope": "principal_action",
+  "timeout_ms": 5000,
+  "enabled": true,
+  "is_default": true
+}

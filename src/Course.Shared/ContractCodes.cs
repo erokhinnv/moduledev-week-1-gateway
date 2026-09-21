@@ -80,6 +80,20 @@ public static class ContractCodes
     /// </summary>
     public const string WorkflowBoundaryFailed = "workflow.boundary_failed";
 
+    /// <summary>Решение по ручному шагу уже принято: конкурирующее или изменённое решение отклоняется.</summary>
+    public const string WorkflowDecisionConflict = "workflow.decision_conflict";
+
+    // --- Коды границы подписанных запросов (неделя 3) ---
+
+    /// <summary>Заголовок X-Provider-Signature передан, но его формат, версия или HMAC неверны.</summary>
+    public const string SignatureInvalid = "signature.invalid";
+
+    /// <summary>
+    /// Действие требует доверенный маркер проверенной подписи, а запрос пришёл без подписи. Код
+    /// возвращает сама зарегистрированная функция: C# не знает, какому действию подпись нужна.
+    /// </summary>
+    public const string ReceiptSignatureRequired = "receipt.signature_required";
+
     /// <summary>
     /// HTTP-статус для кода ошибки, который НЕ входит в техническую матрицу выше — то есть для
     /// предметного (доменного) кода ошибки, объявленного самой зарегистрированной функцией
@@ -101,6 +115,9 @@ public static class ContractCodes
         AccessDenied => 403,
         ActionNotFound => 404,
         IdempotencyConflict => 409,
+        WorkflowDecisionConflict => 409,
+        SignatureInvalid => 401,
+        ReceiptSignatureRequired => 403,
         PayloadInvalid => 422,
         DependencyUnavailable => 503,
         ContractViolation => 500,

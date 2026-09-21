@@ -1,0 +1,70 @@
+{
+  "contract_version": "course-1",
+  "module": "payment",
+  "action": "reject",
+  "version": 1,
+  "http_method": "POST",
+  "target_schema": "payment",
+  "target_function": "reject_v1",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "operationId"
+    ],
+    "properties": {
+      "operationId": {
+        "type": "string",
+        "format": "uuid"
+      }
+    }
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "operationId",
+      "status",
+      "evidence"
+    ],
+    "properties": {
+      "operationId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "status": {
+        "enum": [
+          "COMPLETED",
+          "REJECTED"
+        ]
+      },
+      "evidence": {
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "RECEIPT",
+              "DECISION"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "outcomes": [
+    "REJECTED"
+  ],
+  "required_policy": [
+    "payment:internal"
+  ],
+  "idempotency_mode": "required",
+  "idempotency_scope": "principal_action",
+  "timeout_ms": 5000,
+  "enabled": true,
+  "is_default": true
+}
