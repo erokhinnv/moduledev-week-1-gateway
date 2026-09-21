@@ -5,8 +5,11 @@
     docker compose -p course-e2e up -d --build
     COMPOSE_PROJECT=course-e2e python3 scripts/e2e_perimeter.py
 
-Evidence is read only through HTTP actions, provider audit and the read-only ``autocheck``
-views - the same seams the course checker uses. Exit code 0 means every scenario passed.
+Behaviour is observed through HTTP actions, provider audit and the read-only ``autocheck`` views -
+the same seams the course checker uses. Two scenarios deliberately go below them: the storage
+invariants attack physical tables inside rolled-back transactions to prove the triggers hold, and the
+lock-order scenario holds row locks of a process step to reproduce a race deterministically.
+Exit code 0 means every scenario passed.
 """
 
 from __future__ import annotations
@@ -46,6 +49,10 @@ OTHER_REVIEWER = issue_token(KEY, "e2e-reviewer-2", "backoffice", ["workflow:man
 
 class Failure(AssertionError):
     pass
+
+
+class Skipped(Exception):
+    """The scenario needs a stand configuration the current run does not have."""
 
 
 def check(condition: bool, message: str) -> None:
@@ -217,6 +224,14 @@ def scenario_provider_path() -> None:
 
 def scenario_adapter_and_recreate() -> None:
     check(compose("stop", "outbox-dispatcher", "inbox-reconciler").returncode == 0, "cannot stop services")
+    try:
+        adapter_and_recreate_steps()
+    finally:
+        # A failed step must not leave the perimeter stopped for the scenarios that follow.
+        compose("up", "-d", "--no-build", "outbox-dispatcher", "receipt-adapter", "inbox-reconciler")
+
+
+def adapter_and_recreate_steps() -> None:
     operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1010.00")
     external_id = external_request(operation_id)
     legacy = {"providerPaymentId": f"e2e-provider-{secrets.token_hex(5)}", "operationId": external_id,
@@ -234,6 +249,18 @@ def scenario_adapter_and_recreate() -> None:
     conflict = internal(CALLBACK, compact({**legacy, "result": "COMPLETED"}), {"Content-Type": "application/json"})
     check(conflict[0] == 409 and json.loads(conflict[1])["code"] == "idempotency.conflict", f"conflict: {conflict}")
 
+    # Same Idempotency-Key, semantically equal JSON, different exact bytes with a valid signature:
+    # the command body is not the same, so this is a conflict, not a replay.
+    receipt_for_key = {"externalRequestId": external_id, "messageId": legacy["providerPaymentId"],
+                       "occurredAt": legacy["occurredAt"], "outcome": "REJECTED",
+                       "providerPaymentId": legacy["providerPaymentId"], "version": 1}
+    spaced = json.dumps(receipt_for_key, sort_keys=True, indent=1).encode("utf-8")
+    spaced_signature = "v1=" + hmac.new(HMAC_SECRET.encode("utf-8"), spaced, hashlib.sha256).hexdigest()
+    status, body = action("receipt", "accept", {}, RECEIPT, legacy["providerPaymentId"],
+                          {"X-Provider-Signature": spaced_signature}, body=spaced)
+    check(status == 409 and body and body["code"] == "idempotency.conflict",
+          f"re-serialized signed body under the same key must conflict: {status} {body}")
+
     receipt = {"externalRequestId": external_id, "messageId": legacy["providerPaymentId"], "occurredAt": legacy["occurredAt"],
                "outcome": "REJECTED", "providerPaymentId": legacy["providerPaymentId"], "version": 1}
     rows = poll(f"SELECT state, body_hash FROM autocheck.inbox WHERE message_id = {sql_text(legacy['providerPaymentId'])}",
@@ -246,7 +273,11 @@ def scenario_adapter_and_recreate() -> None:
     wait_status(operation_id, "REJECTED")
     poll(f"SELECT state FROM autocheck.inbox WHERE message_id = {sql_text(legacy['providerPaymentId'])}",
          lambda rows: rows[0]["state"] == "APPLIED")
-    time.sleep(1.5)
+    # Barrier instead of a sleep: a sentinel payment created after the restart is delivered, so the
+    # dispatcher has demonstrably worked the queue; the confirmed delivery must still be untouched.
+    sentinel, _ = create_and_submit("PAYMENT_EXECUTION", "1011.00")
+    wait_status(sentinel, "COMPLETED")
+    check(audit(external_request(sentinel))[0] == 200, "dispatcher did not resume after recreate")
     check(audit(external_id)[0] == 404, "confirmed outbox must not be delivered after the dispatcher restarts")
 
 
@@ -325,8 +356,140 @@ def scenario_least_privilege() -> None:
         check(result.returncode != 0 and "permission denied" in result.stderr, f"{role} must not run: {statement}")
 
 
+def scenario_failpoint_and_lease_expiry() -> None:
+    if os.environ.get("COURSE_TEST_PROFILE") != "1":
+        # Failpoints and the short outbox lease exist only in the test profile of the stand.
+        raise Skipped("requires a stand started with COURSE_TEST_PROFILE=1")
+    failpoint_env = {**os.environ, "COURSE_FAILPOINT": "after_outbox_claim", "MSYS2_ARG_CONV_EXCL": "*"}
+    started = subprocess.run(
+        ["docker", "compose", "-p", PROJECT, "up", "-d", "--no-build", "--force-recreate", "outbox-dispatcher"],
+        capture_output=True, text=True, timeout=120, env=failpoint_env, check=False)
+    check(started.returncode == 0, "cannot start dispatcher with a failpoint")
+    try:
+        operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1012.00")
+        external_id = external_request(operation_id)
+        deadline = time.monotonic() + 30
+        while '"event":"failpoint.reached"' not in compose("logs", "--no-color", "outbox-dispatcher").stdout:
+            check(time.monotonic() < deadline, "dispatcher did not acknowledge the failpoint")
+            time.sleep(0.2)
+        check(compose("stop", "outbox-dispatcher").returncode == 0, "cannot stop the dispatcher at the failpoint")
+        leased = sql_rows(f"SELECT state, attempt_count FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}")
+        check(leased == [{"state": "LEASED", "attempt_count": 1}], f"claim must be durable at the barrier: {leased}")
+        check(audit(external_id)[0] == 404, "a stopped failpoint must never reach the provider")
+    finally:
+        compose("up", "-d", "--no-build", "--force-recreate", "outbox-dispatcher")
+    wait_status(operation_id, "COMPLETED")
+    outbox = sql_rows("SELECT state, attempt_count, last_error_code FROM autocheck.outbox "
+                      f"WHERE external_request_id = {sql_text(external_id)}")
+    check(outbox == [{"state": "CONFIRMED", "attempt_count": 2, "last_error_code": "lease.expired.retryable"}],
+          f"expired lease must be reclaimed with a visible trace: {outbox}")
+    status, payment = audit(external_id)
+    check(status == 200 and payment and payment["paymentCount"] == 1, f"one payment expected: {payment}")
+
+
+def scenario_receipt_lock_order() -> None:
+    """A receipt racing a process step must queue behind it, not deadlock with it.
+
+    Session A reproduces the lock pattern of a worker step (operation FOR UPDATE, then the process
+    FOR UPDATE inside finish_job). Advisory locks and pg_locks/pg_stat_activity serve as barriers,
+    so the interleaving is deterministic rather than timed.
+    """
+    barrier = 733001
+    check(compose("stop", "outbox-dispatcher").returncode == 0, "cannot stop dispatcher")
+    holder = None
+    try:
+        operation_id, submitted = create_and_submit("PAYMENT_EXECUTION", "1013.00")
+        external_id = external_request(operation_id)
+        psql = ["docker", "compose", "-p", PROJECT, "exec", "-T", "postgres", "psql", "-X", "-U", "postgres", "-d", "course"]
+        env = {**os.environ, "MSYS2_ARG_CONV_EXCL": "*"}
+
+        holder = subprocess.Popen(psql, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, env=env)
+        holder.stdin.write(f"SELECT pg_advisory_lock({barrier});" + chr(10))
+        holder.stdin.flush()
+        poll(f"SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = {barrier} AND granted",
+             lambda rows: len(rows) == 1, timeout=30)
+
+        step = subprocess.Popen(
+            psql + ["-v", "ON_ERROR_STOP=1", "-c", "BEGIN",
+                    "-c", f"SELECT 1 FROM payment.operation WHERE operation_id = '{operation_id}' FOR UPDATE",
+                    "-c", f"SELECT pg_advisory_xact_lock({barrier})",
+                    "-c", f"SELECT 1 FROM workflow.process_instance WHERE process_id = '{submitted['processId']}' FOR UPDATE",
+                    "-c", "COMMIT"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        poll(f"SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = {barrier} AND NOT granted",
+             lambda rows: len(rows) == 1, timeout=30)
+
+        receipt, signature = signed_receipt(external_id, f"e2e-lock-{secrets.token_hex(5)}", outcome="COMPLETED")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            accepted = pool.submit(action, "receipt", "accept", receipt, RECEIPT, receipt["messageId"], signature)
+            poll("SELECT 1 FROM pg_stat_activity WHERE application_name = 'course-api' AND wait_event_type = 'Lock'",
+                 lambda rows: len(rows) >= 1 or accepted.done(), timeout=30)
+            check(not accepted.done(), "receipt.accept must wait behind the step holding the operation")
+
+            holder.stdin.write(f"SELECT pg_advisory_unlock({barrier});" + chr(10) + "\\q" + chr(10))
+            holder.stdin.close()
+            holder.wait(timeout=30)
+            _, step_errors = step.communicate(timeout=60)
+            status, body = accepted.result(timeout=60)
+
+        check(step.returncode == 0 and "deadlock" not in step_errors,
+              f"the process step must not be chosen as a deadlock victim: {step_errors[-300:]}")
+        check(status == 200 and body and body["outcome"] == "RECEIVED", f"receipt must be accepted after the step: {status} {body}")
+        wait_status(operation_id, "COMPLETED")
+    finally:
+        if holder is not None and holder.poll() is None:
+            holder.kill()
+        compose("up", "-d", "--no-build", "outbox-dispatcher")
+
+
+def scenario_submit_rejects_foreign_process() -> None:
+    status, created = action("payment", "request", {"operationKind": "PAYMENT_EXECUTION", "amount": "1014.00", "currency": "RUB"},
+                             CLIENT, f"e2e-request-{uuid.uuid4()}")
+    check(status == 200 and created, f"payment.request failed: {status} {created}")
+    operation_id = created["result"]["operationId"]
+    # A trusted operator starts the flow with the operation's business key, bypassing submit.
+    foreign = subprocess.run(
+        ["docker", "compose", "-p", PROJECT, "run", "--rm", "-T", "--no-deps", "cli",
+         "flow", "start", "payment-processing", "--business-key", operation_id, "--data", "/dev/stdin"],
+        input=json.dumps({"operationId": operation_id}), capture_output=True, text=True, timeout=180,
+        env={**os.environ, "MSYS2_ARG_CONV_EXCL": "*"}, check=False)
+    check(foreign.returncode == 0, f"cannot start the foreign process: {foreign.stdout[-300:]}")
+    status, body = action("payment", "submit", {"operationId": operation_id}, CLIENT, f"e2e-submit-{uuid.uuid4()}")
+    check(status == 422 and body and body["code"] == "payment.process_conflict",
+          f"submit must not bind the operation to a process it did not start: {status} {body}")
+    rows = sql_rows(f"SELECT status, process_id FROM autocheck.operations WHERE operation_id = '{operation_id}'::uuid")
+    check(rows == [{"status": "CREATED", "process_id": None}], f"operation must stay untouched: {rows}")
+
+
+def scenario_storage_invariants() -> None:
+    # Triggers bind every role, the superuser included. Each probe runs inside a transaction that
+    # is rolled back, so a missing guard is reported without corrupting the stand.
+    confirmed = sql_rows("SELECT outbox_id FROM autocheck.outbox WHERE state = 'CONFIRMED' LIMIT 1")
+    applied = sql_rows("SELECT message_id FROM autocheck.inbox WHERE state = 'APPLIED' LIMIT 1")
+    check(confirmed and applied, "storage probes need a confirmed delivery and an applied message")
+    probes = (
+        (f"UPDATE delivery.outbox SET last_error_code = 'http.500.retryable' WHERE outbox_id = '{confirmed[0]['outbox_id']}'",
+         "confirmed delivery is final"),
+        (f"UPDATE delivery.inbox SET applied_at = now() - interval '1 day' WHERE message_id = {sql_text(applied[0]['message_id'])}",
+         "a settled inbox message is immutable"),
+        ("UPDATE payment.flow_binding SET flow_name = 'workflow-smoke'", "server-side flow binding is immutable"),
+        ("DELETE FROM workflow.decision", "decision audit is append only"),
+        ("UPDATE payment.receipt SET outcome = 'COMPLETED'", "receipt evidence is immutable"),
+        ("UPDATE payment.operation SET status = 'PROCESSING' WHERE status IN ('COMPLETED', 'REJECTED')",
+         "operation status transition"),
+        ("UPDATE payment.operation SET process_id = gen_random_uuid() WHERE status = 'COMPLETED'",
+         "operation process binding is write-once"),
+    )
+    for statement, expected in probes:
+        result = compose("exec", "-T", "postgres", "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "course",
+                         "-c", "BEGIN", "-c", statement, "-c", "ROLLBACK")
+        check(result.returncode != 0 and expected in result.stderr, f"storage guard missing: {statement[:60]}")
+
+
 SCENARIOS = [scenario_provider_path, scenario_adapter_and_recreate, scenario_review, scenario_concurrent_submit,
-             scenario_least_privilege]
+             scenario_least_privilege, scenario_failpoint_and_lease_expiry, scenario_receipt_lock_order,
+             scenario_submit_rejects_foreign_process, scenario_storage_invariants]
 
 
 def main() -> int:
@@ -336,6 +499,8 @@ def main() -> int:
         try:
             scenario()
             print(f"PASS {scenario.__name__} ({time.monotonic() - started:.1f}s)")
+        except Skipped as reason:
+            print(f"SKIP {scenario.__name__}: {reason}")
         except Exception as error:  # noqa: BLE001 - report every scenario
             failed += 1
             print(f"FAIL {scenario.__name__}: {error}")

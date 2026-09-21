@@ -43,6 +43,25 @@ VALUES ('PAYMENT_EXECUTION', 'payment-processing'),
        ('PAYMENT_APPROVAL', 'payment-review')
 ON CONFLICT (operation_kind) DO NOTHING;
 
+-- Привязка неизменяема: payment.validate сверяет с ней уже запущенные процессы, и переписанная
+-- строка молча провалила бы каждый процесс, стартовавший до правки. Другая карта для вида
+-- операции — это новая версия той же карты (flow activate), а не другое имя в привязке.
+CREATE OR REPLACE FUNCTION payment.flow_binding_immutable()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $fn$
+BEGIN
+    RAISE EXCEPTION 'server-side flow binding is immutable'
+        USING ERRCODE = 'restrict_violation';
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS flow_binding_immutable ON payment.flow_binding;
+CREATE TRIGGER flow_binding_immutable
+    BEFORE UPDATE OR DELETE ON payment.flow_binding
+    FOR EACH ROW EXECUTE FUNCTION payment.flow_binding_immutable();
+
 -------------------------------------------------------------------------------
 -- Правило лимита. Версия правила — часть аудита решения, поэтому строка правила неизменяема:
 -- другой порог означает другую версию, а не переписанную старую.
@@ -172,7 +191,9 @@ CREATE TABLE IF NOT EXISTS delivery.outbox (
     delivered_at        timestamptz,
     confirmed_at        timestamptz,
     updated_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
-    CONSTRAINT outbox_lease_shape CHECK (state <> 'LEASED' OR (lease_owner IS NOT NULL AND lease_until IS NOT NULL))
+    CONSTRAINT outbox_lease_shape CHECK (state <> 'LEASED' OR (lease_owner IS NOT NULL AND lease_until IS NOT NULL)),
+    CONSTRAINT outbox_delivered_shape CHECK (state <> 'DELIVERED' OR (delivered_at IS NOT NULL AND provider_payment_id IS NOT NULL)),
+    CONSTRAINT outbox_confirmed_shape CHECK (state <> 'CONFIRMED' OR confirmed_at IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS outbox_queue
@@ -203,9 +224,20 @@ BEGIN
     END IF;
 
     -- Подтверждённая квитанцией доставка — конечное состояние. Опоздавший ответ dispatcher'а
-    -- (или его сбой) не может вернуть её назад, даже если граница забудет это проверить.
-    IF OLD.state = 'CONFIRMED' AND NEW.state <> 'CONFIRMED' THEN
-        RAISE EXCEPTION 'confirmed delivery cannot regress'
+    -- (или его сбой) не может ни вернуть её назад, ни переписать её след, даже если граница
+    -- забудет это проверить.
+    IF OLD.state = 'CONFIRMED' AND NEW IS DISTINCT FROM OLD THEN
+        RAISE EXCEPTION 'confirmed delivery is final'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    -- Свидетельства доставки пишутся один раз: принятый provider платёж и моменты доставки и
+    -- подтверждения нельзя подменить задним числом.
+    IF (OLD.provider_payment_id IS NOT NULL AND NEW.provider_payment_id IS DISTINCT FROM OLD.provider_payment_id)
+       OR (OLD.delivered_at IS NOT NULL AND NEW.delivered_at IS DISTINCT FROM OLD.delivered_at)
+       OR (OLD.confirmed_at IS NOT NULL AND NEW.confirmed_at IS DISTINCT FROM OLD.confirmed_at)
+    THEN
+        RAISE EXCEPTION 'delivery evidence is write-once'
             USING ERRCODE = 'restrict_violation';
     END IF;
 
@@ -250,7 +282,8 @@ CREATE TABLE IF NOT EXISTS delivery.inbox (
     signal_type text NOT NULL CHECK (length(signal_type) BETWEEN 1 AND 200),
     state       text NOT NULL CHECK (state IN ('RECEIVED', 'APPLIED', 'CONFLICT')),
     received_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    applied_at  timestamptz
+    applied_at  timestamptz,
+    CONSTRAINT inbox_applied_shape CHECK ((state = 'APPLIED') = (applied_at IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS inbox_pending
@@ -280,8 +313,9 @@ BEGIN
             USING ERRCODE = 'restrict_violation';
     END IF;
 
-    IF OLD.state <> 'RECEIVED' AND NEW.state IS DISTINCT FROM OLD.state THEN
-        RAISE EXCEPTION 'a settled inbox message cannot change state'
+    -- Решённое сообщение (APPLIED или CONFLICT) неизменяемо целиком, включая момент применения.
+    IF OLD.state <> 'RECEIVED' AND NEW IS DISTINCT FROM OLD THEN
+        RAISE EXCEPTION 'a settled inbox message is immutable'
             USING ERRCODE = 'restrict_violation';
     END IF;
 
@@ -403,6 +437,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS operation_event_single_final
     WHERE event_type IN ('OPERATION_COMPLETED', 'OPERATION_REJECTED');
 
 CREATE INDEX IF NOT EXISTS operation_process ON payment.operation (process_id);
+
+-------------------------------------------------------------------------------
+-- Жизненный цикл операции как инвариант хранилища, а не только кода функций:
+-- процесс есть ровно у отправленной операции, привязка пишется один раз, статус проходит
+-- CREATED -> PROCESSING -> COMPLETED | REJECTED и из финального не выходит.
+-------------------------------------------------------------------------------
+ALTER TABLE payment.operation DROP CONSTRAINT IF EXISTS operation_process_shape;
+ALTER TABLE payment.operation
+    ADD CONSTRAINT operation_process_shape CHECK ((status = 'CREATED') = (process_id IS NULL));
+
+CREATE OR REPLACE FUNCTION payment.operation_lifecycle_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $fn$
+BEGIN
+    IF OLD.process_id IS NOT NULL AND NEW.process_id IS DISTINCT FROM OLD.process_id THEN
+        RAISE EXCEPTION 'operation process binding is write-once'
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    IF NEW.status IS DISTINCT FROM OLD.status
+       AND NOT ((OLD.status = 'CREATED' AND NEW.status = 'PROCESSING')
+             OR (OLD.status = 'PROCESSING' AND NEW.status IN ('COMPLETED', 'REJECTED')))
+    THEN
+        RAISE EXCEPTION 'operation status transition % -> % is not allowed', OLD.status, NEW.status
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS operation_lifecycle_guard ON payment.operation;
+CREATE TRIGGER operation_lifecycle_guard
+    BEFORE UPDATE ON payment.operation
+    FOR EACH ROW EXECUTE FUNCTION payment.operation_lifecycle_guard();
 
 REVOKE ALL ON ALL TABLES IN SCHEMA delivery FROM PUBLIC;
 REVOKE ALL ON payment.flow_binding, payment.limit_rule, payment.external_request, payment.receipt FROM PUBLIC;

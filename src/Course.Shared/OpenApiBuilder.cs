@@ -116,7 +116,7 @@ public static class OpenApiBuilder
     }
 
     /// <summary>
-    /// Заголовки запроса, общие для любого действия: X-Action-Version и Idempotency-Key.
+    /// Заголовки запроса, общие для любого действия: X-Action-Version, Idempotency-Key и подпись.
     ///
     /// Версионный документ описывает ровно одну версию, поэтому заголовок в нём обязателен и
     /// зафиксирован константой: иначе сгенерированный по такому документу клиент имел бы полное
@@ -155,6 +155,21 @@ public static class OpenApiBuilder
                 ["required"] = manifest.RequiresIdempotencyKey,
                 ["description"] = $"Idempotency key, scope {manifest.IdempotencyScope}.",
                 ["schema"] = new JsonObject { ["type"] = "string", ["minLength"] = 1, ["maxLength"] = 128 },
+            },
+            // Граница подписи общая и не знает, какому действию подпись обязательна: это решает
+            // зарегистрированная функция по доверенному маркеру. Поэтому документ честно описывает
+            // заголовок необязательным для любого действия и объясняет оба исхода.
+            new JsonObject
+            {
+                ["name"] = SignatureBoundary.HeaderName,
+                ["in"] = "header",
+                ["required"] = false,
+                ["description"] =
+                    "Optional v1 HMAC-SHA256 over the exact request body bytes, lowercase hex. " +
+                    "A present but malformed or wrong signature is rejected with 401 signature.invalid " +
+                    "before the action is resolved. Actions that require a verified signature answer " +
+                    "403 when the header is absent.",
+                ["schema"] = new JsonObject { ["type"] = "string", ["pattern"] = "^v1=[0-9a-f]{64}$" },
             });
 
     /// <summary>

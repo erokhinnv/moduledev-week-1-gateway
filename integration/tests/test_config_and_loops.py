@@ -1,7 +1,10 @@
+import contextlib
 import io
+import json
 import unittest
+from unittest import mock
 
-from course_integration.__main__ import EXIT_CONFIG, EXIT_USAGE, main as cli_main
+from course_integration.__main__ import EXIT_CONFIG, EXIT_FAILURE, EXIT_USAGE, main as cli_main
 from course_integration.config import (
     ConfigError,
     adapter_settings,
@@ -72,11 +75,39 @@ class ConfigurationTests(unittest.TestCase):
         reconciler = reconciler_settings({**DATABASE, "COURSE_TEST_PROFILE": "1", "INBOX_POLL_INTERVAL_MS": "5000"})
         self.assertLessEqual(reconciler.poll_interval_s, 0.5)
 
+    def test_database_calls_are_bounded_by_a_statement_timeout(self):
+        kwargs = dispatcher_settings(DISPATCHER).database.connect_kwargs()
+        self.assertEqual(kwargs["options"], "-c statement_timeout=10000")
+        custom = reconciler_settings({**DATABASE, "COURSE_POSTGRES_STATEMENT_TIMEOUT_MS": "2500"})
+        self.assertEqual(custom.database.connect_kwargs()["options"], "-c statement_timeout=2500")
+        self.assert_rejects(reconciler_settings, {**DATABASE, "COURSE_POSTGRES_STATEMENT_TIMEOUT_MS": "0"},
+                            "COURSE_POSTGRES_STATEMENT_TIMEOUT_MS")
+
+    def test_database_settings_repr_hides_password(self):
+        self.assertNotIn("db-password-value", repr(dispatcher_settings(DISPATCHER)))
+
     def test_failpoints_exist_only_in_test_profile(self):
         self.assertEqual(dispatcher_settings({**DISPATCHER, "COURSE_FAILPOINT": "after_outbox_claim"}).failpoint, "")
 
     def test_cli_reports_configuration_error_without_values(self):
         self.assertEqual(cli_main(["unknown"]), EXIT_USAGE)
+        with (
+            mock.patch.dict("os.environ", {"OUTBOX_OWNER": "outbox-dispatcher"}, clear=True),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(cli_main(["outbox-dispatcher"]), EXIT_CONFIG)
+        record = json.loads(output.getvalue())
+        self.assertEqual((record["event"], record["reason"]), ("configuration.invalid", "PROVIDER_URL is required"))
+
+    def test_unexpected_startup_failure_is_a_structured_record(self):
+        with (
+            mock.patch("course_integration.reconciler.main", side_effect=OSError("port 8082 secret-detail")),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(cli_main(["inbox-reconciler"]), EXIT_FAILURE)
+        record = json.loads(output.getvalue())
+        self.assertEqual((record["event"], record["failure"]), ("process.failed", "OSError"))
+        self.assertNotIn("secret-detail", output.getvalue())
 
 
 MESSAGE = OutboxMessage("o-1", 1, "ext-1", "c-1", "10.00", "RUB")
@@ -120,6 +151,42 @@ class DispatcherLoopTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(outbox.reports, [("succeed", 1, "outbox-dispatcher", "provider-1")])
         self.assertFalse(dispatcher.cycle())
+
+    def test_stopped_failpoint_never_crosses_its_boundary(self):
+        for failpoint, expected_sent in (("after_outbox_claim", 0), ("after_provider_response", 1)):
+            with self.subTest(failpoint=failpoint):
+                outbox = FakeOutbox([[MESSAGE]])
+                settings = dispatcher_settings({**DISPATCHER, "COURSE_TEST_PROFILE": "1", "COURSE_FAILPOINT": failpoint})
+                sent = []
+                stop = StopSignal()
+                stop.set()
+
+                def sender(url, request, timeout):
+                    sent.append(request)
+                    return AttemptResult(provider_payment_id="provider-1", http_status=202)
+
+                dispatcher = Dispatcher(settings, lambda: outbox, Logger("outbox-dispatcher", io.StringIO()), stop, sender)
+                with contextlib.redirect_stdout(io.StringIO()) as acknowledgement, self.assertRaises(SystemExit):
+                    dispatcher.cycle()
+                self.assertEqual(len(sent), expected_sent)
+                self.assertEqual(outbox.reports, [])
+                self.assertEqual(
+                    json.loads(acknowledgement.getvalue()),
+                    {"event": "failpoint.reached", "name": failpoint, "instanceId": settings.instance_id},
+                )
+
+    def test_refused_report_is_logged_as_a_warning(self):
+        class StaleOutbox(FakeOutbox):
+            def succeed(self, message, owner, provider_payment_id):
+                return {"status": "error", "code": "delivery.lease_stale", "state": "LEASED"}
+
+        log = io.StringIO()
+        settings = dispatcher_settings({**DISPATCHER, "COURSE_TEST_PROFILE": "1"})
+        dispatcher = Dispatcher(settings, lambda: StaleOutbox([[MESSAGE]]), Logger("outbox-dispatcher", log), StopSignal(),
+                                lambda url, request, timeout: AttemptResult(provider_payment_id="p", http_status=202))
+        dispatcher.cycle()
+        record = json.loads(log.getvalue())
+        self.assertEqual((record["level"], record["reportCode"]), ("warning", "delivery.lease_stale"))
 
     def test_failure_is_reported_and_retry_repeats_exact_request(self):
         retry = OutboxMessage("o-1", 2, "ext-1", "c-1", "10.00", "RUB")

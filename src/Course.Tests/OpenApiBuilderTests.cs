@@ -136,6 +136,24 @@ public sealed class OpenApiBuilderTests
         Assert.Null(header["schema"]!["const"]);
     }
 
+    [Fact]
+    public void Signature_header_is_documented_as_optional_exact_format()
+    {
+        foreach (var document in new[]
+                 {
+                     OpenApiBuilder.VersionDocument(Manifest("receipt", "accept", 1)),
+                     OpenApiBuilder.DefaultDocument([Manifest("receipt", "accept", 1)]),
+                 })
+        {
+            var header = document["paths"]!["/api/receipt/accept"]!["post"]!["parameters"]!.AsArray()
+                .First(parameter => parameter!["name"]!.GetValue<string>() == SignatureBoundary.HeaderName)!;
+
+            Assert.False(header["required"]!.GetValue<bool>());
+            Assert.Equal("^v1=[0-9a-f]{64}$", header["schema"]!["pattern"]!.GetValue<string>());
+            Assert.Contains("signature.invalid", header["description"]!.GetValue<string>());
+        }
+    }
+
     /// <summary>Ищет в OpenAPI-документе параметр заголовка Idempotency-Key и возвращает, помечен ли он как обязательный.</summary>
     private static bool KeyIsRequired(JsonObject document, string path)
         => document["paths"]![path]!["post"]!["parameters"]!.AsArray()

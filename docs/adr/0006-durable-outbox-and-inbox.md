@@ -38,8 +38,9 @@ lost response не создаёт второй платёж: provider дедуп
 или `test`; какой профиль действует, знает сама база (`workflow.runtime_setting.test_profile`).
 
 `CONFIRMED` — конечное состояние. Его ставит квитанция, и ни `succeed_outbox`, ни `fail_outbox`,
-ни прямой UPDATE (триггер `outbox_guard`) не возвращают доставку назад. Подтверждённая доставка
-больше не захватывается.
+ни прямой UPDATE (триггер `outbox_guard`) не меняют подтверждённую строку вообще. Подтверждённая
+доставка больше не захватывается. Свидетельства доставки — `provider_payment_id`, `delivered_at`,
+`confirmed_at` — пишутся один раз; форма состояний `DELIVERED`/`CONFIRMED` закреплена CHECK.
 
 ### Inbox: сохранить до ответа, применить отдельно
 
@@ -53,7 +54,10 @@ lost response не создаёт второй платёж: provider дедуп
 
 Тот же `messageId` и тот же SHA-256 точных байт — `DUPLICATE` с сохранённым `state`; другой hash —
 `idempotency.conflict`, исходная строка, сигнал и статус не меняются. Повтор с тем же
-`Idempotency-Key` возвращает сохранённый результат ещё на уровне `api.invoke`.
+`Idempotency-Key` разбирается ещё на уровне `api.invoke`, и с миграции 020 он сравнивает тот же
+отпечаток точных байт, который HTTP-граница кладёт в context: одна команда не может получить
+replay по ключу и конфликт по `messageId` за одно и то же тело. Решённое сообщение Inbox
+(`APPLIED`/`CONFLICT`) неизменяемо целиком, а `applied_at` существует ровно у `APPLIED`.
 
 Применение — `delivery.reconcile_inbox(limit)`, единственная функция роли `inbox_reconciler`. Для
 каждого подходящего `RECEIVED` сообщения она атомарно создаёт (или дедуплицирует) workflow
@@ -71,11 +75,23 @@ signal, переводит Inbox в `APPLIED` и применяет сигнал
 
 ### Порядок блокировок
 
-Взаимоблокировок нет, потому что порядок один на всех путях:
+Порядок учитывает и неявные блокировки: вставка строки с внешним ключом берёт `FOR KEY SHARE` на
+родительскую строку, а это конфликтует с чужим `FOR UPDATE`. Поэтому порядок один на всех путях:
 
-- `process_instance` → строка `inbox` (worker через `finish_job`, reconciler явно; строку inbox оба
-  берут `SKIP LOCKED`);
-- `external_request` → строка `outbox` (`receipt.accept` и `succeed_outbox`).
+- `external_request` → `operation` → `process_instance` → строка `inbox` / `outbox`;
+- шаг процесса: `operation` (`FOR UPDATE` в самом действии) → `process_instance` (`finish_job`);
+- `receipt.accept`: `external_request` → явный `FOR UPDATE` операции → вставки Inbox, receipt и
+  события, неявно берущие `KEY SHARE` на процесс и операцию → `outbox`. Без явной блокировки
+  операции квитанция, пришедшая во время шага, держала бы процесс и ждала операцию, а шаг —
+  наоборот; e2e-сценарий `scenario_receipt_lock_order` воспроизводит эту очерёдность на барьерах
+  PostgreSQL и без исправления получает deadlock;
+- reconciler и `workflow.manual`: `process_instance` → строки процесса (inbox, шаг); операцию они не
+  трогают;
+- `succeed_outbox`: `external_request` → `outbox`, `claim_outbox` и `fail_outbox` — только `outbox`.
+
+Если конфликт блокировок или сериализации всё же случится, он повторяем: `api.invoke` отвечает
+`503 dependency.unavailable` с `retryable: true`, а worker возвращает попытку в `RETRY_WAIT`
+вместо перевода процесса в `FAILED`.
 
 ## Последствия
 

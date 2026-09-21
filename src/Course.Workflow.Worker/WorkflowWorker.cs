@@ -325,6 +325,21 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 true,
                 Dispatch(job, correlationId, payloadHash, job.ActionVersion, started, succeeded: false));
         }
+        catch (PostgresException exception) when (PostgresFailure.IsTransientConflict(exception))
+        {
+            // Deadlock или serialization failure на границе завершения: вся транзакция откатана,
+            // предметного эффекта нет, а executionId делает повтор безопасным. Такой отказ обязан
+            // быть повторяемым — иначе конкурентная квитанция или решение переводили бы процесс
+            // в FAILED из-за очерёдности блокировок, а не из-за ошибки действия.
+            await SafeRollbackAsync(transaction);
+            Log($"attempt hit a transient database conflict instance={options.InstanceId} job={job.JobId} " +
+                $"attempt={job.AttemptNumber} failure={Redaction.Describe(exception)}");
+            return new AttemptResult(
+                false,
+                ContractCodes.DependencyUnavailable,
+                true,
+                Dispatch(job, correlationId, payloadHash, job.ActionVersion, started, succeeded: false));
+        }
         catch (PostgresException exception)
         {
             // Сервер ответил отказом — соединение цело, и попытку можно честно закрыть. Это

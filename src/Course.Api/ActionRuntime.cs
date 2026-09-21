@@ -209,7 +209,7 @@ public sealed class ActionRuntime(
                 // недоступность базы, "запоминаем" это на короткое время через DependencyState —
                 // чтобы следующие запросы не ждали повторного долгого таймаута соединения.
                 var code = PostgresFailure.Classify(exception);
-                if (code == ContractCodes.DependencyUnavailable)
+                if (PostgresFailure.IsDependencyOutage(exception))
                 {
                     dependencyState.MarkUnavailable();
                 }

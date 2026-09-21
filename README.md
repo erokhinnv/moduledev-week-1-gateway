@@ -87,6 +87,7 @@ inbox-reconciler  → PostgreSQL (delivery.reconcile_inbox)
 | Таблицы периметра и их инварианты | [`db/migrations/017_perimeter_core.sql`](db/migrations/017_perimeter_core.sql) |
 | Платёжные действия, `receipt.accept`, `workflow.manual`, `delivery.*` | [`db/migrations/018_perimeter_actions.sql`](db/migrations/018_perimeter_actions.sql) |
 | Проекции периметра и права Python-ролей | [`db/migrations/019_perimeter_autocheck.sql`](db/migrations/019_perimeter_autocheck.sql) |
+| Идентичность тела идемпотентной HTTP-команды | [`db/migrations/020_invoke_body_identity.sql`](db/migrations/020_invoke_body_identity.sql) |
 | Python-периметр | [`integration/course_integration`](integration/course_integration) |
 | Карты платёжных процессов | [`db/flows/payment-processing-v1.flow.yaml`](db/flows/payment-processing-v1.flow.yaml), [`db/flows/payment-review-v1.flow.yaml`](db/flows/payment-review-v1.flow.yaml) |
 | Общий разбор границы `api.invoke` | [`src/Course.Shared/RegisteredAction.cs`](src/Course.Shared/RegisteredAction.cs) |
@@ -164,7 +165,7 @@ curl -s http://localhost:8080/api/operation/events -H "Authorization: Bearer $TO
   -H 'Content-Type: application/json' -d "{\"operationId\":\"$OP\"}"   # ... RECEIPT_APPLIED, OPERATION_COMPLETED
 ```
 
-Все сценарии недели 3 разом (provider path, adapter, recreate, review, конкуренция, роли):
+Все сценарии недели 3 разом (provider path, adapter, recreate, review, конкуренция, роли, failpoint, порядок блокировок, неизменяемость хранилища):
 
 ```bash
 python3 scripts/e2e_perimeter.py
@@ -198,7 +199,9 @@ docker compose down -v
 | `PROVIDER_SIMULATOR_MODE` | `provider-simulator` | `success` | Режим simulator для ручных экспериментов |
 | `PROVIDER_TIMEOUT_MS` | `outbox-dispatcher` | `500` в test profile, иначе `5000` | Бюджет одной HTTP-попытки |
 | `OUTBOX_POLL_INTERVAL_MS` / `INBOX_POLL_INTERVAL_MS` | dispatcher / reconciler | `100` / `200` в test profile | Интервал опроса; у reconciler в test profile не более 500 мс |
-| `RECEIPT_ADAPTER_PORT`, `RECEIPT_API_TIMEOUT_MS` | `receipt-adapter` | `8082`, `10000` | Порт внутри сети Compose и бюджет ожидания API |
+| `RECEIPT_ADAPTER_HOST`, `RECEIPT_ADAPTER_PORT`, `RECEIPT_API_TIMEOUT_MS` | `receipt-adapter` | `0.0.0.0`, `8082`, `10000` | Адрес и порт внутри сети Compose, бюджет ожидания API |
+| `INBOX_BATCH_SIZE` | `inbox-reconciler` | `50` | Сколько сообщений Inbox согласуется одним вызовом `delivery.reconcile_inbox` (1–100) |
+| `COURSE_POSTGRES_STATEMENT_TIMEOUT_MS` | dispatcher, reconciler | `10000` | Потолок одного вызова SQL-границы: ожидание блокировки заканчивается ошибкой и переподключением, а не зависанием |
 | `COURSE_OUTBOX_PASSWORD`, `COURSE_INBOX_PASSWORD` | `postgres`, dispatcher / reconciler | local-only значения | Пароли ролей `outbox_dispatcher` и `inbox_reconciler` |
 | `COURSE_API_BASE_URL` | `gateway` | `http://api:8080` | Внутренний адрес по Compose DNS |
 | `COURSE_POSTGRES_HOST` / `_PORT` / `_DB` | `api`, `cli`, `worker-*` | `postgres` / `5432` / `course` | Адрес авторитетного состояния |
@@ -425,7 +428,10 @@ Test profile (`COURSE_TEST_PROFILE=1`): аренда 2 секунды, опро�
 активной версией, первый job, событие `OPERATION_SUBMITTED` и результат идемпотентности. Строка
 операции блокируется, поэтому конкурентные submit одной операции дают один процесс; любой повтор
 (с любым ключом, после завершения или смены default-версии карты) возвращает исходный subject
-result со `status = PROCESSING`.
+result со `status = PROCESSING`. Процесс с тем же business key, запущенный в обход submit (например
+`flow start`), к операции не привязывается — `422 payment.process_conflict`. Жизненный цикл
+`CREATED → PROCESSING → COMPLETED | REJECTED`, «процесс есть ровно у отправленной операции» и
+однократная привязка закреплены CHECK и триггером `payment.operation`.
 
 ```text
 payment-processing v1 (выданная карта)
@@ -530,8 +536,12 @@ recreate ничего не теряет.
 `transport.signatureVersion = 1`. `receipt.accept` без маркера — `403 receipt.signature_required`.
 Далее одной транзакцией: версия и известный `externalRequestId` (иначе `422
 receipt.external_request_not_found`), Inbox с глобальным `messageId` и SHA-256 точных байт,
-receipt, Outbox и `external_request` → `CONFIRMED`. Тот же `messageId` и hash — `DUPLICATE`, другой
-hash — `409 idempotency.conflict`. Раннее сообщение ждёт в `RECEIVED`: его применит reconciler или
+receipt, Outbox и `external_request` → `CONFIRMED`. Тот же `messageId` и hash — `DUPLICATE` с
+сохранённым `state` Inbox (`RECEIVED`, `APPLIED` или `CONFLICT` у сообщения, опоздавшего к уже
+применённой квитанции), другой hash — `409 idempotency.conflict`. Повтор с тем же `Idempotency-Key` сравнивается по тем же точным
+байтам ([020](db/migrations/020_invoke_body_identity.sql)): байтово другое, даже корректно
+подписанное тело — тоже конфликт, а не replay. Заголовок подписи описан в OpenAPI каждого действия
+как необязательный с форматом `^v1=[0-9a-f]{64}$`. Раннее сообщение ждёт в `RECEIVED`: его применит reconciler или
 сам вход процесса в `wait_signal`. Подробности и порядок блокировок — в
 [ADR 0006](docs/adr/0006-durable-outbox-and-inbox.md).
 
@@ -617,8 +627,9 @@ dotnet test src/Course.sln
 ```
 
 Неделя 3 добавляет unit-тесты generic-границы подписи (точные байты, сырой UTF-8 ключ, строгий
-формат `v1`, коды `401/403/409`) и request schema `receipt.accept` (любая точность `occurredAt`,
-запрет unknown fields, версий и CR/LF).
+формат `v1`, коды `401/403/409`), request schema `receipt.accept` (любая точность `occurredAt`,
+запрет unknown fields, версий и CR/LF), описания подписи в OpenAPI и классификации отказов
+PostgreSQL (deadlock и serialization failure — повторяемый `503`).
 
 Python unit/contract-тесты периметра — только стандартная библиотека, без Docker и без драйвера
 PostgreSQL:
@@ -637,8 +648,14 @@ End-to-end сценарии недели 3 на поднятом стеке —
 [`scripts/e2e_perimeter.py`](scripts/e2e_perimeter.py): durable Outbox при остановленном dispatcher,
 отказ missing/invalid/replayed signature, wrong version и unknown `externalRequestId` без мутаций,
 `paymentCount = 1`, duplicate/conflict callback, recreate Python-сервисов с непримененным Inbox,
-отсутствие повторной доставки подтверждённого Outbox, auto/manual review с аудитом, гонка из восьми
-ручных решений, 20 конкурентных submit одной операции и запреты Python-ролей.
+отсутствие повторной доставки подтверждённого Outbox (барьер — доставленный sentinel-платёж, а не
+пауза), конфликт байтово другого подписанного тела под тем же ключом, auto/manual review с
+аудитом, гонка из восьми ручных решений, 20 конкурентных submit одной операции, запреты
+Python-ролей, failpoint `after_outbox_claim` (остановленный dispatcher не доходит до provider, а
+новый перехватывает аренду со следом `lease.expired.retryable` и одним платежом), квитанция во время
+шага процесса на барьерах PostgreSQL (встаёт в очередь за шагом, а не получает deadlock), отказ
+submit привязать операцию к процессу, запущенному в обход, и триггеры неизменяемости Outbox, Inbox,
+receipts, decisions, flow binding и жизненного цикла операции.
 
 Интеграционные тесты закрывают то, что без живого контура доказать нельзя: гонку версий между
 валидацией и исполнением, повтор по ключу идемпотентности через смену версии по умолчанию,
@@ -726,12 +743,14 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
 | Задание `DEAD`, процесс `FAILED` | причина — в `autocheck.jobs.dead_reason`, код отказа — в `autocheck.attempts.error_code`, событие `TaskFailed` или `TaskAbandoned` — в истории |
 | Попытка `STALE` | аренда истекла до завершения; `attempt_count` вырос, бюджет отказов — нет |
 | `workflow.lease_stale` | завершение пришло от прежнего арендатора после перехвата — так и должно быть |
+| Действие отвечает `503 dependency.unavailable` c `retryable: true` и `details.sqlstate` `40P01`/`40001` | конфликт блокировок или сериализации в PostgreSQL; транзакция откатана целиком, ту же команду с тем же ключом можно повторить. Worker в этом случае планирует повтор, а не переводит процесс в `FAILED` |
 | `executionId` из `autocheck.jobs` | связывает задание, все его попытки, строку `autocheck.action_dispatches` и предметный эффект |
 | Operation `PROCESSING`, Outbox `PENDING` | dispatcher остановлен или не может подключиться: `docker compose logs outbox-dispatcher`, событие `outbox.cycle_failed` |
 | Outbox `RETRY_WAIT`, `last_error_code` = `transport.error.retryable` или `http.5xx.retryable` | provider недоступен или медленнее `PROVIDER_TIMEOUT_MS`; следующая попытка — `next_attempt_at` |
 | Outbox `DEAD` | исчерпаны попытки или terminal-ответ (`http.4xx.terminal`, `response.invalid.terminal`); процесс продолжает ждать квитанцию |
 | Outbox `CONFIRMED`, Inbox `RECEIVED` дольше секунды | reconciler остановлен или процесс ещё не дошёл до `wait_receipt`: `docker compose logs inbox-reconciler` |
 | Inbox `CONFLICT` | сообщение пришло после того, как процесс уже применил другую квитанцию или завершился |
+| Outbox `last_error_code = lease.expired.retryable` | прежний dispatcher захватил доставку и не отчитался (остановлен или потерял базу); попытка учтена в `attempt_count` |
 | Callback provider получает `404` | capability в `CALLBACK_URL` не совпадает с `PROVIDER_CALLBACK_CAPABILITY` adapter'а |
 | `receipt.accept` отвечает `401 signature.invalid` | `PROVIDER_HMAC_SECRET` у `api` и adapter различаются или тело изменено по пути |
 | `receipt.accept` отвечает `401 auth.invalid` | `PROVIDER_CALLBACK_TOKEN` подписан не тем `COURSE_JWT_SIGNING_KEY` или просрочен |
@@ -761,6 +780,18 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
   — это маршрут к ручному шагу, а не решение, и отдельной строки аудита не порождает.
 - `workflow.manual` не проверяет, что ревьюер не является автором операции: в учебном контуре это
   не требуется, в реальном — нужна проверка «четырёх глаз».
+- `payment.submit` и `operation.events` не проверяют, что операция принадлежит вызывающему
+  principal: любой держатель `payment:write` / `payment:read` действует над любой операцией по её
+  идентификатору — так же, как `workflow.get` недели 2. В реальном контуре нужна проверка
+  принадлежности.
+- JWT adapter'а (`PROVIDER_CALLBACK_TOKEN`) не обновляется сам. `scripts/dev_env.py` выпускает его на
+  7 дней; после истечения API отвечает `401 auth.invalid`, adapter честно передаёт этот статус
+  provider (событие `callback.forwarded` с `apiStatus=401`), и provider исчерпывает свои повторы.
+- Привязка `payment.flow_binding` неизменяема: другая карта для вида операции вводится новой версией
+  той же карты, а не переименованием в привязке, иначе уже запущенные процессы не прошли бы
+  `payment.validate`.
+- Идентичность тела идемпотентной HTTP-команды — точные байты запроса. Записи идемпотентности,
+  сделанные до миграции 020, хранят jsonb-отпечаток; стенд недели 3 и так требует чистого тома.
 - У JWT/HMAC/capability/токенов нет default в `compose.yaml`, поэтому голый
   `docker compose up` без окружения не поднимет `api` и adapter; для локального запуска есть
   `scripts/dev_env.py`.

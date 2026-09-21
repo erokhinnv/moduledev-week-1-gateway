@@ -71,6 +71,7 @@ class DatabaseSettings:
     user: str
     password: str = field(repr=False)
     application_name: str
+    statement_timeout_ms: int
 
     def connect_kwargs(self) -> dict[str, object]:
         return {
@@ -81,6 +82,9 @@ class DatabaseSettings:
             "password": self.password,
             "application_name": self.application_name,
             "connect_timeout": 5,
+            # Every boundary call is one short statement. A lock wait or a stuck server must end
+            # in an error the loop can recover from, not freeze the process indefinitely.
+            "options": f"-c statement_timeout={self.statement_timeout_ms}",
             "autocommit": True,
         }
 
@@ -93,6 +97,9 @@ def database_settings(env: Mapping[str, str], application_name: str) -> Database
         user=_required(env, "COURSE_POSTGRES_USER"),
         password=_required(env, "COURSE_POSTGRES_PASSWORD"),
         application_name=env.get("PGAPPNAME") or application_name,
+        statement_timeout_ms=_positive_int(
+            env, "COURSE_POSTGRES_STATEMENT_TIMEOUT_MS", 10000, maximum=300000
+        ),
     )
 
 

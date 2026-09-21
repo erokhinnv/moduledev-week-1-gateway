@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import http.client
+import http.server
 import io
 import json
 import threading
@@ -8,6 +9,7 @@ import unittest
 
 from course_integration.adapter import (
     DEPENDENCY_UNAVAILABLE,
+    MAX_API_RESPONSE_BYTES,
     CallbackServer,
     ReceiptAdapter,
     Reply,
@@ -130,6 +132,36 @@ class AdapterHandlingTests(unittest.TestCase):
                 self.assertEqual(reply.status, 503)
                 self.assertEqual(json.loads(reply.body), {"status": "error", "code": "dependency.unavailable"})
                 self.assertEqual(reply.body, DEPENDENCY_UNAVAILABLE)
+
+    def test_unexpected_failure_answers_500_instead_of_dropping_the_connection(self):
+        reply = self.adapter(RecordingTransport(error=RuntimeError("boom with value 42"))).handle(RAW)
+        self.assertEqual(reply, Reply(500))
+        self.assertIn('"failure":"RuntimeError"', self.log.getvalue())
+        self.assertNotIn("boom with value", self.log.getvalue())
+
+    def test_oversized_api_response_is_not_relayed_truncated(self):
+        class Oversized(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                body = b"x" * (MAX_API_RESPONSE_BYTES + 10)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Oversized)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            settings = adapter_settings({**ENV, "RECEIPT_API_URL": f"http://127.0.0.1:{server.server_address[1]}/api/receipt/accept"})
+            reply = ReceiptAdapter(settings, Logger("receipt-adapter", self.log)).handle(RAW)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(reply.status, 503)
+        self.assertEqual(reply.body, DEPENDENCY_UNAVAILABLE)
 
     def test_logs_contain_no_message_body_or_secrets(self):
         adapter = self.adapter(RecordingTransport())

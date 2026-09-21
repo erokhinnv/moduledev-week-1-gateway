@@ -10,8 +10,9 @@ import sys
 from typing import Callable, Sequence
 
 from .config import ConfigError
-from .logs import Logger
+from .logs import Logger, describe_failure
 
+EXIT_FAILURE = 1
 EXIT_CONFIG = 2
 EXIT_USAGE = 64
 
@@ -54,6 +55,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as error:
         Logger(args[0]).error("configuration.invalid", reason=str(error))
         return EXIT_CONFIG
+    except Exception as error:  # noqa: BLE001 - a crash is reported as a structured record
+        # A default traceback is not a structured, redaction-safe log line; the class is enough to
+        # diagnose (a busy port, an unreachable resolver), and the container restarts the process.
+        Logger(args[0]).error("process.failed", **describe_failure(error))
+        return EXIT_FAILURE
 
 
 if __name__ == "__main__":

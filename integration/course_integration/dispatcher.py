@@ -62,7 +62,10 @@ class Dispatcher:
         else:
             report = boundary.fail(message, self.settings.owner, result.error_code or "")
 
-        self.logger.info(
+        # A refused report (stale lease, rejected code) is not routine: the delivery stays leased
+        # until the lease expires, so it must stand out in the log.
+        log = self.logger.info if report.get("status") == "ok" else self.logger.warning
+        log(
             "outbox.attempt",
             outboxId=message.outbox_id,
             externalRequestId=message.external_request_id,

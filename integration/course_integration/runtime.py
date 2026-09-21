@@ -6,7 +6,6 @@ import json
 import signal
 import sys
 import threading
-import time
 from typing import Callable
 
 from .logs import Logger
@@ -60,7 +59,9 @@ class Backoff:
 def reach_failpoint(name: str, instance_id: str, stop: StopSignal) -> None:
     """Deterministic acknowledgement barrier of the closed test profile.
 
-    Prints exactly one JSON line and blocks until the container is stopped.
+    Prints exactly one JSON line and blocks until the container is stopped. A stop request never
+    returns control to the caller: the process exits right at the barrier, so the boundary after
+    the failpoint (an HTTP attempt, a delivery report) is never crossed by a stopped component.
     """
     sys.stdout.write(
         json.dumps(
@@ -72,6 +73,8 @@ def reach_failpoint(name: str, instance_id: str, stop: StopSignal) -> None:
     sys.stdout.flush()
     while not stop.wait(3600):
         pass
+    # SystemExit is not an Exception: run_loop does not swallow it and the process ends here.
+    raise SystemExit(0)
 
 
 def run_loop(
@@ -97,7 +100,3 @@ def run_loop(
             break
     logger.info("loop.stopped")
     return 0
-
-
-def monotonic_ms() -> int:
-    return int(time.monotonic() * 1000)

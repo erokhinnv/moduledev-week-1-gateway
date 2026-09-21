@@ -204,6 +204,17 @@ BEGIN
 
     v_process_id := (v_started -> 'result' ->> 'processId')::uuid;
 
+    -- start_process идемпотентен по business key и вернёт уже существующий процесс, если его
+    -- запустили в обход submit (trusted-командой flow start). Привязать к нему операцию нельзя:
+    -- такой процесс мог уже пройти или провалить шаги, не видя операцию в PROCESSING. Процесс,
+    -- созданный этой транзакцией, имеет created_at = now() (время начала транзакции).
+    IF NOT EXISTS (
+        SELECT 1 FROM workflow.process_instance p
+        WHERE p.process_id = v_process_id AND p.created_at = now()
+    ) THEN
+        RETURN api.action_fail('payment.process_conflict', 'a process for this operation was started outside payment.submit');
+    END IF;
+
     UPDATE payment.operation
     SET status = 'PROCESSING', process_id = v_process_id
     WHERE operation_id = v_operation.operation_id;
@@ -561,6 +572,7 @@ DECLARE
     v_rule      payment.limit_rule%ROWTYPE;
     v_step_id   uuid;
     v_decision  workflow.decision%ROWTYPE;
+    v_inserted  integer;
 BEGIN
     v_operation := payment.bound_operation(p_context, p_payload);
     IF v_operation.operation_id IS NULL THEN
@@ -604,11 +616,16 @@ BEGIN
     VALUES (v_operation.process_id, v_step_id, 'LIMIT_RULE', p_context ->> 'principal', 'APPROVED', v_rule.rule_version)
     ON CONFLICT (step_instance_id) DO NOTHING;
 
+    GET DIAGNOSTICS v_inserted = ROW_COUNT;
+
     SELECT * INTO v_decision FROM workflow.decision WHERE step_instance_id = v_step_id;
 
-    PERFORM workflow.record_event(
-        v_operation.process_id, v_step_id, 'DecisionRecorded',
-        jsonb_build_object('decisionId', v_decision.decision_id, 'source', v_decision.source, 'outcome', v_decision.outcome));
+    -- Уже записанное решение шага не дублирует событие истории: одно решение — одна запись.
+    IF v_inserted > 0 THEN
+        PERFORM workflow.record_event(
+            v_operation.process_id, v_step_id, 'DecisionRecorded',
+            jsonb_build_object('decisionId', v_decision.decision_id, 'source', v_decision.source, 'outcome', v_decision.outcome));
+    END IF;
 
     RETURN api.action_ok(p_context, 'WITHIN_LIMIT', jsonb_build_object(
         'operationId', v_operation.operation_id,
@@ -955,6 +972,16 @@ BEGIN
         RETURN api.action_fail('receipt.external_request_not_found', 'externalRequestId is not known');
     END IF;
 
+    -- Порядок блокировок: external_request -> operation -> process. Шаги процесса берут операцию
+    -- FOR UPDATE, а затем finish_job — процесс. Вставки ниже неявно берут FOR KEY SHARE на строки
+    -- процесса (inbox, receipt) и операции (receipt, operation_event); без явной блокировки
+    -- операции первой квитанция держала бы процесс и ждала операцию, а шаг — наоборот, и
+    -- PostgreSQL прервал бы одну из транзакций как deadlock.
+    PERFORM 1
+    FROM payment.operation o
+    WHERE o.operation_id = v_request.operation_id
+    FOR UPDATE;
+
     INSERT INTO delivery.inbox (message_id, body_hash, process_id, signal_type, state)
     VALUES (v_message_id, v_body_hash, v_request.process_id, 'payment.receipt', 'RECEIVED')
     ON CONFLICT (message_id) DO NOTHING;
@@ -1174,12 +1201,15 @@ BEGIN
             CONTINUE;
         END IF;
 
+        -- Перехват истёкшей аренды оставляет след: предыдущая попытка могла дойти до provider, и
+        -- без кода в проекции её нельзя было бы отличить от доставки, у которой отказов не было.
         UPDATE delivery.outbox o
         SET state = 'LEASED',
             lease_owner = p_owner,
             lease_version = o.lease_version + 1,
             lease_until = clock_timestamp() + make_interval(secs => v_policy.lease_ms / 1000.0),
-            attempt_count = o.attempt_count + 1
+            attempt_count = o.attempt_count + 1,
+            last_error_code = CASE WHEN v_row.state = 'LEASED' THEN 'lease.expired.retryable' ELSE o.last_error_code END
         WHERE o.outbox_id = v_id
         RETURNING o.* INTO v_row;
 

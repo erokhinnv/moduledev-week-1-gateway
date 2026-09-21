@@ -33,6 +33,8 @@ from .runtime import StopSignal
 CALLBACK_PREFIX = "/callbacks/provider-v02/"
 MAX_CALLBACK_BYTES = 64 * 1024
 MAX_API_RESPONSE_BYTES = 1024 * 1024
+# Upper bound of a rejected request body that is still read and discarded before answering.
+MAX_DISCARDED_BYTES = 1024 * 1024
 DEPENDENCY_UNAVAILABLE = json.dumps(
     {"status": "error", "code": "dependency.unavailable"}, separators=(",", ":")
 ).encode("utf-8")
@@ -80,6 +82,10 @@ def sign_callback(raw: bytes, settings: AdapterSettings) -> SignedReceipt:
 Transport = Callable[[str, bytes, dict[str, str], float], Reply]
 
 
+class ResponseTooLarge(http.client.HTTPException):
+    """The API answered with more than the adapter relays; treated as an unusable dependency."""
+
+
 def http_transport(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> Reply:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme == "https":
@@ -93,7 +99,10 @@ def http_transport(url: str, body: bytes, headers: dict[str, str], timeout_s: fl
     try:
         connection.request("POST", parsed.path or "/", body=body, headers=headers)
         response = connection.getresponse()
-        data = response.read(MAX_API_RESPONSE_BYTES)
+        data = response.read(MAX_API_RESPONSE_BYTES + 1)
+        if len(data) > MAX_API_RESPONSE_BYTES:
+            # A truncated envelope must not reach the provider under the original status.
+            raise ResponseTooLarge("generic API response exceeds the adapter limit")
         return Reply(response.status, data, response.getheader("Content-Type"))
     finally:
         connection.close()
@@ -150,6 +159,15 @@ class ReceiptAdapter:
                 **describe_failure(error),
             )
             return Reply(503, DEPENDENCY_UNAVAILABLE, "application/json")
+        except Exception as error:  # noqa: BLE001 - the provider must get an answer, not a reset
+            # Nothing was confirmed: an empty 500 lets the provider retry by its own policy.
+            self.logger.error(
+                "callback.failed",
+                messageId=signed.message_id,
+                externalRequestId=signed.external_request_id,
+                **describe_failure(error),
+            )
+            return Reply(500)
 
         self.logger.info(
             "callback.forwarded",
@@ -183,23 +201,39 @@ def _handler_class(adapter: ReceiptAdapter) -> type[BaseHTTPRequestHandler]:
             if reply.body and self.command != "HEAD":
                 self.wfile.write(reply.body)
 
-        def _not_found(self) -> None:
-            # The body of an unmatched request is never read: close instead of draining it.
+        def _reject(self, status: int) -> None:
+            # Closing a socket with unread request bytes makes the TCP stack answer with RST, which
+            # can destroy the response before the client reads it. A declared body up to a bounded
+            # size is therefore read and discarded first; anything larger or unframed is not.
+            values = self.headers.get_all("Content-Length") or []
+            if not self.headers.get_all("Transfer-Encoding") and len(values) == 1:
+                declared = values[0].strip()
+                if declared.isdigit() and int(declared) <= MAX_DISCARDED_BYTES:
+                    remaining = int(declared)
+                    try:
+                        while remaining > 0:
+                            chunk = self.rfile.read(min(remaining, 65536))
+                            if not chunk:
+                                break
+                            remaining -= len(chunk)
+                    except OSError:
+                        pass
             self.close_connection = True
-            self._send(Reply(404))
+            self._send(Reply(status))
+
+        def _not_found(self) -> None:
+            self._reject(404)
 
         def do_POST(self) -> None:  # noqa: N802
             if not adapter.route_matches("POST", self.path):
                 self._not_found()
                 return
             if self.headers.get_all("Transfer-Encoding"):
-                self.close_connection = True
-                self._send(Reply(400))
+                self._reject(400)
                 return
             length = adapter.content_length(self.headers.get_all("Content-Length") or [])
             if length is None:
-                self.close_connection = True
-                self._send(Reply(400))
+                self._reject(400)
                 return
             raw = self.rfile.read(length)
             if len(raw) != length:
