@@ -32,6 +32,21 @@ public sealed class GatewayOptions
 
     public TimeSpan ProbeTimeout { get; init; } = TimeSpan.FromMilliseconds(1500);
 
+    /// <summary>
+    /// Верхняя граница ответа, который шлюз соглашается переслать клиенту.
+    ///
+    /// Устроена так же, как бюджет ожидания: она обязана быть ЗАВЕДОМО БОЛЬШЕ того, что api имеет
+    /// право отдать, — иначе шлюз резал бы законные ответы. Самый большой законный ответ — конверт
+    /// действия с результатом до COURSE_MAX_RESULT_BYTES (512 КБ); четырёхкратный запас покрывает
+    /// конверт и документ OpenAPI с большим каталогом.
+    ///
+    /// Своя граница у шлюза нужна потому, что ограничение api — это обещание api, а не гарантия:
+    /// единственная публичная точка входа не должна переливать неограниченный объём только потому,
+    /// что внутренний сервис ошибся или был скомпрометирован. Тело запроса шлюз ограничивает давно;
+    /// до этой правки ответ не ограничивался ничем.
+    /// </summary>
+    public long MaxResponseBytes { get; init; } = 2 * 1024 * 1024;
+
     public static GatewayOptions FromEnvironment()
     {
         var upstream = Env.Optional("COURSE_API_BASE_URL", "http://api:8080");
@@ -50,11 +65,23 @@ public sealed class GatewayOptions
                 "COURSE_API_BASE_URL must use the Compose service name of the internal api, not a loopback address");
         }
 
+        // Граница проверяется ПРИ СТАРТЕ, как и адрес api выше. Ноль или отрицательное значение не
+        // ломает запуск, но делает шлюз бесполезным: он отверг бы каждый непустой ответ или падал бы
+        // на каждом запросе. Ошибка конфигурации обязана быть громкой и ранней, а не размазанной по
+        // трафику.
+        var maxResponseBytes = Env.OptionalInt("COURSE_GATEWAY_MAX_RESPONSE_BYTES", 2 * 1024 * 1024);
+        if (maxResponseBytes <= 0)
+        {
+            throw new InvalidOperationException(
+                "COURSE_GATEWAY_MAX_RESPONSE_BYTES must be a positive number of bytes");
+        }
+
         return new GatewayOptions
         {
             UpstreamBaseAddress = uri,
             ListenPort = Env.OptionalInt("COURSE_GATEWAY_PORT", 8080),
             UpstreamTimeout = TimeSpan.FromSeconds(Env.OptionalInt("COURSE_GATEWAY_UPSTREAM_TIMEOUT", 35)),
+            MaxResponseBytes = maxResponseBytes,
         };
     }
 }

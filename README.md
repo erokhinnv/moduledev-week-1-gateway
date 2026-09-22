@@ -148,6 +148,7 @@ docker compose down -v
 | `COURSE_BOOTSTRAP_MIGRATIONS` / `_ACTIONS` / `_FLOWS` | `cli` | `/app/db/...` | Источники стартовой инициализации |
 | `COURSE_GATEWAY_UPSTREAM_TIMEOUT` | `gateway` | `35` секунд | Бюджет ожидания `api`; заведомо больше контрактного потолка `timeout_ms` (30 с) |
 | `COURSE_MAX_RESULT_BYTES` | `api`, `worker-*` | `524288` | Верхняя граница конверта действия до его разбора |
+| `COURSE_GATEWAY_MAX_RESPONSE_BYTES` | `gateway` | `2097152` | Верхняя граница ответа, который шлюз пересылает клиенту; заведомо больше `COURSE_MAX_RESULT_BYTES`. Превышение даёт контрактный `action.contract_violation`, а если часть тела уже ушла — обрыв соединения, но никогда не молча усечённый ответ |
 | `COURSE_DISPATCH_QUEUE_CAPACITY` | `api` | `2048` | Глубина очереди технических следов вызовов |
 
 Роли PostgreSQL создаются один раз при инициализации кластера

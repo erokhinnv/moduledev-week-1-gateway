@@ -58,7 +58,13 @@ internal static class CourseCli
             // через тот же самый механизм, что используется в HTTP runtime (PostgresFailure),
             // чтобы CLI и API согласованно понимали одни и те же сбои.
             var code = PostgresFailure.Classify(exception);
-            Console.Error.WriteLine($"{exception.GetType().Name}: {exception.Message}");
+
+            // В stderr уходит ТА ЖЕ безопасная классификация, что и наружу. Печатать
+            // exception.Message нельзя: у PostgresException сообщение при нарушении ограничения
+            // содержит значения данных и идентификатор вызывающего, и они оседают в сборщике
+            // логов, даже когда сам ответ команды выглядит безобидно. Тип и SQLSTATE отвечают на
+            // вопрос «что за сбой», не отвечая на вопрос «с какими данными».
+            Console.Error.WriteLine($"command failed code={code} failure={Redaction.Describe(exception)}");
             Write(stdout, Envelope.CliError(
                 code,
                 code == ContractCodes.DependencyUnavailable
