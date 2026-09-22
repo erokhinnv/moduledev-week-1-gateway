@@ -86,6 +86,71 @@ public sealed class CatalogIntegrationTests(ProbeFixture fixture)
         Assert.Equal("0", membership.Output.Trim());
     }
 
+    /// <summary>
+    /// Семантика повтора закреплена за маршрутом. Раньше версия с другим idempotency_scope
+    /// публиковалась, и после activate тот же Idempotency-Key с тем же телом исполнял
+    /// зарегистрированную функцию второй раз: запись идемпотентности уникальна по scope ТЕКУЩЕЙ
+    /// версии. Проверяются обе половины границы — отказ публикации и отказ вставки в обход неё.
+    /// </summary>
+    [SkippableFact]
+    public void IdempotencySemanticsOfARouteCannotChangeBetweenVersions()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+        fixture.EnsurePublished();
+
+        const string versionThree =
+            "SELECT count(*) FROM api.action_version WHERE module = 'itest' AND action = 'probe' AND version = 3;";
+
+        // Версия 3 отличается от версии 2 только scope — и именно поэтому отклоняется.
+        var (exitCode, envelope) = IntegrationEnvironment.Cli(
+            IntegrationEnvironment.FixturesDirectory,
+            "action", "publish", "/itest/manifests/itest-probe-v3-scope-drift.action.json");
+
+        Assert.NotEqual(0, exitCode);
+        Assert.Equal("manifest.conflict", envelope?["code"]?.GetValue<string>());
+        Assert.Contains("scope principal_action", envelope?["message"]?.GetValue<string>() ?? string.Empty);
+        Assert.Equal("0", IntegrationEnvironment.Psql(versionThree).Output.Trim());
+
+        // Вставка мимо функции публикации. Контроль идёт первым: версия с ТОЙ ЖЕ семантикой
+        // обязана пройти триггер — иначе отказ ниже доказывал бы лишь, что триггер не пускает
+        // ничего. Её откатывает исключение-маркер. Любой исход, кроме «контроль прошёл, дрейф
+        // отклонён именно restrict_violation», завершает psql ненулевым кодом.
+        var bypass = IntegrationEnvironment.Psql(
+            """
+            DO $$
+            BEGIN
+                BEGIN
+                    INSERT INTO api.action_version (module, action, version, http_method, target_schema,
+                        target_function, request_schema, response_schema, outcomes, required_policy,
+                        idempotency_mode, idempotency_scope, timeout_ms, manifest, manifest_hash)
+                    SELECT module, action, 3, http_method, target_schema, target_function, request_schema,
+                        response_schema, outcomes, required_policy, idempotency_mode, idempotency_scope,
+                        timeout_ms, manifest, manifest_hash
+                    FROM api.action_version WHERE module = 'itest' AND action = 'probe' AND version = 1;
+                    RAISE EXCEPTION 'itest-control-passed';
+                EXCEPTION WHEN raise_exception THEN
+                    IF SQLERRM <> 'itest-control-passed' THEN RAISE; END IF;
+                END;
+
+                BEGIN
+                    INSERT INTO api.action_version (module, action, version, http_method, target_schema,
+                        target_function, request_schema, response_schema, outcomes, required_policy,
+                        idempotency_mode, idempotency_scope, timeout_ms, manifest, manifest_hash)
+                    SELECT module, action, 3, http_method, target_schema, target_function, request_schema,
+                        response_schema, outcomes, required_policy, idempotency_mode, 'consumer_action',
+                        timeout_ms, manifest, manifest_hash
+                    FROM api.action_version WHERE module = 'itest' AND action = 'probe' AND version = 1;
+                    RAISE EXCEPTION 'scope drift was inserted past the trigger';
+                EXCEPTION WHEN restrict_violation THEN
+                    NULL;
+                END;
+            END $$;
+            """.ReplaceLineEndings(" "));
+
+        Assert.True(bypass.ExitCode == 0, "вставка в обход публикации нарушила закрепление семантики");
+        Assert.Equal("0", IntegrationEnvironment.Psql(versionThree).Output.Trim());
+    }
+
     [SkippableFact]
     public void RuntimeRoleCannotPublishActions()
     {

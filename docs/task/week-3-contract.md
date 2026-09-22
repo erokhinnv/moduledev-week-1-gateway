@@ -96,7 +96,7 @@ Python-сервисы и provider не публикуют host-порты. Bind 
 | `OUTBOX_OWNER` | `outbox-dispatcher` | Стабильный owner `outbox-dispatcher` |
 | `COURSE_TEST_PROFILE` | Все проверяемые процессы | Короткие интервалы публичной/скрытой проверки |
 
-Полная таблица, включая PostgreSQL credentials, опубликована в конфигурационном контракте задания. Synthetic JWT/HMAC/capability values передаются только через environment проверочного запуска и не имеют default в tracked Compose. Документированные local-only placeholders разрешены только для паролей PostgreSQL; checker всегда заменяет их. Реальные secrets не попадают в repository, image layers, stdout, structured logs, trace и report.
+Полная таблица, включая PostgreSQL credentials, опубликована в [конфигурационном контракте](week-3-configuration.md). Synthetic JWT/HMAC/capability values передаются только через environment проверочного запуска и не имеют default в tracked Compose. Документированные local-only placeholders разрешены только для паролей PostgreSQL; checker всегда заменяет их. Реальные secrets не попадают в repository, image layers, stdout, structured logs, trace и report.
 
 ## Python `outbox-dispatcher`
 
@@ -454,6 +454,11 @@ Hidden checker использует другие identifiers, суммы и inte
 Скрытая проверка проверяет опубликованные инварианты, а не имена Python modules, framework или ORM.
 
 ## Оценка недели
+
+Помимо канонического вклада недели действует [внутренняя калибровка готовности сдачи](https://github.com/fintech-dev-lab/moduledev-week-3-python-perimeter-task/blob/23419a529fa77b28e8325689004ce41baf277169/docs/review-calibration-weeks-3-4.md).
+Первый запуск, полнота README и воспроизводимая команда проверки оцениваются отдельно;
+успешный диагностический повтор не отменяет первоначальную ошибку запуска.
+Работа с предыдущими замечаниями подтверждается отчётом и его доставкой до следующей сдачи.
 
 Неделя добавляет 25 баллов:
 

@@ -1,0 +1,33 @@
+{
+  "contract_version": "course-1",
+  "module": "itest",
+  "action": "probe",
+  "version": 3,
+  "http_method": "POST",
+  "target_schema": "itest",
+  "target_function": "probe_v2",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["marker"],
+    "properties": {"marker": {"type": "string", "minLength": 1, "maxLength": 128}}
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["revision", "marker"],
+    "properties": {
+      "revision": {"const": 2},
+      "marker": {"type": "string"}
+    }
+  },
+  "outcomes": ["APPLIED"],
+  "required_policy": ["workflow:execute"],
+  "idempotency_mode": "required",
+  "idempotency_scope": "consumer_action",
+  "timeout_ms": 5000,
+  "enabled": true,
+  "is_default": false
+}

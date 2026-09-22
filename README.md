@@ -13,9 +13,11 @@ durable Outbox к выданному provider v0.2.0, anti-corruption layer дл
 Исходные тексты заданий — [TASK.md](TASK.md) (неделя 1),
 [docs/task/week-2-assignment.md](docs/task/week-2-assignment.md) (неделя 2) и
 [docs/task/week-3-assignment.md](docs/task/week-3-assignment.md) (неделя 3, полный контракт —
-[week-3-contract.md](docs/task/week-3-contract.md) и
-[week-3-external-contracts.md](docs/task/week-3-external-contracts.md)). Машинные схемы
-контракта — в [`contracts/course-1`](contracts/course-1).
+[week-3-contract.md](docs/task/week-3-contract.md),
+[week-3-external-contracts.md](docs/task/week-3-external-contracts.md) и
+[week-3-configuration.md](docs/task/week-3-configuration.md); редакция `week-3.1`, сняты с пакета
+задания на commit `23419a5`, изменены только относительные ссылки). Машинные схемы контракта — в
+[`contracts/course-1`](contracts/course-1).
 
 Главное свойство решения не изменилось и распространилось на процессы и периметр: **новое действие
 и новая карта процесса добавляются миграцией, манифестом и картой — и исполняются через общие
@@ -66,6 +68,10 @@ inbox-reconciler  → PostgreSQL (delivery.reconcile_inbox)
 - Идемпотентность, «ровно одна default-версия действия», «ровно одна активная версия карты» и
   «один процесс на business key» держатся уникальными индексами PostgreSQL, а не блокировками
   внутри процессов C#.
+- Что считается повтором, решает маршрут, а не версия: `idempotency_mode` и `idempotency_scope`
+  задаёт первая опубликованная версия действия, и каждая следующая обязана их повторить
+  (`manifest.conflict` при публикации, триггер на вставку в обход неё). Иначе тот же
+  `Idempotency-Key` после activate версии с другим scope исполнил бы действие второй раз.
 
 Схема контейнеров и поток одного вызова: [C4 Container diagram](docs/c4-container.md).
 
@@ -87,13 +93,13 @@ inbox-reconciler  → PostgreSQL (delivery.reconcile_inbox)
 | Таблицы периметра и их инварианты | [`db/migrations/017_perimeter_core.sql`](db/migrations/017_perimeter_core.sql) |
 | Платёжные действия, `receipt.accept`, `workflow.manual`, `delivery.*` | [`db/migrations/018_perimeter_actions.sql`](db/migrations/018_perimeter_actions.sql) |
 | Проекции периметра и права Python-ролей | [`db/migrations/019_perimeter_autocheck.sql`](db/migrations/019_perimeter_autocheck.sql) |
-| Идентичность тела идемпотентной HTTP-команды | [`db/migrations/020_invoke_body_identity.sql`](db/migrations/020_invoke_body_identity.sql) |
+| Семантика идемпотентности, закреплённая за маршрутом | [`db/migrations/021_idempotency_semantics.sql`](db/migrations/021_idempotency_semantics.sql) |
 | Python-периметр | [`integration/course_integration`](integration/course_integration) |
 | Карты платёжных процессов | [`db/flows/payment-processing-v1.flow.yaml`](db/flows/payment-processing-v1.flow.yaml), [`db/flows/payment-review-v1.flow.yaml`](db/flows/payment-review-v1.flow.yaml) |
 | Общий разбор границы `api.invoke` | [`src/Course.Shared/RegisteredAction.cs`](src/Course.Shared/RegisteredAction.cs) |
 | Сменный исполнитель процессов | [`src/Course.Workflow.Worker/WorkflowWorker.cs`](src/Course.Workflow.Worker/WorkflowWorker.cs) |
 | Семантический валидатор карт | [`src/Course.Shared/WorkflowMapValidator.cs`](src/Course.Shared/WorkflowMapValidator.cs) |
-| Единственная точка предметного вызова | [`db/migrations/009_invoke_replay_version.sql`](db/migrations/009_invoke_replay_version.sql) |
+| Единственная точка предметного вызова — действующее определение `api.invoke` (идентичность повтора по точным байтам тела; замещает 009 и 004) | [`db/migrations/020_invoke_body_identity.sql`](db/migrations/020_invoke_body_identity.sql) |
 | Определения и состояние процессов | [`db/migrations/011_workflow_core.sql`](db/migrations/011_workflow_core.sql) |
 | Продвижение процесса и сигналы | [`db/migrations/012_workflow_engine.sql`](db/migrations/012_workflow_engine.sql) |
 | Аренда, fencing и завершение попыток | [`db/migrations/013_workflow_lease.sql`](db/migrations/013_workflow_lease.sql) |
@@ -620,12 +626,17 @@ docker compose run --rm -T --no-deps cli flow test-finish <job-id> --owner worke
 Собственные unit-тесты закрывают границы, которые проверяются без Docker: форма claims JWT, JSON
 Schema с обязательной проверкой `format`, матрица кодов ошибок, построение OpenAPI, указатели
 RFC 6901, согласование срока аренды с бюджетом границы завершения (включая разбор `leaseUntil` в
-том виде, в каком его отдаёт PostgreSQL) и — на опубликованных fixtures проверки — приём валидных
-карт и отклонение каждой заведомо испорченной.
+том виде, в каком его отдаёт PostgreSQL), на опубликованных fixtures проверки — приём валидных
+карт и отклонение каждой заведомо испорченной, копирование с жёсткой границей, которым шлюз
+пересылает ответ, и бит исполнения скриптов, которые README предлагает запускать напрямую.
 
 ```bash
 dotnet test src/Course.sln
 ```
+
+Бит исполнения читается из индекса Git (`git ls-files --stage`), потому что на Windows файловая
+система его не хранит; поэтому unit-набору нужен git-checkout и `git` в `PATH` — в распакованном
+архиве без `.git` четыре случая этой проверки (по одному на скрипт) падают.
 
 Неделя 3 добавляет unit-тесты generic-границы подписи (точные байты, сырой UTF-8 ключ, строгий
 формат `v1`, коды `401/403/409`), request schema `receipt.accept` (любая точность `occurredAt`,
@@ -660,12 +671,23 @@ receipts, decisions, flow binding и жизненного цикла опера�
 
 Интеграционные тесты закрывают то, что без живого контура доказать нельзя: гонку версий между
 валидацией и исполнением, повтор по ключу идемпотентности через смену версии по умолчанию,
-конкурентные команды каталога и границы прав ролей, а для недели 2 — неизменяемость опубликованной
+отказ публикации версии с другой семантикой идемпотентности (и вставки её в обход публикации),
+конкурентные команды каталога и границы прав ролей, границу ответа шлюза на настоящем ответе api
+(контрактный отказ вместо усечённого тела), а для недели 2 — неизменяемость опубликованной
 версии карты, append-only историю, неизменяемость личности состояния (ключ идемпотентности,
 закрепление за версией, тело принятого сигнала), отклонение испорченной карты самим хранилищем в
 обход клиента, границы роли `workflow_worker`, конкурентные `flow activate` и `flow start`, полный
 проход `workflow-smoke` через сигнал с ровно одним предметным эффектом и честный отчёт об отказе
 границы завершения, не связанном с потерей аренды.
+
+Аварийные границы недели 2 закреплены собственными регрессиями на настоящих `claim_jobs` и
+`finish_job`, а не только проверкой курса: перехват истёкшей аренды вторым арендатором и отказ
+`workflow.lease_stale` опоздавшему `finish` без сдвига задания и процесса; гибель настоящего
+worker на failpoint `after_action_before_finish` — ни одного эффекта до восстановления, затем ровно
+один эффект при тех же `jobId`/`executionId`, новой попытке и истории `STALE,SUCCEEDED`; повтор
+сигнала с тем же телом — дубликат, с другим — `workflow.signal_conflict` без перезаписи
+сохранённого; и отсутствие исходного текста ошибки PostgreSQL (маркер в имени роли) в stdout и
+stderr CLI. На время первых двух штатные worker'ы останавливаются.
 
 ```bash
 ./scripts/integration-tests.sh
