@@ -42,6 +42,7 @@ builder.Services.AddSingleton<DispatchRecorder>();
 builder.Services.AddSingleton<DispatchQueue>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<DispatchQueue>());
 builder.Services.AddSingleton<ReadinessProbe>();
+builder.Services.AddSingleton(_ => SignatureBoundary.FromEnvironment());
 builder.Services.AddSingleton<ActionRuntime>();
 
 var app = builder.Build();
@@ -96,7 +97,10 @@ app.Map("/api/{**path}", async (HttpContext context, ActionRuntime runtime) =>
         context.Request.Headers.Authorization.ToString(),
         Header(context, "X-Action-Version"),
         Header(context, "Idempotency-Key"),
-        body);
+        body,
+        context.Request.Headers.TryGetValue(SignatureBoundary.HeaderName, out var signatures)
+            ? signatures.Where(value => value is not null).Select(value => value!).ToArray()
+            : []);
 
     var response = await runtime.ExecuteAsync(request, context.RequestAborted);
     await WriteAsync(context, response.Status, response.Body);

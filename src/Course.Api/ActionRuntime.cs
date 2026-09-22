@@ -13,7 +13,8 @@ public sealed record ActionRequest(
     string? AuthorizationHeader,
     string? VersionHeader,
     string? IdempotencyKey,
-    byte[] Body);
+    byte[] Body,
+    IReadOnlyList<string>? SignatureHeaders = null);
 
 /// <summary>Готовый HTTP-ответ: статус-код и тело в виде JSON-конверта.</summary>
 public sealed record ActionResponse(int Status, JsonObject Body);
@@ -34,6 +35,7 @@ public sealed class ActionRuntime(
     DispatchQueue dispatchQueue,
     DependencyState dependencyState,
     NpgsqlDataSource dataSource,
+    SignatureBoundary signatureBoundary,
     ILogger<ActionRuntime> logger)
 {
     private const int MaxIdempotencyKeyLength = 128;
@@ -74,6 +76,20 @@ public sealed class ActionRuntime(
                 ContractCodes.AuthInvalid,
                 reason);
             return Failure(ContractCodes.AuthInvalid, "request is not authenticated", correlationId, null);
+        }
+
+        // Шаг 1а. Общая граница подписанных запросов. Подпись проверяется над точными байтами тела
+        // до разбора JSON и до разрешения действия: неверная подпись не доходит ни до каталога, ни
+        // до целевой функции. Отсутствие подписи не является ошибкой на этой границе — какое
+        // действие без неё не работает, решает само действие по доверенному маркеру.
+        var signature = signatureBoundary.Verify(request.SignatureHeaders ?? [], request.Body);
+        if (signature == SignatureVerdict.Invalid)
+        {
+            logger.LogInformation(
+                "action rejected correlationId={CorrelationId} code={Code}",
+                correlationId,
+                ContractCodes.SignatureInvalid);
+            return Failure(ContractCodes.SignatureInvalid, "request signature is invalid", correlationId, null);
         }
 
         // Шаг 2. Форма маршрута. После префикса /api в пути обязано быть ровно два сегмента:
@@ -156,6 +172,8 @@ public sealed class ActionRuntime(
                     identity,
                     idempotencyKey,
                     payloadDocument.RootElement,
+                    payloadHash,
+                    signature == SignatureVerdict.Verified,
                     correlationId,
                     evidence,
                     started,
@@ -191,7 +209,7 @@ public sealed class ActionRuntime(
                 // недоступность базы, "запоминаем" это на короткое время через DependencyState —
                 // чтобы следующие запросы не ждали повторного долгого таймаута соединения.
                 var code = PostgresFailure.Classify(exception);
-                if (code == ContractCodes.DependencyUnavailable)
+                if (PostgresFailure.IsDependencyOutage(exception))
                 {
                     dependencyState.MarkUnavailable();
                 }
@@ -227,6 +245,8 @@ public sealed class ActionRuntime(
         TrustedIdentity identity,
         string? idempotencyKey,
         JsonElement payload,
+        string payloadHash,
+        bool signatureVerified,
         Guid correlationId,
         DispatchEvidence evidence,
         long startedAt,
@@ -328,7 +348,17 @@ public sealed class ActionRuntime(
             ["correlationId"] = correlationId.ToString(),
             ["requestId"] = requestId,
             ["deadline"] = deadline.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"),
+            // Отпечаток точных байт тела. Функции, которым нужна идентичность сообщения «как
+            // пришло» (Inbox), берут его отсюда: jsonb-представление payload байты не сохраняет.
+            ["payloadHash"] = payloadHash,
         };
+
+        // Только два доверенных маркера и только после успешной проверки HMAC. Ни секрет, ни
+        // сама подпись в контекст не попадают.
+        if (signatureVerified)
+        {
+            context["transport"] = SignatureBoundary.TransportMarker();
+        }
 
         // Шаг 11. Один и только один вызов к базе на весь предметный эффект: открываем
         // транзакцию, вызываем api.invoke, проверяем контракт результата и только после этого

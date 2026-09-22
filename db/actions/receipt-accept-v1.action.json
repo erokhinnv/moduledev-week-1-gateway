@@ -1,0 +1,113 @@
+{
+  "contract_version": "course-1",
+  "module": "receipt",
+  "action": "accept",
+  "version": 1,
+  "http_method": "POST",
+  "target_schema": "payment",
+  "target_function": "receipt_accept_v1",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "externalRequestId",
+      "messageId",
+      "occurredAt",
+      "outcome",
+      "providerPaymentId",
+      "version"
+    ],
+    "properties": {
+      "externalRequestId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "not": {
+          "pattern": "[\\r\\n]"
+        }
+      },
+      "messageId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "not": {
+          "pattern": "[\\r\\n]"
+        }
+      },
+      "occurredAt": {
+        "type": "string",
+        "format": "date-time",
+        "maxLength": 64,
+        "pattern": "Z$",
+        "not": {
+          "pattern": "[\\r\\n]"
+        }
+      },
+      "outcome": {
+        "enum": [
+          "COMPLETED",
+          "REJECTED"
+        ]
+      },
+      "providerPaymentId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "not": {
+          "pattern": "[\\r\\n]"
+        }
+      },
+      "version": {
+        "const": 1
+      }
+    }
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "messageId",
+      "externalRequestId",
+      "state"
+    ],
+    "properties": {
+      "messageId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "not": {
+          "pattern": "[\\r\\n]"
+        }
+      },
+      "externalRequestId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "not": {
+          "pattern": "[\\r\\n]"
+        }
+      },
+      "state": {
+        "enum": [
+          "RECEIVED",
+          "APPLIED",
+          "CONFLICT"
+        ]
+      }
+    }
+  },
+  "outcomes": [
+    "RECEIVED",
+    "DUPLICATE"
+  ],
+  "required_policy": [
+    "receipt:write"
+  ],
+  "idempotency_mode": "required",
+  "idempotency_scope": "principal_action",
+  "timeout_ms": 5000,
+  "enabled": true,
+  "is_default": true
+}

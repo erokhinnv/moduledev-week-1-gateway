@@ -46,6 +46,14 @@ public static class PostgresFailure
     /// конфликт. Правильная реакция на такой отказ — повторить операцию, а не показать ошибку.
     /// Актуально для команд каталога, которые конкурируют за один и тот же маршрут.
     /// </summary>
+    /// <summary>
+    /// Недоступна ли сама база. Повторяемый конфликт блокировок классифицируется тем же кодом
+    /// dependency.unavailable, но базу недоступной не делает: пометка недоступности заставила бы
+    /// сервис на время отвечать 503 на все запросы из-за одной проигравшей транзакции.
+    /// </summary>
+    public static bool IsDependencyOutage(Exception exception)
+        => Classify(exception) == ContractCodes.DependencyUnavailable && !IsTransientConflict(exception);
+
     public static bool IsTransientConflict(Exception exception)
     {
         for (var current = exception; current is not null; current = current.InnerException)
@@ -80,6 +88,13 @@ public static class PostgresFailure
 
         // Класс ошибок 08 в PostgreSQL — это "connection exception" (проблемы с соединением).
         if (sqlState.StartsWith("08", StringComparison.Ordinal))
+        {
+            return ContractCodes.DependencyUnavailable;
+        }
+
+        // 40001 serialization_failure и 40P01 deadlock_detected: транзакция откатана целиком, и
+        // та же команда безопасно повторяема. Это временный отказ хранилища, а не внутренняя ошибка.
+        if (sqlState is "40001" or "40P01")
         {
             return ContractCodes.DependencyUnavailable;
         }

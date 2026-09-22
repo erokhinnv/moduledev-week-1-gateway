@@ -13,3 +13,10 @@ docs/
 week-1-public-report.json
 **/*.user
 **/*.log
+# Python: кеши байткода, локальные окружения и тесты периметра в образы не попадают.
+**/__pycache__/
+**/*.pyc
+**/.venv/
+integration/tests/
+week-2-public-report.json
+week-3-public-report.json

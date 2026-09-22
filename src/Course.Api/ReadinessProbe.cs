@@ -74,7 +74,7 @@ public sealed class ReadinessProbe(
         catch (Exception exception)
         {
             logger.LogWarning("readiness probe failed reason={Reason}", exception.GetType().Name);
-            if (PostgresFailure.Classify(exception) == ContractCodes.DependencyUnavailable)
+            if (PostgresFailure.IsDependencyOutage(exception))
             {
                 dependencyState.MarkUnavailable();
             }

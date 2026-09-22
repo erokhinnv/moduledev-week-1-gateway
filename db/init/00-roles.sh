@@ -19,6 +19,10 @@
 #                      выдаются EXECUTE ровно на четыре функции-границы (claim_jobs, api.invoke,
 #                      finish_job, fail_job) и НИ ОДНОГО права на таблицы: см. 015_workflow_autocheck.
 #                      Она не член course_owner, поэтому ничего не наследует.
+#   outbox_dispatcher - роль Python-диспетчера Outbox (неделя 3). EXECUTE ровно на три функции
+#                      delivery.claim_outbox / succeed_outbox / fail_outbox, ни одной таблицы.
+#   inbox_reconciler - роль Python-согласователя Inbox (неделя 3). EXECUTE ровно на одну функцию
+#                      delivery.reconcile_inbox. Обе роли не состоят ни в одной другой роли.
 #
 # Почему миграции и публикация разведены. Раньше обе задачи выполняла одна роль course_migrator,
 # а она — член course_owner с атрибутом INHERIT, то есть обладает правами владельца НЕЯВНО, даже
@@ -35,16 +39,20 @@ psql -v ON_ERROR_STOP=1 \
      -v publisher_password="$COURSE_PUBLISHER_PASSWORD" \
      -v runtime_password="$COURSE_RUNTIME_PASSWORD" \
      -v worker_password="$COURSE_WORKER_PASSWORD" \
-     -v operator_password="$COURSE_OPERATOR_PASSWORD" <<'EOSQL'
+     -v operator_password="$COURSE_OPERATOR_PASSWORD" \
+     -v outbox_password="$COURSE_OUTBOX_PASSWORD" \
+     -v inbox_password="$COURSE_INBOX_PASSWORD" <<'EOSQL'
 CREATE ROLE course_owner NOLOGIN;
 CREATE ROLE course_migrator LOGIN PASSWORD :'migrator_password' IN ROLE course_owner;
 CREATE ROLE course_publisher LOGIN PASSWORD :'publisher_password';
 CREATE ROLE course_runtime LOGIN PASSWORD :'runtime_password';
 CREATE ROLE course_operator LOGIN PASSWORD :'operator_password';
 CREATE ROLE workflow_worker LOGIN PASSWORD :'worker_password';
+CREATE ROLE outbox_dispatcher LOGIN PASSWORD :'outbox_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE inbox_reconciler LOGIN PASSWORD :'inbox_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
 REVOKE ALL ON DATABASE :"dbname" FROM PUBLIC;
-GRANT CONNECT ON DATABASE :"dbname" TO course_owner, course_migrator, course_publisher, course_runtime, course_operator, workflow_worker;
+GRANT CONNECT ON DATABASE :"dbname" TO course_owner, course_migrator, course_publisher, course_runtime, course_operator, workflow_worker, outbox_dispatcher, inbox_reconciler;
 GRANT CREATE ON DATABASE :"dbname" TO course_owner;
 
 ALTER SCHEMA public OWNER TO course_owner;

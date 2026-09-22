@@ -1,0 +1,93 @@
+{
+  "contract_version": "course-1",
+  "module": "operation",
+  "action": "events",
+  "version": 1,
+  "http_method": "POST",
+  "target_schema": "payment",
+  "target_function": "operation_events_v1",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "operationId"
+    ],
+    "properties": {
+      "operationId": {
+        "type": "string",
+        "format": "uuid"
+      }
+    }
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "operationId",
+      "status",
+      "processId",
+      "events"
+    ],
+    "properties": {
+      "operationId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "status": {
+        "enum": [
+          "CREATED",
+          "PROCESSING",
+          "COMPLETED",
+          "REJECTED"
+        ]
+      },
+      "processId": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "uuid"
+      },
+      "events": {
+        "type": "array",
+        "maxItems": 200,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "eventId",
+            "eventType",
+            "occurredAt"
+          ],
+          "properties": {
+            "eventId": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "eventType": {
+              "type": "string",
+              "pattern": "^[A-Z][A-Z0-9_]{0,62}$"
+            },
+            "occurredAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        }
+      }
+    }
+  },
+  "outcomes": [
+    "FOUND"
+  ],
+  "required_policy": [
+    "payment:read"
+  ],
+  "idempotency_mode": "none",
+  "idempotency_scope": "none",
+  "timeout_ms": 5000,
+  "enabled": true,
+  "is_default": true
+}

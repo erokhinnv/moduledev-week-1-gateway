@@ -1,0 +1,18 @@
+[project]
+name = "course-integration"
+version = "0.3.0"
+description = "Python integration perimeter: outbox dispatcher, provider receipt adapter, inbox reconciler"
+requires-python = ">=3.12"
+dependencies = ["psycopg[binary]==3.3.5"]
+
+[project.scripts]
+outbox-dispatcher = "course_integration.dispatcher:main"
+receipt-adapter = "course_integration.adapter:main"
+inbox-reconciler = "course_integration.reconciler:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["course_integration"]
