@@ -121,7 +121,141 @@ public static class IntegrationEnvironment
         return (exitCode, envelope);
     }
 
+    /// <summary>
+    /// Запускает cli с подменёнными переменными окружения и возвращает ОБА потока раздельно.
+    ///
+    /// Раздельно — потому что весь смысл проверки в границе между ними: в stdout уходит конверт,
+    /// в stderr диагностика, и утечка возможна именно во втором, когда первый выглядит безупречно.
+    /// </summary>
+    public static (int ExitCode, string Stdout, string Stderr) CliDiagnostics(
+        IReadOnlyDictionary<string, string> environment,
+        params string[] arguments)
+    {
+        var call = new List<string> { "run", "--rm", "-T", "--no-deps" };
+        foreach (var pair in environment)
+        {
+            call.Add("-e");
+            call.Add($"{pair.Key}={pair.Value}");
+        }
+
+        call.Add("cli");
+        call.AddRange(arguments);
+        return ComposeStreams([.. call]);
+    }
+
+    /// <summary>
+    /// Произвольная команда docker compose над контуром тестов: остановка и запуск сервисов.
+    ///
+    /// Нужна там, где проверяется поведение при ОТСУТСТВИИ исполнителя: аварию между действием и
+    /// подтверждением нельзя воспроизвести, пока рядом работают штатные worker'ы — они заберут
+    /// задание первыми, и тест будет доказывать не то, ради чего написан.
+    /// </summary>
+    public static (int ExitCode, string Output) Service(params string[] arguments)
+        => Compose(arguments);
+
+    /// <summary>
+    /// Запускает одноразовый worker с включённым failpoint и возвращает идентификатор контейнера.
+    ///
+    /// Профиль и точка аварии задаются окружением этого экземпляра, а не контура: штатные
+    /// worker'ы остаются обычными, и тест не меняет условия для соседних проверок.
+    /// </summary>
+    public static string StartFailpointWorker(string instanceId, string failpoint)
+    {
+        var (exitCode, output) = Compose(
+            "run", "--detach", "--no-deps",
+            "-e", "COURSE_TEST_PROFILE=1",
+            "-e", $"COURSE_FAILPOINT={failpoint}",
+            "-e", $"COURSE_WORKER_ID={instanceId}",
+            "worker-a");
+
+        var container = output.Trim().Split('\n', StringSplitOptions.RemoveEmptyEntries).LastOrDefault();
+        if (exitCode != 0 || string.IsNullOrWhiteSpace(container))
+        {
+            throw new InvalidOperationException($"failpoint worker could not be started: {output}");
+        }
+
+        return container.Trim();
+    }
+
+    /// <summary>
+    /// Поднимает отдельный шлюз с заданной границей ответа и возвращает контейнер и порт хоста.
+    ///
+    /// Отдельный, а не штатный: граница задаётся окружением при старте, и менять её у общего шлюза
+    /// значило бы менять условия для всех соседних тестов. Порт выбирает Docker — жёстко заданный
+    /// порт рано или поздно столкнулся бы с чужим.
+    /// </summary>
+    public static (string Container, int Port) StartGatewayWithResponseLimit(long limitBytes)
+    {
+        var (exitCode, output) = Compose(
+            "run", "--detach", "--no-deps",
+            "-p", "0:8080",
+            "-e", $"COURSE_GATEWAY_MAX_RESPONSE_BYTES={limitBytes}",
+            "gateway");
+
+        var container = output.Trim().Split('\n', StringSplitOptions.RemoveEmptyEntries).LastOrDefault()?.Trim();
+        if (exitCode != 0 || string.IsNullOrWhiteSpace(container))
+        {
+            throw new InvalidOperationException($"limited gateway could not be started: {output}");
+        }
+
+        // «0.0.0.0:49153» — берётся номер порта после последнего двоеточия.
+        var mapping = Docker("port", container, "8080").Output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .FirstOrDefault(line => line.Contains(':'));
+
+        if (mapping is null || !int.TryParse(mapping[(mapping.LastIndexOf(':') + 1)..], out var port))
+        {
+            KillContainer(container);
+            throw new InvalidOperationException($"limited gateway exposes no host port: {mapping}");
+        }
+
+        return (container, port);
+    }
+
+    /// <summary>Журнал контейнера: по нему видно структурное подтверждение достигнутого failpoint.</summary>
+    public static string ContainerLog(string container) => Docker("logs", container).Output;
+
+    /// <summary>
+    /// Жёсткая остановка контейнера. Именно жёсткая: штатное завершение дало бы worker'у довести
+    /// попытку до конца, а воспроизводится гибель посреди неё.
+    /// </summary>
+    public static void KillContainer(string container)
+    {
+        Docker("kill", container);
+        Docker("rm", "--force", container);
+    }
+
+    private static (int ExitCode, string Output) Docker(params string[] arguments)
+    {
+        var start = new ProcessStartInfo("docker")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        foreach (var argument in arguments)
+        {
+            start.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(start)
+            ?? throw new InvalidOperationException("docker could not be started");
+
+        var output = process.StandardOutput.ReadToEnd();
+        var error = process.StandardError.ReadToEnd();
+        process.WaitForExit(120_000);
+        return (process.ExitCode, output + error);
+    }
+
     private static (int ExitCode, string Output) Compose(params string[] arguments)
+    {
+        var (exitCode, stdout, _) = ComposeStreams(arguments);
+        return (exitCode, stdout);
+    }
+
+    private static (int ExitCode, string Stdout, string Stderr) ComposeStreams(params string[] arguments)
     {
         var start = new ProcessStartInfo("docker")
         {
@@ -141,8 +275,8 @@ public static class IntegrationEnvironment
             ?? throw new InvalidOperationException("docker compose could not be started");
 
         var output = process.StandardOutput.ReadToEnd();
-        process.StandardError.ReadToEnd();
+        var diagnostics = process.StandardError.ReadToEnd();
         process.WaitForExit(120_000);
-        return (process.ExitCode, output);
+        return (process.ExitCode, output, diagnostics);
     }
 }

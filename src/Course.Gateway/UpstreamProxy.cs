@@ -132,6 +132,23 @@ public sealed class UpstreamProxy(
 
         using (upstreamResponse)
         {
+            // Объявленный размер проверяется ДО того, как клиенту ушёл хоть один байт: пока статус
+            // не отправлен, отказ ещё можно выразить обычным контрактным конвертом, а не обрывом.
+            // Нарушение классифицируется как нарушение контракта внутренним api — тем же кодом и
+            // статусом, что и в остальной матрице, как и соседние ветки таймаута и недоступности.
+            if (upstreamResponse.Content.Headers.ContentLength is long declared
+                && declared > options.MaxResponseBytes)
+            {
+                logger.LogWarning(
+                    "upstream response too large gatewayRequestId={GatewayRequestId} path={Path} declared={Declared} limit={Limit}",
+                    gatewayRequestId,
+                    context.Request.Path,
+                    declared,
+                    options.MaxResponseBytes);
+                await WriteResponseTooLargeAsync(context);
+                return;
+            }
+
             context.Response.StatusCode = (int)upstreamResponse.StatusCode;
 
             foreach (var header in upstreamResponse.Headers.Concat(upstreamResponse.Content.Headers))
@@ -151,9 +168,52 @@ public sealed class UpstreamProxy(
                 context.Request.Path,
                 context.Response.StatusCode);
 
-            await upstreamResponse.Content.CopyToAsync(context.Response.Body, context.RequestAborted);
+            // Длина может быть не объявлена (chunked — так api отдаёт и конверты, и документ OpenAPI).
+            // Тогда граница держится во время передачи.
+            await using var body = await upstreamResponse.Content.ReadAsStreamAsync(context.RequestAborted);
+            var complete = await BoundedCopy.CopyAsync(
+                body, context.Response.Body, options.MaxResponseBytes, context.RequestAborted);
+
+            if (!complete)
+            {
+                logger.LogWarning(
+                    "upstream response exceeded the gateway limit mid-stream gatewayRequestId={GatewayRequestId} path={Path} limit={Limit}",
+                    gatewayRequestId,
+                    context.Request.Path,
+                    options.MaxResponseBytes);
+
+                // Пока ни один байт не ушёл клиенту, отказ ещё выразим обычным конвертом — ровно тем
+                // же, что и при объявленной длине. Так бывает всегда, когда предел превышает первый же
+                // фрагмент. Обрыв остаётся только на случай, когда часть тела уже в канале: молча
+                // усечённый ответ выглядел бы для клиента полным, и это хуже честного обрыва.
+                if (!context.Response.HasStarted)
+                {
+                    context.Response.Clear();
+                    await WriteResponseTooLargeAsync(context);
+                }
+                else
+                {
+                    context.Abort();
+                }
+            }
         }
     }
+
+    /// <summary>
+    /// Отказ из-за превышения границы ответа. Один метод на обе ветки — объявленную длину и
+    /// превышение во время передачи: клиент обязан получать один и тот же конверт независимо от
+    /// того, как внутренний api закодировал тело.
+    /// </summary>
+    private static Task WriteResponseTooLargeAsync(HttpContext context)
+        => GatewayResponses.WriteAsync(
+            context,
+            ContractCodes.HttpStatus(ContractCodes.ContractViolation),
+            Envelope.Error(
+                ContractCodes.ContractViolation,
+                "internal api response exceeds the gateway limit",
+                null,
+                null,
+                retryable: false));
 
     /// <summary>Спрашивает /health/ready у внутреннего api и переводит результат в форму, удобную для собственной проверки готовности шлюза.</summary>
     public async Task<UpstreamReadiness> ProbeReadinessAsync(CancellationToken cancellationToken)

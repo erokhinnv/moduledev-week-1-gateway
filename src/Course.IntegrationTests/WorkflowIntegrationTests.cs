@@ -736,6 +736,288 @@ public sealed class WorkflowIntegrationTests
         Assert.Equal("1", LastLine(settings.Output));
     }
 
+    /// <summary>
+    /// Два конкурирующих арендатора и «опоздавшее» завершение.
+    ///
+    /// Это центральный инвариант недели: право завершить задание даёт не факт, что исполнитель
+    /// дошёл до конца, а пара «арендатор + версия аренды». Проверка идёт по РЕАЛЬНЫМ границам
+    /// claim_jobs и finish_job, а не по пробе: побеждает тот, чья версия текущая, и проигравший
+    /// не меняет ни задание, ни процесс, ни предметные данные.
+    ///
+    /// Штатные исполнители на время теста остановлены: иначе задание заберут они, и тест будет
+    /// доказывать не то, ради чего написан.
+    /// </summary>
+    [SkippableFact]
+    public void AStaleLeaseCannotFinishAJobThatAnotherOwnerReclaimed()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        IntegrationEnvironment.Service("stop", "worker-a", "worker-b");
+        try
+        {
+            var processId = StartSmokeProcess($"itest-fencing-{Guid.NewGuid():N}");
+            var jobId = SingleValue($"SELECT job_id FROM autocheck.jobs WHERE process_id = '{processId}'");
+            var executionId = SingleValue($"SELECT execution_id FROM autocheck.jobs WHERE process_id = '{processId}'");
+
+            // Первый арендатор берёт задание с минимальной арендой, поэтому она заведомо истечёт.
+            IntegrationEnvironment.Psql("SELECT workflow.claim_jobs('itest-owner-a', 1, 1);");
+            var staleVersion = SingleValue($"SELECT lease_version FROM autocheck.jobs WHERE job_id = '{jobId}'");
+            Assert.Equal("itest-owner-a", SingleValue($"SELECT lease_owner FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+
+            // Второй арендатор ждёт истечения аренды ОПРОСОМ, а не паузой: производный срок
+            // зависит от профиля и от бюджета задачи, и зашитое здесь число молча разошлось бы с
+            // ними при первой же правке констант.
+            Assert.True(
+                WaitFor(() =>
+                {
+                    IntegrationEnvironment.Psql("SELECT workflow.claim_jobs('itest-owner-b', 1, 60000);");
+                    return SingleValue($"SELECT lease_owner FROM autocheck.jobs WHERE job_id = '{jobId}'")
+                        == "itest-owner-b";
+                }, seconds: 30),
+                "второй арендатор не смог перехватить задание после истечения аренды");
+
+            var freshVersion = SingleValue($"SELECT lease_version FROM autocheck.jobs WHERE job_id = '{jobId}'");
+
+            Assert.True(
+                long.Parse(freshVersion) > long.Parse(staleVersion),
+                $"перезахват обязан увеличить версию аренды: было {staleVersion}, стало {freshVersion}");
+
+            // Опоздавший арендатор предъявляет СВОЮ версию — и получает отказ.
+            var stale = IntegrationEnvironment.Psql(
+                $"SELECT workflow.finish_job('{jobId}', 'itest-owner-a', {staleVersion}, " +
+                "'ROUTE_SIGNAL', '{}'::jsonb) ->> 'code';");
+            Assert.Equal("workflow.lease_stale", LastLine(stale.Output));
+
+            // Отказ не должен был ничего сдвинуть.
+            Assert.Equal("LEASED", SingleValue($"SELECT state FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+            Assert.Equal("itest-owner-b", SingleValue($"SELECT lease_owner FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+            Assert.Equal("RUNNING", SingleValue($"SELECT state FROM autocheck.processes WHERE process_id = '{processId}'"));
+
+            // А текущий арендатор завершает то же самое задание без возражений.
+            var fresh = IntegrationEnvironment.Psql(
+                $"SELECT workflow.finish_job('{jobId}', 'itest-owner-b', {freshVersion}, " +
+                "'ROUTE_SIGNAL', '{}'::jsonb) ->> 'status';");
+            Assert.Equal("ok", LastLine(fresh.Output));
+
+            // Личность задания при смене арендатора неизменна — на этом держится идемпотентность.
+            Assert.Equal(jobId, SingleValue($"SELECT job_id FROM autocheck.jobs WHERE process_id = '{processId}'"));
+            Assert.Equal(executionId, SingleValue($"SELECT execution_id FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+            Assert.Equal("SUCCEEDED", SingleValue($"SELECT state FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+
+            // Истёкшая аренда оставляет попытку STALE и НЕ расходует бюджет отказов действия.
+            Assert.Equal("STALE", SingleValue(
+                $"SELECT status FROM autocheck.attempts a JOIN autocheck.jobs j ON j.job_id = a.job_id " +
+                $"WHERE j.job_id = '{jobId}' AND a.attempt_number = 1"));
+            Assert.Equal("0", SingleValue(
+                $"SELECT failure_count FROM workflow.workflow_job WHERE job_id = '{jobId}'"));
+        }
+        finally
+        {
+            IntegrationEnvironment.Service("start", "worker-a", "worker-b");
+        }
+    }
+
+    /// <summary>
+    /// Гибель исполнителя МЕЖДУ предметным действием и подтверждением.
+    ///
+    /// Самый дорогой сценарий недели и единственный, который нельзя доказать чтением кода:
+    /// действие уже выполнено внутри транзакции, но ещё не зафиксировано. Смерть здесь обязана
+    /// не оставить ни одного предметного эффекта, а восстановление — не создать второго.
+    ///
+    /// Воспроизводится настоящим worker'ом с failpoint, а не подделкой состояния в таблицах:
+    /// подделка проверяла бы наши представления о границе, а не саму границу.
+    /// </summary>
+    [SkippableFact]
+    public void KillingTheWorkerBetweenActionAndFinishLeavesNoEffectAndRecovers()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        IntegrationEnvironment.Service("stop", "worker-a", "worker-b");
+        string? container = null;
+        try
+        {
+            var processId = StartSmokeProcess($"itest-crash-{Guid.NewGuid():N}");
+            var jobId = SingleValue($"SELECT job_id FROM autocheck.jobs WHERE process_id = '{processId}'");
+            var executionId = SingleValue($"SELECT execution_id FROM autocheck.jobs WHERE job_id = '{jobId}'");
+
+            container = IntegrationEnvironment.StartFailpointWorker(
+                "itest-crash-worker", "after_action_before_finish");
+
+            // Ждём СТРУКТУРНОГО подтверждения, а не таймаута: только оно означает, что действие
+            // уже выполнено внутри транзакции и исполнитель остановлен ровно перед фиксацией.
+            Assert.True(
+                WaitFor(() => IntegrationEnvironment.ContainerLog(container!)
+                    .Contains("\"event\":\"failpoint.reached\"", StringComparison.Ordinal)),
+                "worker не дошёл до failpoint между действием и завершением");
+
+            Assert.Equal("itest-crash-worker", SingleValue(
+                $"SELECT lease_owner FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+
+            IntegrationEnvironment.KillContainer(container);
+            container = null;
+
+            // Откат обязан быть полным: ни предметного эффекта, ни следа успешного вызова.
+            Assert.Equal("0", SingleValue(
+                $"SELECT count(*) FROM training.canary_effect WHERE execution_id = '{executionId}'"));
+            Assert.Equal("0", SingleValue(
+                $"SELECT count(*) FROM api.dispatch WHERE request_id = '{executionId}' AND status = 'OK'"));
+            Assert.Equal("LEASED", SingleValue($"SELECT state FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+
+            IntegrationEnvironment.Service("start", "worker-a", "worker-b");
+
+            Assert.True(
+                WaitForState(processId, "WAITING_SIGNAL"),
+                "процесс не восстановился после гибели исполнителя");
+
+            // Восстановление продолжает ТО ЖЕ задание, а не начинает новое.
+            Assert.Equal(jobId, SingleValue($"SELECT job_id FROM autocheck.jobs WHERE process_id = '{processId}'"));
+            Assert.Equal(executionId, SingleValue($"SELECT execution_id FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+            Assert.Equal("SUCCEEDED", SingleValue($"SELECT state FROM autocheck.jobs WHERE job_id = '{jobId}'"));
+
+            // Попытка новая, но исполнение то же: ровно один эффект и ровно один успешный след.
+            Assert.Equal("1", SingleValue(
+                $"SELECT count(*) FROM training.canary_effect WHERE execution_id = '{executionId}'"));
+            Assert.Equal("1", SingleValue(
+                $"SELECT count(*) FROM api.dispatch WHERE request_id = '{executionId}' AND status = 'OK'"));
+
+            // Брошенная попытка осталась в истории — и она ОТЛИЧНА от той, что довела дело до конца.
+            Assert.Equal("STALE,SUCCEEDED", SingleValue(
+                "SELECT string_agg(a.status, ',' ORDER BY a.attempt_number) FROM autocheck.attempts a " +
+                $"WHERE a.job_id = '{jobId}'"));
+            Assert.Equal("2", SingleValue(
+                $"SELECT count(DISTINCT attempt_id) FROM autocheck.attempts WHERE job_id = '{jobId}'"));
+            Assert.Equal("0", SingleValue(
+                $"SELECT failure_count FROM workflow.workflow_job WHERE job_id = '{jobId}'"));
+        }
+        finally
+        {
+            if (container is not null)
+            {
+                IntegrationEnvironment.KillContainer(container);
+            }
+
+            IntegrationEnvironment.Service("start", "worker-a", "worker-b");
+        }
+    }
+
+    /// <summary>
+    /// Один message_id — одно сообщение. Повтор идентичного тела обязан остаться дубликатом, а
+    /// любое расхождение — стать конфликтом, НЕ изменив уже сохранённую строку: именно с её
+    /// отпечатком сравнивается следующая доставка.
+    /// </summary>
+    [SkippableFact]
+    public void AReusedMessageIdWithADifferentBodyIsAConflict()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var processId = StartSmokeProcess($"itest-signal-conflict-{Guid.NewGuid():N}");
+        Assert.True(WaitForState(processId, "WAITING_SIGNAL"), "процесс не дошёл до ожидания сигнала");
+
+        var messageId = $"itest-conflict-{Guid.NewGuid():N}";
+
+        var accepted = IntegrationEnvironment.Psql(
+            $"SELECT workflow.accept_signal('{processId}', 'training.completed', '{messageId}', " +
+            "'{\"attempt\":1}'::jsonb) #>> '{result,status}';");
+        Assert.Equal("accepted", LastLine(accepted.Output));
+
+        var storedHash = SingleValue($"SELECT body_hash FROM autocheck.signals WHERE message_id = '{messageId}'");
+
+        // Повтор того же тела — дубликат, а не ошибка: клиент с ретраями обязан видеть успех.
+        var duplicate = IntegrationEnvironment.Psql(
+            $"SELECT workflow.accept_signal('{processId}', 'training.completed', '{messageId}', " +
+            "'{\"attempt\":1}'::jsonb) #>> '{result,status}';");
+        Assert.Equal("duplicate", LastLine(duplicate.Output));
+
+        // Тот же ключ с другим телом — конфликт.
+        var conflict = IntegrationEnvironment.Psql(
+            $"SELECT workflow.accept_signal('{processId}', 'training.completed', '{messageId}', " +
+            "'{\"attempt\":2}'::jsonb) ->> 'code';");
+        Assert.Equal("workflow.signal_conflict", LastLine(conflict.Output));
+
+        // Конфликт не имеет права переписать сохранённое сообщение.
+        Assert.Equal("1", SingleValue($"SELECT count(*) FROM autocheck.signals WHERE message_id = '{messageId}'"));
+        Assert.Equal(storedHash, SingleValue($"SELECT body_hash FROM autocheck.signals WHERE message_id = '{messageId}'"));
+    }
+
+    /// <summary>
+    /// Диагностика в stderr обязана быть обезврежена так же, как конверт в stdout.
+    ///
+    /// Безопасный ответ наружу не защищает ничего, если рядом печатается исходный текст
+    /// исключения: у PostgresException он содержит значения — здесь имя роли, а в общем случае
+    /// куски полезной нагрузки и идентификатор вызывающего. Сборщик логов не различает потоки.
+    ///
+    /// Маркер подаётся именем роли: ошибка аутентификации кладёт его прямо в текст сообщения, и
+    /// если исходный текст где-то печатается, тест это увидит.
+    /// </summary>
+    [SkippableFact]
+    public void CliDiagnosticsNeverCarryTheRawFailureText()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        var marker = $"sentinel{Guid.NewGuid():N}";
+
+        var (exitCode, stdout, stderr) = IntegrationEnvironment.CliDiagnostics(
+            new Dictionary<string, string>
+            {
+                ["COURSE_PUBLISHER_USER"] = marker,
+                ["COURSE_PUBLISHER_PASSWORD"] = marker,
+            },
+            "action", "list");
+
+        Assert.NotEqual(0, exitCode);
+
+        // Сначала убеждаемся, что ошибка ДЕЙСТВИТЕЛЬНО произошла на стороне PostgreSQL и её
+        // исходный текст содержал бы маркер: иначе тест проходил бы просто потому, что ничего
+        // не сломалось.
+        var authentication = IntegrationEnvironment.Psql(
+            $"SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname = '{marker}';");
+        Assert.Equal("0", LastLine(authentication.Output));
+
+        Assert.DoesNotContain(marker, stderr, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(marker, stdout, StringComparison.OrdinalIgnoreCase);
+
+        // Диагностика при этом обязана остаться ПОЛЕЗНОЙ: без типа сбоя и SQLSTATE обезвреженный
+        // журнал перестал бы отвечать на вопрос «что сломалось», и лечение было бы хуже болезни.
+        Assert.Contains("command failed code=", stderr, StringComparison.Ordinal);
+        Assert.Contains("failure=PostgresException/", stderr, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// РОВНО одно значение из psql.
+    ///
+    /// Именно ровно одно: молча взять последнюю строку значило бы, что запрос, неожиданно
+    /// вернувший две, проходит незамеченным — а вместе с ним и расхождение, ради обнаружения
+    /// которого запрос написан.
+    /// </summary>
+    private static string SingleValue(string query)
+    {
+        var result = IntegrationEnvironment.Psql($"{query};");
+        Assert.True(result.ExitCode == 0, $"запрос не выполнился: {query}");
+
+        var lines = result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        Assert.True(lines.Length == 1, $"запрос вернул {lines.Length} строк вместо одной: {query}");
+        Assert.False(string.IsNullOrWhiteSpace(lines[0]), $"запрос не вернул значения: {query}");
+        return lines[0];
+    }
+
+    /// <summary>Опрос условия до истечения срока. Опрос, а не пауза: время зависит от профиля.</summary>
+    private static bool WaitFor(Func<bool> condition, int seconds = 60)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(seconds);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return true;
+            }
+
+            Thread.Sleep(250);
+        }
+
+        return false;
+    }
+
     /// <summary>Последняя непустая строка вывода psql — сам результат, без эха служебных команд.</summary>
     private static string LastLine(string output)
         => output

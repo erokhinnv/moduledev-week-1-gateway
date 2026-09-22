@@ -52,7 +52,7 @@ C4Container
 
 | Граница | Что проверяется | Где |
 |---|---|---|
-| Edge | Whitelist маршрутов, отсутствие предметной логики и БД | `gateway` |
+| Edge | Whitelist маршрутов, отсутствие предметной логики и БД, собственная граница тела запроса (1 МБ) и пересылаемого ответа (`COURSE_GATEWAY_MAX_RESPONSE_BYTES`, 2 МБ) — не полагаясь на обещание api | `gateway` |
 | Runtime | Подпись и форма claims JWT, policy, request schema, outcome и response schema | `api` |
 | Worker | Mapping по указателям RFC 6901, request schema, объявленность исхода, response schema | `worker-*` |
 | Database | Разрешение target только из каталога, повторная проверка policy, точная сигнатура функции, идемпотентность | `api.invoke` |
