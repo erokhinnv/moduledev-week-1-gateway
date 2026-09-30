@@ -72,8 +72,44 @@ class ConfigurationTests(unittest.TestCase):
         settings = dispatcher_settings({**DISPATCHER, "COURSE_TEST_PROFILE": "1"})
         self.assertEqual(settings.provider_timeout_s, 0.5)
         self.assertLessEqual(settings.poll_interval_s, 0.1)
-        reconciler = reconciler_settings({**DATABASE, "COURSE_TEST_PROFILE": "1", "INBOX_POLL_INTERVAL_MS": "5000"})
+        reconciler = reconciler_settings({**DATABASE, "COURSE_TEST_PROFILE": "1", "COURSE_INBOX_POLL_MS": "5000"})
         self.assertLessEqual(reconciler.poll_interval_s, 0.5)
+
+    def test_the_attempt_budget_never_outlives_the_delivery_lease(self):
+        # The published test profile is untouched: 500 ms fits into the two-second lease.
+        published = dispatcher_settings({**DISPATCHER, "COURSE_TEST_PROFILE": "1"})
+        self.assertEqual((published.provider_timeout_s, published.lease_ms), (0.5, 2000))
+        self.assertFalse(published.provider_timeout_limited)
+        conservative = dispatcher_settings(DISPATCHER)
+        self.assertEqual((conservative.provider_timeout_s, conservative.lease_ms), (5.0, 30000))
+        self.assertFalse(conservative.provider_timeout_limited)
+
+        # A timeout that would outlive the lease is cut to fit into it with room for the report.
+        # Otherwise a slow provider is reclaimed mid-attempt, every report is refused as stale and
+        # the attempt budget is spent without a single backoff.
+        for timeout_ms, lease_ms, expected_s in (
+            ("5000", "2000", 1.5),    # the documented conservative timeout under the published lease
+            ("2000", "2000", 1.5),    # the boundary: a budget equal to the lease leaves no room to report
+            ("1501", "2000", 1.5),
+            ("1500", "2000", 1.5),    # exactly the lease minus the margin is still allowed
+            ("60000", "30000", 29.5),
+            ("1000", "600", 0.3),     # a lease shorter than twice the margin keeps half of itself
+            ("1000", "250", 0.125),
+        ):
+            with self.subTest(timeout_ms=timeout_ms, lease_ms=lease_ms):
+                settings = dispatcher_settings(
+                    {**DISPATCHER, "COURSE_PROVIDER_TIMEOUT_MS": timeout_ms, "COURSE_OUTBOX_LEASE_MS": lease_ms}
+                )
+                self.assertEqual(settings.provider_timeout_s, expected_s)
+                self.assertLess(settings.provider_timeout_s * 1000, settings.lease_ms)
+                self.assertEqual(settings.provider_timeout_limited, int(timeout_ms) > expected_s * 1000)
+
+    def test_the_instance_is_named_by_its_lease_owner_not_by_the_container(self):
+        # HOSTNAME inside a container is the container id: it changes on every recreate and says
+        # nothing about which tenant of the queue reached the barrier.
+        for owner in ("outbox-dispatcher", "outbox-dispatcher-b"):
+            settings = dispatcher_settings({**DISPATCHER, "OUTBOX_OWNER": owner, "HOSTNAME": "3f2a9c1b7d5e"})
+            self.assertEqual(settings.instance_id, owner)
 
     def test_database_calls_are_bounded_by_a_statement_timeout(self):
         kwargs = dispatcher_settings(DISPATCHER).database.connect_kwargs()

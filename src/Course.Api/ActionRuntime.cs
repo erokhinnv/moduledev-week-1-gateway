@@ -36,6 +36,7 @@ public sealed class ActionRuntime(
     DependencyState dependencyState,
     NpgsqlDataSource dataSource,
     SignatureBoundary signatureBoundary,
+    ActionFailpoints failpoints,
     ILogger<ActionRuntime> logger)
 {
     private const int MaxIdempotencyKeyLength = 128;
@@ -461,8 +462,16 @@ public sealed class ActionRuntime(
         var result = interpreted.Result!;
         evidence.Version = reportedVersion;
 
+        // Граница закрытого профиля «эффект есть, commit ещё нет». Принудительная остановка здесь
+        // обязана откатить всё содержимое транзакции целиком, включая результат идемпотентности.
+        await failpoints.StopIfReachedAsync(module, action, ActionPhase.BeforeCommit);
+
         // Все проверки пройдены — теперь и только теперь фиксируем транзакцию.
         await transaction.CommitAsync(budget.Token);
+
+        // Граница закрытого профиля «commit есть, ответа ещё нет». Сохранённое сообщение обязано
+        // пережить смерть процесса и быть применённым обычным согласователем, а не api.
+        await failpoints.StopIfReachedAsync(module, action, ActionPhase.AfterCommit);
 
         dependencyState.MarkAvailable();
         evidence.Status = "OK";

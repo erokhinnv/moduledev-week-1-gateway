@@ -14,6 +14,9 @@
   <ItemGroup>
     <ProjectReference Include="..\Course.Shared\Course.Shared.csproj" />
     <ProjectReference Include="..\Course.Workflow.Worker\Course.Workflow.Worker.csproj" />
+    <!-- Привязка точек остановки к границам действий живёт в сервисе api: проверяется именно она,
+         а не её копия в тестах. -->
+    <ProjectReference Include="..\Course.Api\Course.Api.csproj" />
   </ItemGroup>
 
 </Project>

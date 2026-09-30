@@ -177,7 +177,11 @@ class AdapterServerTests(unittest.TestCase):
         self.log = io.StringIO()
         self.transport = RecordingTransport(Reply(200, b'{"status":"ok","outcome":"RECEIVED"}', "application/json"))
         adapter = ReceiptAdapter(adapter_settings(ENV), Logger("receipt-adapter", self.log), self.transport)
-        self.server = CallbackServer(("127.0.0.1", 0), _handler_class(adapter))
+        self.adapter_under_test = adapter
+        self.ready = True
+        self.server = CallbackServer(
+            ("127.0.0.1", 0), _handler_class(adapter, lambda: self.ready)
+        )
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.port = self.server.server_address[1]
 

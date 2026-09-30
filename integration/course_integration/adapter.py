@@ -20,6 +20,15 @@ from typing import Callable, Mapping
 
 from .config import AdapterSettings, adapter_settings
 from .logs import Logger, describe_failure
+from .observability import (
+    JSON_MEDIA_TYPE,
+    LIVE_BODY,
+    NOT_READY_BODY,
+    OPENMETRICS_MEDIA_TYPE,
+    READY_BODY,
+    Metrics,
+    Readiness,
+)
 from .receipt import (
     SIGNATURE_HEADER,
     CallbackRejected,
@@ -35,6 +44,8 @@ MAX_CALLBACK_BYTES = 64 * 1024
 MAX_API_RESPONSE_BYTES = 1024 * 1024
 # Upper bound of a rejected request body that is still read and discarded before answering.
 MAX_DISCARDED_BYTES = 1024 * 1024
+# Budget of the readiness probe of the gateway dependency.
+DEPENDENCY_PROBE_TIMEOUT_S = 2.0
 DEPENDENCY_UNAVAILABLE = json.dumps(
     {"status": "error", "code": "dependency.unavailable"}, separators=(",", ":")
 ).encode("utf-8")
@@ -86,6 +97,41 @@ class ResponseTooLarge(http.client.HTTPException):
     """The API answered with more than the adapter relays; treated as an unusable dependency."""
 
 
+def build_metrics() -> Metrics:
+    metrics = Metrics()
+    metrics.register("provider_callbacks_received", "counter", "Legacy provider callbacks accepted on the route.")
+    metrics.register("provider_callbacks_rejected", "counter", "Callbacks refused before reaching the platform.")
+    metrics.register("provider_callbacks_forwarded", "counter", "Signed receipts relayed to the generic API.")
+    metrics.register("provider_callbacks_dependency_unavailable", "counter", "Relays that found the platform away.")
+    return metrics
+
+
+def probe_dependency(url: str, timeout_s: float) -> bool:
+    """Readiness of the adapter is readiness of the gateway it relays through.
+
+    PostgreSQL is not probed here and cannot be: the adapter holds no database credentials.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    default_port = 443 if parsed.scheme == "https" else 80
+    if parsed.scheme == "https":
+        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname or "", parsed.port or default_port, timeout=timeout_s
+        )
+    else:
+        connection = http.client.HTTPConnection(
+            parsed.hostname or "", parsed.port or default_port, timeout=timeout_s
+        )
+    try:
+        connection.request("GET", parsed.path or "/")
+        response = connection.getresponse()
+        response.read(1024)
+        return response.status == 200
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
+
+
 def http_transport(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> Reply:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme == "https":
@@ -116,10 +162,12 @@ class ReceiptAdapter:
         settings: AdapterSettings,
         logger: Logger,
         transport: Transport = http_transport,
+        metrics: Metrics | None = None,
     ) -> None:
         self.settings = settings
         self.logger = logger
         self.transport = transport
+        self.metrics = metrics if metrics is not None else build_metrics()
         self._capability = settings.capability.encode("utf-8")
 
     def route_matches(self, method: str, path: str) -> bool:
@@ -140,10 +188,12 @@ class ReceiptAdapter:
 
     def handle(self, raw: bytes) -> Reply:
         started = time.monotonic()
+        self.metrics.increment("provider_callbacks_received")
         try:
             signed = sign_callback(raw, self.settings)
         except CallbackRejected as error:
             # The reason names the rule, never the offending value.
+            self.metrics.increment("provider_callbacks_rejected")
             self.logger.info("callback.rejected", status=400, reason=str(error))
             return Reply(400)
 
@@ -152,6 +202,7 @@ class ReceiptAdapter:
                 self.settings.receipt_api_url, signed.body, signed.headers, self.settings.api_timeout_s
             )
         except (OSError, http.client.HTTPException) as error:
+            self.metrics.increment("provider_callbacks_dependency_unavailable")
             self.logger.warning(
                 "callback.dependency_unavailable",
                 messageId=signed.message_id,
@@ -169,6 +220,7 @@ class ReceiptAdapter:
             )
             return Reply(500)
 
+        self.metrics.increment("provider_callbacks_forwarded")
         self.logger.info(
             "callback.forwarded",
             messageId=signed.message_id,
@@ -179,7 +231,9 @@ class ReceiptAdapter:
         return reply
 
 
-def _handler_class(adapter: ReceiptAdapter) -> type[BaseHTTPRequestHandler]:
+def _handler_class(
+    adapter: ReceiptAdapter, readiness: Callable[[], bool]
+) -> type[BaseHTTPRequestHandler]:
     class CallbackHandler(BaseHTTPRequestHandler):
         server_version = "receipt-adapter"
         sys_version = ""
@@ -242,14 +296,34 @@ def _handler_class(adapter: ReceiptAdapter) -> type[BaseHTTPRequestHandler]:
                 return
             self._send(adapter.handle(raw))
 
+        # Наблюдаемость живёт на том же служебном порту, что и callback: контракт недели 4
+        # закрепляет adapter на 8082, и отдельный сокет тут был бы вторым адресом одного и того
+        # же процесса. Точку аварийной остановки этот порт НЕ включает: он отвечает только на
+        # GET трёх известных путей, поэтому закрытый профиль остаётся закрытым.
         def do_GET(self) -> None:  # noqa: N802
-            self._not_found()
+            route = self.path.split("?", 1)[0]
+            if route == "/health/live":
+                self._send(Reply(200, LIVE_BODY, JSON_MEDIA_TYPE))
+            elif route == "/health/ready":
+                ready = readiness()
+                self._send(Reply(
+                    200 if ready else 503,
+                    READY_BODY if ready else NOT_READY_BODY,
+                    JSON_MEDIA_TYPE,
+                ))
+            elif route == "/metrics":
+                self._send(Reply(200, adapter.metrics.render(), OPENMETRICS_MEDIA_TYPE))
+            else:
+                self._not_found()
 
         do_HEAD = do_GET
-        do_PUT = do_GET
-        do_PATCH = do_GET
-        do_DELETE = do_GET
-        do_OPTIONS = do_GET
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._not_found()
+
+        do_PATCH = do_PUT
+        do_DELETE = do_PUT
+        do_OPTIONS = do_PUT
 
     return CallbackHandler
 
@@ -270,8 +344,16 @@ class CallbackServer(ThreadingHTTPServer):
 
 
 def serve(settings: AdapterSettings, logger: Logger, stop: StopSignal) -> int:
-    adapter = ReceiptAdapter(settings, logger)
-    server = CallbackServer((settings.listen_host, settings.listen_port), _handler_class(adapter))
+    adapter = ReceiptAdapter(settings, logger, metrics=build_metrics())
+    # The probe budget is deliberately shorter than the relay budget: a health check that waits as
+    # long as a real callback answers the question too late to be useful.
+    readiness = Readiness(
+        lambda: probe_dependency(settings.dependency_probe_url, DEPENDENCY_PROBE_TIMEOUT_S),
+        logger,
+    )
+    server = CallbackServer(
+        (settings.listen_host, settings.listen_port), _handler_class(adapter, readiness)
+    )
     server.logger = logger
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
     thread.start()

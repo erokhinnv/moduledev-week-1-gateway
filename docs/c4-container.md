@@ -4,49 +4,60 @@
 точка входа — `gateway` на порту `8080`. Предметное выполнение существует только внутри
 PostgreSQL, за функцией `api.invoke`, — и для HTTP-клиента, и для исполнителя процессов.
 
-Неделя 3 добавляет интеграционный периметр: три Python-процесса из одного образа и выданный
+Неделя 3 добавила интеграционный периметр: Python-процессы из одного образа и выданный
 provider v0.2.0. Python переводит форматы и носит байты через фиксированные границы, но не
 выбирает карту, лимит, переход или финальный статус. См.
 [ADR 0005](adr/0005-provider-trust-boundary-and-anti-corruption-layer.md) и
 [ADR 0006](adr/0006-durable-outbox-and-inbox.md).
 
+Неделя 4 удваивает арендаторов периметра и добавляет наблюдателя. Второй dispatcher и второй
+reconciler — те же образ, роль и SQL-границы; отличается только владелец аренды доставки.
+Наблюдатель читает исключительно представления схемы `autocheck` и не участвует в исполнении. См.
+[ADR 0007](adr/0007-delivery-policy-in-the-database.md) и
+[ADR 0008](adr/0008-observability-from-saved-facts.md).
+
 ```mermaid
 C4Container
-    title Недели 1-3. Action runtime, workflow-ядро и Python-периметр
+    title Недели 1-4. Action runtime, workflow-ядро, Python-периметр и надёжность
 
     Person(client, "Внешний клиент", "Создаёт и отправляет операцию, читает события")
     Person(reviewer, "Ревьюер", "Принимает ручное решение по payment-review")
     Person(operator, "Оператор курса", "Публикует миграции, манифесты и карты процессов")
+    Person(observer, "Наблюдатель", "Читает health, OpenMetrics, diagnostics.trace и diagnostics.stalled")
     System_Ext(provider, "provider-simulator", "Go, выданный образ v0.2.0 по digest. Идемпотентный POST /payments, legacy callback без JWT и HMAC")
 
     System_Boundary(stack, "Docker Compose stack") {
         Container(gateway, "gateway", "C# ASP.NET Core", "Единственный публичный порт 8080. Whitelist маршрутов, прозрачная передача контрактных заголовков, health. Не содержит каталог и предметную логику")
-        Container(api, "api", "C# ASP.NET Core", "Generic action runtime. JWT, server-side context, request/response schema validation, одна Npgsql-транзакция, OpenAPI из манифестов")
+        Container(api, "api", "C# ASP.NET Core", "Generic action runtime. JWT, server-side context, request/response schema validation, одна Npgsql-транзакция, OpenAPI из манифестов, шесть обязательных серий OpenMetrics")
         Container(cli, "cli", "C# console", "Course CLI: checksummed migrations, публикация манифестов и карт, trusted-команды процессов. Тремя разными ролями: миграций, публикации и операций")
-        Container(workera, "worker-a", "C# console", "Сменный исполнитель процессов. Аренда задания, вызов зарегистрированного действия, сообщение исхода. lease owner worker-a")
-        Container(workerb, "worker-b", "C# console", "Тот же образ, lease owner worker-b. Отличается только идентификатором арендатора")
-        Container(dispatcher, "outbox-dispatcher", "Python 3.12", "Один claim - одна HTTP-попытка к provider. Неизменные key/body/correlation, классификация ответа, отчёт в PostgreSQL")
+        Container(workers, "worker-a, worker-b", "C# console, один образ", "Сменные исполнители процессов. Аренда задания, вызов зарегистрированного действия, сообщение исхода. Отличаются только идентификатором арендатора")
+        Container(dispatchers, "outbox-dispatcher, outbox-dispatcher-b", "Python 3.12, один образ", "Один claim - одна HTTP-попытка к provider. Неизменные key/body/correlation, классификация ответа, отчёт по owner и версии аренды. Отличаются только владельцем аренды")
         Container(adapter, "receipt-adapter", "Python 3.12, тот же образ", "Anti-corruption layer: legacy callback -> receipt v1, compact sorted bytes, HMAC. Без учётных данных БД")
-        Container(reconciler, "inbox-reconciler", "Python 3.12, тот же образ", "Периодически вызывает одну функцию согласования Inbox")
-        ContainerDb(postgres, "postgres", "PostgreSQL 17", "Авторитетное состояние: каталог, идемпотентность, карты, процессы, jobs, сигналы, operations, external requests, Outbox, Inbox, receipts, decisions, схема autocheck")
+        Container(reconcilers, "inbox-reconciler, inbox-reconciler-b", "Python 3.12, тот же образ", "Вызывают одну функцию согласования Inbox; конкуренцию разбирает сама граница")
+        ContainerDb(postgres, "postgres", "PostgreSQL 17", "Авторитетное состояние: каталог, идемпотентность, карты, процессы, jobs, сигналы, operations, external requests, Outbox, Inbox, receipts, decisions, профиль доставки, схема autocheck")
     }
 
     Rel(client, gateway, "POST /api/{module}/{action}, GET /openapi, GET /health", "HTTPS/HTTP :8080")
     Rel(gateway, api, "Проксирует запрос и контрактные заголовки", "HTTP по Compose DNS http://api:8080")
-    Rel(api, postgres, "SELECT api.invoke(...), api.resolve_action(...), api.record_dispatch(...)", "Npgsql, роль course_runtime")
+    Rel(api, postgres, "SELECT api.invoke(...), api.resolve_action(...), api.runtime_metrics()", "Npgsql, роль course_runtime")
     Rel(operator, cli, "migration apply, action publish/activate, flow publish/activate/start/signal", "docker compose run cli")
     Rel(cli, postgres, "DDL, публикация каталога и карт, trusted-команды процессов", "Npgsql, роли course_migrator, course_publisher и course_operator")
-    Rel(workera, postgres, "claim_jobs → api.invoke → finish_job / fail_job", "Npgsql, роль workflow_worker")
-    Rel(workerb, postgres, "claim_jobs → api.invoke → finish_job / fail_job", "Npgsql, роль workflow_worker")
+    Rel(workers, postgres, "claim_jobs → api.invoke → finish_job / fail_job", "Npgsql, роль workflow_worker")
     Rel(reviewer, gateway, "POST /api/workflow/manual", "HTTP :8080, scope workflow:manual")
-    Rel(dispatcher, postgres, "delivery.claim_outbox / succeed_outbox / fail_outbox", "psycopg, роль outbox_dispatcher")
-    Rel(dispatcher, provider, "POST /payments + Idempotency-Key + X-Correlation-ID", "HTTP provider-simulator:8081")
+    Rel(observer, gateway, "POST /api/diagnostics/trace, POST /api/diagnostics/stalled", "HTTP :8080, scope diagnostics:read")
+    Rel(observer, postgres, "SELECT из представлений схемы autocheck", "psql, роль autocheck_reader, read-only session")
+    Rel(dispatchers, postgres, "delivery.claim_outbox / succeed_outbox / fail_outbox", "psycopg, роль outbox_dispatcher")
+    Rel(dispatchers, provider, "POST /payments + Idempotency-Key + X-Correlation-ID", "HTTP provider-simulator:8081")
     Rel(provider, adapter, "Legacy callback", "HTTP /callbacks/provider-v02/{capability}")
     Rel(adapter, gateway, "POST /api/receipt/accept + JWT + X-Provider-Signature", "HTTP gateway:8080")
-    Rel(reconciler, postgres, "delivery.reconcile_inbox", "psycopg, роль inbox_reconciler")
+    Rel(reconcilers, postgres, "delivery.reconcile_inbox", "psycopg, роль inbox_reconciler")
 
     UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 ```
+
+Служебные адреса наблюдаемости (`/health/live`, `/health/ready`, `/metrics`) есть у `api`, обоих
+worker, обоих dispatcher и обоих reconciler на внутреннем порту `8080`, у `receipt-adapter` — на
+`8082`. Наружу не публикуется ни один из них: host-порт по-прежнему только у `gateway`.
 
 ## Границы доверия
 
@@ -66,6 +77,9 @@ C4Container
 | Delivery | Owner и `lease_version` до записи; `CONFIRMED` не регрессирует; ключ и тело Outbox неизменяемы | `delivery.*`, триггеры `outbox_guard`, `inbox_guard` |
 | Evidence | Финальный статус только по применённой квитанции или записанному решению | `payment.complete_v1`, `reject_v1`, `approve_v1` |
 | Integration roles | `outbox_dispatcher` — три функции, `inbox_reconciler` — одна; ноль прав на таблицы, `CREATE` и членств; у adapter нет учётных данных БД | PostgreSQL, Compose |
+| Delivery policy | Число попыток, экспонента, jitter и срок аренды читаются из настроек базы, а не из аргумента вызывающего | `delivery.active_policy`, `db/init/00-roles.sh` |
+| Observer | `CONNECT`, `USAGE` на схему `autocheck` и `SELECT` на её представления — и ничего больше: ни членств, ни физических отношений, ни функций приложения, ни `CREATE`, ни `TEMP` | роль `autocheck_reader` |
+| Failpoint | Точка аварийной остановки читается только из окружения процесса и только при `COURSE_TEST_PROFILE=1`; служебный порт отвечает лишь на GET трёх путей | `Failpoint`, `ActionFailpoints`, `observability.py` |
 
 ## Поток одного HTTP-вызова
 

@@ -39,6 +39,9 @@ public sealed class WorkerOptions
     /// <summary>Верхняя граница размера конверта, возвращённого api.invoke.</summary>
     public int MaxResultBytes { get; init; } = Env.OptionalInt("COURSE_MAX_RESULT_BYTES", 512 * 1024);
 
+    /// <summary>Служебный порт наблюдаемости: health/live, health/ready и metrics.</summary>
+    public required int ObservabilityPort { get; init; }
+
     public static WorkerOptions FromEnvironment()
     {
         var testProfile = Env.Optional("COURSE_TEST_PROFILE", "0") == "1";
@@ -46,13 +49,16 @@ public sealed class WorkerOptions
         return new WorkerOptions
         {
             InstanceId = Env.Optional("COURSE_WORKER_ID", "worker"),
-            // Test profile: аренда 2 секунды, опрос не реже чем раз в 100 мс — таковы условия
-            // воспроизводимости аварийных сценариев проверки.
-            LeaseMs = Env.OptionalInt("COURSE_WORKER_LEASE_MS", testProfile ? 2_000 : 30_000),
+            // Срок аренды задания — общая величина контура, а не настройка одного исполнителя:
+            // из неё же складывается значение по умолчанию на стороне PostgreSQL (см.
+            // db/init/00-roles.sh и 024_reliability.sql). Test profile: аренда 2 секунды, опрос
+            // не реже чем раз в 100 мс — таковы условия воспроизводимости аварийных сценариев.
+            LeaseMs = Env.OptionalInt("COURSE_JOB_LEASE_MS", testProfile ? 2_000 : 30_000),
             PollMs = Env.OptionalInt("COURSE_WORKER_POLL_MS", testProfile ? 50 : 1_000),
             BatchSize = Env.OptionalInt("COURSE_WORKER_BATCH", 1),
             TestProfile = testProfile,
             Failpoint = testProfile ? Env.Optional("COURSE_FAILPOINT", string.Empty).Trim() : string.Empty,
+            ObservabilityPort = Env.OptionalInt("COURSE_WORKER_HEALTH_PORT", 8080),
         };
     }
 }

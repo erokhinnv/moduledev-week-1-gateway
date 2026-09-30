@@ -103,3 +103,17 @@ class ReconnectingConnection:
                 connection.close()
             except Exception:  # noqa: BLE001 - closing a broken connection must not fail
                 pass
+
+    def ping(self) -> bool:
+        """Readiness probe: PostgreSQL answered a trivial statement.
+
+        The probe sends no boundary function and needs no privilege beyond CONNECT, so a role
+        with EXECUTE on exactly one function stays a role with EXECUTE on exactly one function.
+        A broken connection is dropped here, not on the next unit of work.
+        """
+        try:
+            row = self.get().execute("SELECT 1", ()).fetchone()
+        except Exception:  # noqa: BLE001 - an unavailable dependency is not a crash
+            self.reset()
+            return False
+        return bool(row) and row[0] == 1

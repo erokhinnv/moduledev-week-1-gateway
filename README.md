@@ -1,6 +1,6 @@
-# Недели 1–3. Action runtime, workflow-ядро и Python-периметр
+# Недели 1–4. Action runtime, workflow-ядро, Python-периметр и надёжность
 
-Решение первых трёх недель ModuleDev в одном репозитории.
+Решение всех четырёх недель ModuleDev в одном репозитории.
 
 Неделя 1: C# gateway и generic C# runtime, публикующие зарегистрированные PostgreSQL-функции как
 HTTP actions. Неделя 2: поверх того же runtime — общий C# worker, версионированные workflow-карты,
@@ -9,39 +9,53 @@ HTTP actions. Неделя 2: поверх того же runtime — общий 
 `payment-review`) на том же ядре и интеграционный периметр из трёх Python-процессов одного образа —
 durable Outbox к выданному provider v0.2.0, anti-corruption layer для его legacy callback с
 подписанной квитанцией receipt v1, согласование Inbox, ручное и автоматическое решение с аудитом.
+Неделя 4: по два dispatcher и reconciler из того же образа, профиль доставки как настройка самой
+базы (ограниченный retry, экспонента с jitter, перехват просроченной доставки, `DEAD` как
+технический исход), health и OpenMetrics у восьми процессов, действия `diagnostics.trace` и
+`diagnostics.stalled`, шесть детерминированных точек аварийной остановки и роль наблюдателя
+`autocheck_reader`.
 
 Исходные тексты заданий — [TASK.md](TASK.md) (неделя 1),
-[docs/task/week-2-assignment.md](docs/task/week-2-assignment.md) (неделя 2) и
+[docs/task/week-2-assignment.md](docs/task/week-2-assignment.md) (неделя 2),
 [docs/task/week-3-assignment.md](docs/task/week-3-assignment.md) (неделя 3, полный контракт —
 [week-3-contract.md](docs/task/week-3-contract.md),
 [week-3-external-contracts.md](docs/task/week-3-external-contracts.md) и
 [week-3-configuration.md](docs/task/week-3-configuration.md); редакция `week-3.1`, сняты с пакета
-задания на commit `23419a5`, изменены только относительные ссылки). Машинные схемы контракта — в
-[`contracts/course-1`](contracts/course-1).
+задания на commit `23419a5`) и
+[docs/task/week-4-assignment.md](docs/task/week-4-assignment.md) (неделя 4, полный контракт —
+[week-4-contract.md](docs/task/week-4-contract.md),
+[week-4-observability-contracts.md](docs/task/week-4-observability-contracts.md) и
+[week-4-configuration.md](docs/task/week-4-configuration.md); редакция `week-4.1`, снята с пакета
+задания на commit `e1ae7e0`). В копиях изменены только относительные ссылки. Машинные схемы
+контракта — в [`contracts/course-1`](contracts/course-1).
 
-Главное свойство решения не изменилось и распространилось на процессы и периметр: **новое действие
-и новая карта процесса добавляются миграцией, манифестом и картой — и исполняются через общие
-маршруты без единой правки и пересборки C#-кода.** Обе платёжные карты исполняются тем же
-worker'ом без веток по имени flow, шага или действия; `receipt.accept` и `workflow.manual` — обычные
-действия generic-маршрута, а не отдельные controllers.
+Главное свойство решения не изменилось и распространилось на процессы, периметр и наблюдаемость:
+**новое действие и новая карта процесса добавляются миграцией, манифестом и картой — и исполняются
+через общие маршруты без единой правки и пересборки C#-кода.** Обе платёжные карты исполняются тем
+же worker'ом без веток по имени flow, шага или действия; `receipt.accept`, `workflow.manual`,
+`diagnostics.trace` и `diagnostics.stalled` — обычные действия generic-маршрута, а не отдельные
+controllers.
 
 ## Решение
 
 ### Архитектура
 
-Десять сервисов Docker Compose, одна публичная точка входа.
+Двенадцать сервисов Docker Compose, одна публичная точка входа. Host-порт публикует только
+`gateway`; служебные адреса наблюдаемости доступны исключительно внутри сети Compose.
 
 | Сервис | Технология | Ответственность | Порт |
 |---|---|---|---|
 | `gateway` | C# ASP.NET Core | Публичный edge: whitelist маршрутов, прозрачная передача контрактных заголовков, health. Не содержит каталог, предметную логику и доступ к PostgreSQL | `127.0.0.1:8080` на host |
-| `api` | C# ASP.NET Core | Generic action runtime: JWT, generic-граница подписи, server-side context, разрешение версии, request/response schema, одна Npgsql-транзакция, OpenAPI из манифестов | только внутренний `8080` |
+| `api` | C# ASP.NET Core | Generic action runtime: JWT, generic-граница подписи, server-side context, разрешение версии, request/response schema, одна Npgsql-транзакция, OpenAPI из манифестов, шесть обязательных серий OpenMetrics | только внутренний `8080` |
 | `cli` | C# console | Course CLI: checksummed migrations, публикация манифестов и карт, trusted-команды процессов. Владеет publication credentials | нет |
-| `postgres` | PostgreSQL 17 | Авторитетное состояние: каталог, идемпотентность, процессы, operations, external requests, Outbox, Inbox, receipts, decisions, схема `autocheck` | нет |
-| `worker-a` | C# console | Сменный исполнитель процессов, lease owner `worker-a` | нет |
-| `worker-b` | C# console | Тот же образ, lease owner `worker-b` | нет |
-| `outbox-dispatcher` | Python 3.12 | Outbox → provider: один claim — одна HTTP-попытка, отчёт о ней в PostgreSQL | нет |
+| `postgres` | PostgreSQL 17 | Авторитетное состояние: каталог, идемпотентность, процессы, operations, external requests, Outbox, Inbox, receipts, decisions, схема `autocheck` и профиль доставки | нет |
+| `worker-a` | C# console | Сменный исполнитель процессов, lease owner `worker-a` | только внутренний `8080` |
+| `worker-b` | C# console | Тот же образ, lease owner `worker-b` | только внутренний `8080` |
+| `outbox-dispatcher` | Python 3.12 | Outbox → provider: один claim — одна HTTP-попытка, отчёт о ней в PostgreSQL | только внутренний `8080` |
+| `outbox-dispatcher-b` | Python 3.12, тот же образ | Второй арендатор доставки, owner `outbox-dispatcher-b` | только внутренний `8080` |
 | `receipt-adapter` | Python 3.12, тот же образ | Legacy callback provider → signed receipt v1 → gateway. Без учётных данных БД | только внутренний `8082` |
-| `inbox-reconciler` | Python 3.12, тот же образ | Вызывает одну функцию согласования Inbox | нет |
+| `inbox-reconciler` | Python 3.12, тот же образ | Вызывает одну функцию согласования Inbox | только внутренний `8080` |
+| `inbox-reconciler-b` | Python 3.12, тот же образ | Второй согласователь; конкуренцию разбирает сама SQL-граница | только внутренний `8080` |
 | `provider-simulator` | Go, выданный образ по digest | Внешний provider v0.2.0: `POST /payments`, legacy callback, audit | только внутренний `8081` |
 
 Направление вызовов строго одностороннее:
@@ -50,9 +64,10 @@ worker'ом без веток по имени flow, шага или действ
 клиент            → gateway (:8080) → api (Compose DNS http://api:8080) → PostgreSQL (api.invoke)
 worker            → PostgreSQL (claim_jobs → api.invoke → finish_job / fail_job)
 cli               → PostgreSQL (миграции, публикация действий и карт, trusted-команды)
-outbox-dispatcher → PostgreSQL (delivery.claim/succeed/fail_outbox) и provider (POST /payments)
+dispatcher (×2)   → PostgreSQL (delivery.claim/succeed/fail_outbox) и provider (POST /payments)
 provider          → receipt-adapter (legacy callback) → gateway → api → PostgreSQL (receipt.accept)
-inbox-reconciler  → PostgreSQL (delivery.reconcile_inbox)
+reconciler (×2)   → PostgreSQL (delivery.reconcile_inbox)
+наблюдатель       → autocheck_reader (read-only views схемы autocheck)
 ```
 
 - `gateway` обращается к внутреннему `api` по Compose DNS `http://api:8080`, а не через
@@ -82,7 +97,9 @@ inbox-reconciler  → PostgreSQL (delivery.reconcile_inbox)
 - [ADR 0003. Бюджет времени складывается из одного дедлайна, а шлюз держит потолок](docs/adr/0003-deadline-composition.md);
 - [ADR 0004. Аренда с fencing вместо блокировки на время выполнения](docs/adr/0004-lease-and-fencing.md);
 - [ADR 0005. Граница доверия provider и Python anti-corruption layer](docs/adr/0005-provider-trust-boundary-and-anti-corruption-layer.md);
-- [ADR 0006. Durable Outbox и Inbox за фиксированными SQL-границами](docs/adr/0006-durable-outbox-and-inbox.md).
+- [ADR 0006. Durable Outbox и Inbox за фиксированными SQL-границами](docs/adr/0006-durable-outbox-and-inbox.md);
+- [ADR 0007. Политика доставки принадлежит базе, а `DEAD` остаётся техническим исходом](docs/adr/0007-delivery-policy-in-the-database.md);
+- [ADR 0008. Наблюдаемость строится из сохранённых фактов](docs/adr/0008-observability-from-saved-facts.md).
 
 Ключевые файлы:
 
@@ -94,8 +111,13 @@ inbox-reconciler  → PostgreSQL (delivery.reconcile_inbox)
 | Платёжные действия, `receipt.accept`, `workflow.manual`, `delivery.*` | [`db/migrations/018_perimeter_actions.sql`](db/migrations/018_perimeter_actions.sql) |
 | Проекции периметра и права Python-ролей | [`db/migrations/019_perimeter_autocheck.sql`](db/migrations/019_perimeter_autocheck.sql) |
 | Семантика идемпотентности, закреплённая за маршрутом | [`db/migrations/021_idempotency_semantics.sql`](db/migrations/021_idempotency_semantics.sql) |
-| Бюджет повторов доставки test profile: четыре попытки, задержек ровно на одну меньше | [`db/migrations/022_outbox_retry_budget.sql`](db/migrations/022_outbox_retry_budget.sql) |
+| Бюджет повторов доставки: четыре попытки в test profile, форма строки профиля закреплена ограничением таблицы | [`db/migrations/022_outbox_retry_budget.sql`](db/migrations/022_outbox_retry_budget.sql) |
 | Аренда задания покрывает бюджет действия | [`db/migrations/023_lease_covers_the_action_budget.sql`](db/migrations/023_lease_covers_the_action_budget.sql) |
+| Профиль доставки, метрики, `diagnostics.*` и права наблюдателя | [`db/migrations/024_reliability.sql`](db/migrations/024_reliability.sql) |
+| Шесть обязательных серий OpenMetrics сервиса `api` | [`src/Course.Api/RuntimeMetrics.cs`](src/Course.Api/RuntimeMetrics.cs) |
+| Барьер подтверждения закрытого профиля | [`src/Course.Shared/Failpoint.cs`](src/Course.Shared/Failpoint.cs), [`src/Course.Api/ActionFailpoints.cs`](src/Course.Api/ActionFailpoints.cs) |
+| Служебный адрес исполнителя (health/metrics без веб-фреймворка) | [`src/Course.Workflow.Worker/ObservabilityEndpoint.cs`](src/Course.Workflow.Worker/ObservabilityEndpoint.cs) |
+| Health и OpenMetrics Python-процессов | [`integration/course_integration/observability.py`](integration/course_integration/observability.py) |
 | Python-периметр | [`integration/course_integration`](integration/course_integration) |
 | Карты платёжных процессов | [`db/flows/payment-processing-v1.flow.yaml`](db/flows/payment-processing-v1.flow.yaml), [`db/flows/payment-review-v1.flow.yaml`](db/flows/payment-review-v1.flow.yaml) |
 | Общий разбор границы `api.invoke` | [`src/Course.Shared/RegisteredAction.cs`](src/Course.Shared/RegisteredAction.cs) |
@@ -113,10 +135,11 @@ Prerequisites: Docker Engine 24+, Docker Compose v2 и Python 3.11+ на host (�
 локального окружения и e2e-сценариев). .NET SDK, `psql`, NuGet и pip-пакеты используются только
 внутри образов.
 
-У JWT, HMAC-ключа, capability callback и токенов **нет значений по умолчанию** в `compose.yaml`: они
-приходят только из окружения запуска. Для локального стенда их генерирует помощник — случайные
-synthetic-значения на одну сессию shell плюс JWT `receipt-provider`, подписанный тем же ключом, что
-проверяет `api`. На диск ничего не пишется, `.env` не нужен:
+У JWT, HMAC-ключа, capability callback, токенов и пароля наблюдателя **нет значений по умолчанию**
+в `compose.yaml`: они приходят только из окружения запуска. Для локального стенда их генерирует
+помощник — случайные synthetic-значения на одну сессию shell плюс JWT `receipt-provider`,
+подписанный тем же ключом, что проверяет `api`. Он же включает `COURSE_TEST_PROFILE=1`. На диск
+ничего не пишется, `.env` не нужен:
 
 ```bash
 eval "$(python3 scripts/dev_env.py)"
@@ -124,23 +147,50 @@ docker compose up -d --build
 ```
 
 После этого не требуются ручные SQL-команды, ручная публикация actions и карт или настройка
-учётных данных: сервис `cli` применяет миграции недель 1–3, публикует встроенные actions (включая
-одиннадцать действий недели 3), публикует карты `workflow-smoke` v1/v2, `payment-processing` v1 и
-`payment-review` v1 и активирует младшую версию каждой. Только после его успешного завершения
-стартует `api`. Python-сервисы и provider стартуют сразу и сами дожидаются базы и gateway.
+учётных данных: сервис `cli` применяет миграции недель 1–4, публикует встроенные actions (включая
+одиннадцать действий недели 3 и два действия `diagnostics` недели 4), публикует карты
+`workflow-smoke` v1/v2, `payment-processing` v1 и `payment-review` v1 и активирует младшую версию
+каждой. Только после его успешного завершения стартует `api`. Python-сервисы и provider стартуют
+сразу и сами дожидаются базы и gateway.
 
-Роли `outbox_dispatcher` и `inbox_reconciler` создаются при инициализации кластера, поэтому
-перед первым запуском недели 3 на томе прежних недель нужен `docker compose down -v`.
+Роли `outbox_dispatcher`, `inbox_reconciler`, `autocheck_reader` и настройки профиля доставки
+создаются один раз при инициализации кластера, поэтому **перед первым запуском недели 4 на томе
+прежних недель нужен `docker compose down -v`**. На уже инициализированном томе скрипт
+инициализации не выполняется вообще: изменённые значения `COURSE_OUTBOX_*` и `COURSE_JOB_LEASE_MS`
+на нём не применятся, пока том не пересоздан (см. [ADR 0007](docs/adr/0007-delivery-policy-in-the-database.md)).
 
 Стек самодостаточен и по устройству Compose: ни одного bind mount и ни одного внешнего ресурса —
 миграции, манифесты, карты и скрипт создания ролей копируются внутрь образов на этапе сборки.
 
-Ожидаемый результат:
+Признаки готовности. Контур готов, когда `gateway` отвечает `200` на readiness, а каждый
+проверяемый процесс — `ready` на своём служебном адресе:
 
 ```bash
-curl -s http://localhost:8080/health/live    # {"status":"ok","service":"gateway",...}
-curl -s http://localhost:8080/health/ready   # {"status":"ok","service":"gateway","check":"api",...}
+curl -s http://localhost:8080/health/live    # {"status":"live"}
+curl -s http://localhost:8080/health/ready   # {"status":"ready"}
 ```
+
+Служебные адреса наружу не публикуются, поэтому опрашиваются изнутри сети Compose. Любой
+Python-сервис периметра годится как точка входа:
+
+```bash
+docker compose exec -T outbox-dispatcher python - <<'PY'
+import urllib.request
+targets = [
+    "http://api:8080", "http://worker-a:8080", "http://worker-b:8080",
+    "http://outbox-dispatcher:8080", "http://outbox-dispatcher-b:8080",
+    "http://inbox-reconciler:8080", "http://inbox-reconciler-b:8080",
+    "http://receipt-adapter:8082",
+]
+for target in targets:
+    with urllib.request.urlopen(target + "/health/ready", timeout=2) as response:
+        print(target, response.status, response.read().decode())
+PY
+```
+
+Ready у `api`, worker, dispatcher и reconciler означает доступность PostgreSQL, у
+`receipt-adapter` — доступность `gateway`. Недоступность provider на готовность не влияет ни у
+одного процесса: накопление Outbox — штатный режим.
 
 Полный проход встроенной карты. Данные процесса передаются файлом или стандартным вводом:
 
@@ -173,7 +223,9 @@ curl -s http://localhost:8080/api/operation/events -H "Authorization: Bearer $TO
   -H 'Content-Type: application/json' -d "{\"operationId\":\"$OP\"}"   # ... RECEIPT_APPLIED, OPERATION_COMPLETED
 ```
 
-Все сценарии недели 3 разом (provider path, adapter, recreate, review, конкуренция, роли, failpoint, порядок блокировок, неизменяемость хранилища):
+Все e2e-сценарии периметра недель 3–4 разом (provider path, adapter, recreate, review, конкуренция,
+роли, failpoints, порядок блокировок, неизменяемость хранилища, health и метрики, исчерпание
+доставки и поздняя квитанция, trace, наблюдатель, бюджет повторов):
 
 ```bash
 python3 scripts/e2e_perimeter.py
@@ -187,14 +239,28 @@ docker compose down -v
 
 ### Конфигурация
 
-Реальные секреты в репозитории отсутствуют. У JWT, HMAC, capability и токенов в `compose.yaml` нет
-значений по умолчанию; для паролей PostgreSQL заданы явно обозначенные local-only значения, которые
-проверка всегда заменяет synthetic-значениями через собственный Compose override.
+Реальные секреты в репозитории отсутствуют. У JWT, HMAC, capability, токенов и пароля наблюдателя
+в `compose.yaml` нет значений по умолчанию; для паролей прикладных ролей PostgreSQL заданы явно
+обозначенные local-only значения, которые проверка всегда заменяет synthetic-значениями через
+собственный Compose override.
 
-Каждую переменную таблицы `compose.yaml` пробрасывает в контейнер из окружения запуска
-(`docker compose up`); не заданная или пустая переменная означает умолчание самого процесса.
-Исключения: `COURSE_GATEWAY_PORT` задаёт только host-порт, а порт adapter `8082` закреплён в
-`compose.yaml`, потому что на него ссылаются `expose` и callback URL provider.
+Таблица перечисляет только то, что действительно проведено в контур, и проведено одним из трёх
+способов (это сверяет unit-тест `RepositoryContractTests`):
+
+- **окружение запуска** — `compose.yaml` пробрасывает переменную в контейнер как `${ИМЯ}`; не
+  заданная или пустая переменная означает значение из третьей колонки. `COURSE_GATEWAY_PORT` при
+  этом задаёт только host-порт;
+- **проводка контура** — адреса, роли и идентификаторы арендаторов записаны в `compose.yaml`
+  литералами и окружением запуска не меняются: `COURSE_API_BASE_URL`, `COURSE_POSTGRES_HOST`,
+  `COURSE_POSTGRES_PORT`, `COURSE_POSTGRES_DB`, `COURSE_POSTGRES_USER`, `COURSE_PUBLISHER_USER`,
+  `COURSE_OPERATOR_USER`, `COURSE_WORKER_ID` и порт adapter `RECEIPT_ADAPTER_PORT` (на него
+  ссылаются `expose` и callback URL provider);
+- **умолчания образа** — `COURSE_BOOTSTRAP_*` заданы в `docker/cli.Dockerfile`.
+
+Третья колонка — значение, с которым контур поднимается без дополнительных переменных. Времена
+в ней — опубликованный test profile недели 4 (контракт конфигурации разрешает их как default), и
+действуют они независимо от `COURSE_TEST_PROFILE`: более консервативный профиль задаётся явными
+значениями тех же переменных.
 
 | Переменная | Сервис | Значение открытого профиля | Назначение |
 |---|---|---|---|
@@ -206,13 +272,19 @@ docker compose down -v
 | `PROVIDER_CALLBACK_CAPABILITY` | `receipt-adapter`, `provider-simulator` (`CALLBACK_URL`) | нет default | Непредсказуемый сегмент пути callback |
 | `PROVIDER_CALLBACK_TOKEN` | `receipt-adapter` | нет default | JWT principal `receipt-provider`, scope `receipt:write` |
 | `RECEIPT_API_URL` | `receipt-adapter` | `http://gateway:8080/api/receipt/accept` | Generic-маршрут через gateway |
-| `PROVIDER_URL` | `outbox-dispatcher` | `http://provider-simulator:8081` | Базовый адрес provider |
+| `PROVIDER_URL` | оба dispatcher | `http://provider-simulator:8081` | Базовый адрес provider |
 | `OUTBOX_OWNER` | `outbox-dispatcher` | `outbox-dispatcher` | Стабильный lease owner Outbox |
+| `OUTBOX_OWNER_B` | `outbox-dispatcher-b` | `outbox-dispatcher-b` | Owner второго арендатора: один и тот же owner у двух dispatcher сделал бы fencing бессмысленным |
 | `PROVIDER_AUDIT_TOKEN` | `provider-simulator` | нет default | Токен audit endpoint provider (нужен только проверке) |
 | `PROVIDER_SIMULATOR_MODE` | `provider-simulator` | `success` | Режим simulator для ручных экспериментов |
-| `PROVIDER_TIMEOUT_MS` | `outbox-dispatcher` | `500` в test profile, иначе `5000` | Бюджет одной HTTP-попытки |
-| `OUTBOX_POLL_INTERVAL_MS` / `INBOX_POLL_INTERVAL_MS` | dispatcher / reconciler | `100` / `200` в test profile | Интервал опроса; у reconciler в test profile не более 500 мс |
-| `RECEIPT_ADAPTER_HOST`, `RECEIPT_API_TIMEOUT_MS` | `receipt-adapter` | `0.0.0.0`, `10000` | Адрес прослушивания внутри сети Compose и бюджет ожидания API; порт `8082` закреплён в `compose.yaml` |
+| `COURSE_PROVIDER_TIMEOUT_MS` | оба dispatcher | `500` | Бюджет одной попытки целиком, включая разрешение имени. Не может пережить аренду доставки: действует `min(значение, COURSE_OUTBOX_LEASE_MS − 500 мс)` |
+| `COURSE_OUTBOX_POLL_MS` / `COURSE_INBOX_POLL_MS` | dispatcher / reconciler | `100` / `500` | Интервал опроса; при `COURSE_TEST_PROFILE=1` не больше этих значений, сколько бы ни было задано |
+| `COURSE_OUTBOX_MAX_ATTEMPTS` | `postgres`, оба dispatcher | `4` | Бюджет попыток одной доставки вместе с первой. Решение принимает PostgreSQL; dispatcher публикует значение метрикой |
+| `COURSE_OUTBOX_BACKOFF_BASE_MS` / `_MAX_MS` / `COURSE_OUTBOX_JITTER_MAX_MS` | `postgres` | `200` / `800` / `100` | Экспонента `least(base × 2^(n−1), max)` плюс равномерный jitter |
+| `COURSE_OUTBOX_LEASE_MS` | `postgres`, оба dispatcher | `2000` | Срок аренды доставки. Решает PostgreSQL; dispatcher по нему же ограничивает бюджет попытки и публикует значение метрикой |
+| `COURSE_JOB_LEASE_MS` | `postgres`, `worker-*` | `2000` | Нижняя граница срока аренды задания. Исполнитель передаёт её в `workflow.claim_jobs`; настройка базы — значение по умолчанию для не переданного срока |
+| `COURSE_AUTOCHECK_PASSWORD` | `postgres` | нет default | Пароль роли наблюдателя `autocheck_reader`. Без него роль создаётся без пароля, и войти под ней по сети нельзя |
+| `RECEIPT_ADAPTER_HOST`, `RECEIPT_ADAPTER_PORT`, `RECEIPT_API_TIMEOUT_MS` | `receipt-adapter` | `0.0.0.0`, `8082`, `10000` | Адрес и порт внутри сети Compose, бюджет ожидания API |
 | `INBOX_BATCH_SIZE` | `inbox-reconciler` | `50` | Сколько сообщений Inbox согласуется одним вызовом `delivery.reconcile_inbox` (1–100) |
 | `COURSE_POSTGRES_STATEMENT_TIMEOUT_MS` | dispatcher, reconciler | `10000` | Потолок одного вызова SQL-границы: ожидание блокировки заканчивается ошибкой и переподключением, а не зависанием |
 | `COURSE_OUTBOX_PASSWORD`, `COURSE_INBOX_PASSWORD` | `postgres`, dispatcher / reconciler | local-only значения | Пароли ролей `outbox_dispatcher` и `inbox_reconciler` |
@@ -224,15 +296,22 @@ docker compose down -v
 | `COURSE_OPERATOR_USER` / `_PASSWORD` | `cli` | `course_operator` | Роль операций: запуск, сигналы, чтение процессов и проба fencing; публиковать не может. Тоже обязательна |
 | `COURSE_POSTGRES_USER` / `_PASSWORD` | `worker-*` | `workflow_worker` | Роль исполнителя: `EXECUTE` ровно на четыре функции-границы |
 | `COURSE_WORKER_ID` | `worker-*` | `worker-a` / `worker-b` | Идентификатор арендатора; он же `instanceId` в структурных событиях |
-| `COURSE_TEST_PROFILE` | `api`, `cli`, `worker-*` | `0` | `1` включает короткую аренду, частый опрос, failpoints и `flow test-finish` |
-| `COURSE_FAILPOINT` | `worker-*` | пусто | `after_job_claim` или `after_action_before_finish` |
-| `COURSE_WORKER_LEASE_MS` / `COURSE_WORKER_POLL_MS` | `worker-*` | профиль | Явное переопределение срока аренды и интервала опроса |
+| `COURSE_TEST_PROFILE` | `gateway`, `api`, `cli`, `worker-*`, Python-сервисы | `0` | `1` включает закрытый профиль проверки: failpoints, `flow test-finish` и верхние границы интервалов опроса dispatcher и reconciler. `scripts/dev_env.py` и проверка задают `1` |
+| `COURSE_FAILPOINT` | `api`, `worker-*`, dispatcher, reconciler | пусто | Одна точка аварийной остановки закрытого профиля (см. «Надёжность и восстановление»). Имя, не принадлежащее процессу, он игнорирует |
+| `COURSE_WORKER_POLL_MS` | `worker-*` | `100` | Интервал опроса очереди заданий |
 | `COURSE_MIGRATOR_PASSWORD`, `COURSE_PUBLISHER_PASSWORD`, `COURSE_RUNTIME_PASSWORD`, `COURSE_OPERATOR_PASSWORD`, `COURSE_WORKER_PASSWORD`, `COURSE_POSTGRES_PASSWORD` | `postgres` | локальные значения | Пароли ролей при инициализации кластера |
 | `COURSE_BOOTSTRAP_MIGRATIONS` / `_ACTIONS` / `_FLOWS` | `cli` | `/app/db/...` | Источники стартовой инициализации |
 | `COURSE_GATEWAY_UPSTREAM_TIMEOUT` | `gateway` | `35` секунд | Бюджет ожидания `api`; заведомо больше контрактного потолка `timeout_ms` (30 с) |
 | `COURSE_MAX_RESULT_BYTES` | `api`, `worker-*` | `524288` | Верхняя граница конверта действия до его разбора |
 | `COURSE_GATEWAY_MAX_RESPONSE_BYTES` | `gateway` | `2097152` | Верхняя граница ответа, который шлюз пересылает клиенту; заведомо больше `COURSE_MAX_RESULT_BYTES`. Превышение даёт контрактный `action.contract_violation`, а если часть тела уже ушла — обрыв соединения, но никогда не молча усечённый ответ |
 | `COURSE_DISPATCH_QUEUE_CAPACITY` | `api` | `2048` | Глубина очереди технических следов вызовов |
+
+Служебные порты наблюдаемости закреплены контрактом (`8080`, у adapter `8082`), поэтому в
+`compose.yaml` они не настраиваются и в таблицу не входят. Вне Compose процессы читают
+`COURSE_DISPATCHER_HEALTH_PORT`, `COURSE_RECONCILER_HEALTH_PORT` и `COURSE_WORKER_HEALTH_PORT`
+(по умолчанию `8080`). Там же действуют собственные умолчания процессов для не заданных времён:
+вне test profile — аренда 30 с, бюджет попытки 5 с, опрос раз в секунду; в test profile — аренда
+2 с, бюджет попытки 500 мс, опрос не реже раза в 100 мс (reconciler — в 500 мс).
 
 Роли PostgreSQL создаются один раз при инициализации кластера
 ([`db/init/00-roles.sh`](db/init/00-roles.sh)):
@@ -254,7 +333,14 @@ docker compose down -v
   `delivery.succeed_outbox`, `delivery.fail_outbox`; ни одного права на таблицы и views, `CREATE`
   на схемы и базу, членства в ролях, `api.invoke` или workflow-функций;
 - `inbox_reconciler` — роль Python-согласователя: `EXECUTE` ровно на `delivery.reconcile_inbox`
-  и те же запреты. У `receipt-adapter` учётных данных PostgreSQL нет вовсе.
+  и те же запреты. У `receipt-adapter` учётных данных PostgreSQL нет вовсе;
+- `autocheck_reader` — роль наблюдателя: `CONNECT` к базе, `USAGE` на схему `autocheck` и `SELECT`
+  на её представления. Ни членства в ролях, ни прав на физические отношения, функции приложения и
+  последовательности, ни `CREATE`, ни `TEMP`.
+
+Probe готовности Python-процессов и worker не расширяет ни одну из этих ролей: он идёт под тем же
+принципалом, что и рабочий цикл, и посылает `SELECT 1`, а не границу доставки. Роль с `EXECUTE` на
+одной функции остаётся ролью с `EXECUTE` на одной функции.
 
 ### Миграции
 
@@ -390,8 +476,9 @@ claim_jobs(owner)                     короткая транзакция; lea
 | `leaseVersion` | Возрастающая версия права на завершение |
 
 Срок аренды не берётся из конфигурации вслепую, но и не отдаётся карте целиком: `claim_jobs`
-выдаёт `max(настроенный срок, min(timeout_ms, 30 с) + 500 мс)`. Настроенный профилем срок (2 с в
-test profile, 30 с в обычном) — нижняя граница для коротких действий; для длинных аренда покрывает
+выдаёт `max(настроенный срок, min(timeout_ms, 30 с) + 500 мс)`. Настроенный срок
+`COURSE_JOB_LEASE_MS` (2 с в опубликованном test profile, он же значение `compose.yaml` по
+умолчанию) — нижняя граница для коротких действий; для длинных аренда покрывает
 объявленный бюджет шага целиком, поэтому живого исполнителя нельзя перехватить на середине
 работы. Потолок — контрактный максимум бюджета шага плюс запас: карта не может отодвинуть перехват
 дальше 30,5 с. Прежний потолок «настроенный срок × 3» (6 с в test profile) делал любой шаг длиннее
@@ -424,10 +511,13 @@ test profile, 30 с в обычном) — нижняя граница для к
 повторяются. Истёкшая аренда оставляет попытку `STALE`, увеличивает `attempt_count`, но не
 расходует бюджет отказов.
 
-Test profile (`COURSE_TEST_PROFILE=1`): аренда 2 секунды, опрос 50 мс, доступны два failpoint.
-Признак профиля записывается командой `bootstrap` в саму базу (`workflow.runtime_setting`), и
-проба `flow test-finish` проверяется по нему: обход арендатора — вопрос прав в базе, а не
-переменной окружения того, кто запустил клиент.
+Test profile: аренда `COURSE_JOB_LEASE_MS` = 2 секунды и опрос `COURSE_WORKER_POLL_MS` = 100 мс
+(значения `compose.yaml` по умолчанию), а при `COURSE_TEST_PROFILE=1` доступны ещё и два
+failpoint. Признак профиля записывается командой
+`bootstrap` в саму базу (`workflow.runtime_setting`), и проба `flow test-finish` проверяется по
+нему: обход арендатора — вопрос прав в базе, а не переменной окружения того, кто запустил клиент.
+Тот же срок аренды приходит и в сам PostgreSQL настройкой базы: не переданный `p_lease_ms`
+заполняется из неё, поэтому `claim_jobs` не зависит от константы внутри функции.
 При достижении failpoint исполнитель печатает ровно одну структурную строку и блокируется:
 
 ```json
@@ -438,6 +528,13 @@ Test profile (`COURSE_TEST_PROFILE=1`): аренда 2 секунды, опро�
 |---|---|
 | `after_job_claim` | После commit аренды и попытки, до `api.invoke` |
 | `after_action_before_finish` | После эффекта и проверки контракта внутри транзакции, до `finish_job` |
+
+У исполнителя нет ни одного HTTP-обработчика предметных запросов, но есть служебный адрес
+наблюдаемости на внутреннем порту `8080`:
+[`ObservabilityEndpoint`](src/Course.Workflow.Worker/ObservabilityEndpoint.cs) — сокет на три
+фиксированных GET-ответа, а не веб-фреймворк. Готовность проверяет PostgreSQL отдельным коротким
+соединением под той же ролью; собственные метрики отвечают на вопрос «сколько работы прошло через
+ЭТОТ экземпляр» и не дублируют длину общей очереди, которую публикует `api`.
 
 ### Платёжные процессы
 
@@ -493,15 +590,22 @@ payment-review v1
 ### Python-периметр
 
 Один пакет [`integration/course_integration`](integration/course_integration), один локально
-собранный образ ([`docker/integration.Dockerfile`](docker/integration.Dockerfile), Python 3.12) и три
-entrypoint: главный процесс контейнера — сам интерпретатор (`python -m course_integration
-<entrypoint>`), без shell-обёртки, поэтому он получает SIGTERM и останавливается сразу.
+собранный образ ([`docker/integration.Dockerfile`](docker/integration.Dockerfile), Python 3.12),
+три entrypoint и пять сервисов: главный процесс контейнера — сам интерпретатор
+(`python -m course_integration <entrypoint>`), без shell-обёртки, поэтому он получает SIGTERM и
+останавливается сразу.
 
 | Процесс | Вход | Выход | Граница | Не делает |
 |---|---|---|---|---|
-| `outbox-dispatcher` | `delivery.claim_outbox` | `POST /payments` | роль `outbox_dispatcher`, три функции | не читает таблицы, не вызывает `api.invoke`, не решает о повторе |
+| `outbox-dispatcher`, `outbox-dispatcher-b` | `delivery.claim_outbox` | `POST /payments` | роль `outbox_dispatcher`, три функции, разные owner | не читают таблицы, не вызывают `api.invoke`, не решают о повторе |
 | `receipt-adapter` | legacy callback | signed receipt v1 → gateway | JWT `receipt-provider`, HMAC | не подключается к PostgreSQL, не хранит состояние, не повторяет вызов API |
-| `inbox-reconciler` | `delivery.reconcile_inbox` | persisted workflow signal | роль `inbox_reconciler`, одна функция | не исполняет flow, не выбирает переход |
+| `inbox-reconciler`, `inbox-reconciler-b` | `delivery.reconcile_inbox` | persisted workflow signal | роль `inbox_reconciler`, одна функция | не исполняют flow, не выбирают переход, не согласуют себя между собой |
+
+Вторые экземпляры не получают ни нового образа, ни отдельного хранилища, ни дополнительных прав в
+базе. Единственное отличие `outbox-dispatcher-b` — собственный `OUTBOX_OWNER`: один и тот же
+владелец у двух арендаторов сделал бы fencing бессмысленным, потому что чужой отчёт прошёл бы
+проверку owner/`leaseVersion` как свой. Два reconciler не отличаются ничем: конкуренцию разбирает
+`FOR UPDATE SKIP LOCKED` внутри самой границы согласования.
 
 Сквозные идентификаторы:
 
@@ -524,13 +628,38 @@ requestId → operationId → processId → jobId → executionId
 | прочий статус, включая `200` и `3xx` | `fail_outbox(..., 'http.<status>.terminal')` |
 | `202` с некорректным UTF-8/JSON/телом | `fail_outbox(..., 'response.invalid.terminal')` |
 
-Состояние, `next_attempt_at` и предел попыток определяет PostgreSQL (`delivery.delivery_policy`: в
-test profile четыре попытки, включая первую, с задержками 200/400/800 мс между ними и арендой
-3 с; в обычном профиле — пять попыток и 1/5/15/60 с). Задержек ровно на одну меньше, чем попыток,
-и это ограничение таблицы: список из N задержек означает N + 1 попыток, а не N. Каждый отказ
-пишется в журнал dispatcher'а событием `outbox.attempt` с решением базы — `state` и
-`nextAttemptInMs`. Если база пропала между HTTP и отчётом, аренда истекает и следующий claim
-повторяет те же ключ и тело — provider дедуплицирует.
+Состояние, `next_attempt_at` и предел попыток определяет PostgreSQL по действующему профилю: в
+test profile — 4 попытки вместе с первой, экспонента 200/400/800 мс плюс jitter 0…100 мс, аренда
+доставки 2 с. Значения приходят настройками самой базы из окружения сервиса `postgres`
+([ADR 0007](docs/adr/0007-delivery-policy-in-the-database.md)) и читаются из каталога базы, а не
+из сессии: `SET course.outbox_max_attempts` в сессии dispatcher'а политику не меняет. Dispatcher
+их не решает, а только публикует метрикой, чтобы действующий профиль был виден на служебном
+адресе. Каждый отказ пишется в журнал
+dispatcher'а событием `outbox.attempt` с решением базы — `state` и `nextAttemptInMs` (уже с jitter),
+поэтому расписание одной доставки читается из журнала попытка за попыткой. Если база пропала
+между HTTP и отчётом, аренда истекает и следующий claim повторяет те же ключ и тело — provider
+дедуплицирует.
+
+Отчёт принимается только условным обновлением по паре «owner + `leaseVersion`». Опоздавший отчёт
+получает `delivery.lease_stale` и не меняет результат нового владельца; доставка остаётся
+арендованной до истечения срока, поэтому такой отказ виден и в журнале, и в счётчике
+`outbox_delivery_reports_refused_total`.
+
+`COURSE_PROVIDER_TIMEOUT_MS` — бюджет **всей** попытки, включая разрешение имени. Socket timeout
+покрывает connect и read, но `getaddrinfo` не покрывает: на Docker-host отсутствующее имя
+provider стоит секунды при объявленном бюджете в 500 мс, и такая попытка переживает двухсекундную
+аренду доставки — её отчёт потом отклоняется fencing'ом, то есть попытка тратится дважды. Поэтому
+попытка выполняется на отдельном потоке и бросается по истечении бюджета
+([ADR 0007](docs/adr/0007-delivery-policy-in-the-database.md)).
+
+По той же причине бюджет попытки не может быть длиннее аренды. Срок аренды знает PostgreSQL, а
+таймаут provider — только dispatcher, поэтому согласует их dispatcher: действует
+`min(COURSE_PROVIDER_TIMEOUT_MS, COURSE_OUTBOX_LEASE_MS − 500 мс)`, где 500 мс — место для отчёта
+(у аренды короче секунды — её половина). В опубликованном профиле это ничего не меняет (500 мс при
+аренде 2 с), а таймаут 5 с при той же аренде стал бы 1,5 с: иначе медленный provider перехватывался
+бы на середине попытки, каждый отчёт отклонялся бы как устаревший, и доставка уходила бы в `DEAD`
+без единой паузы между попытками. Урезанный бюджет виден в записи `dispatcher.configured`
+(`providerTimeoutLimitedByLease`).
 
 **Adapter.** `POST /callbacks/provider-v02/{capability}` на внутреннем порту `8082`:
 
@@ -568,8 +697,16 @@ receipt, Outbox и `external_request` → `CONFIRMED`. Тот же `messageId` �
 сам вход процесса в `wait_signal`. Подробности и порядок блокировок — в
 [ADR 0006](docs/adr/0006-durable-outbox-and-inbox.md).
 
-Логи всех трёх процессов — структурные JSON-строки: идентификаторы, статусы, коды, классы ошибок.
+Логи всех пяти процессов — структурные JSON-строки: идентификаторы, статусы, коды, классы ошибок.
 Callback `message`, тела, токены, подписи, capability и тексты ошибок драйвера туда не попадают.
+
+Наблюдаемость периметра — общий модуль
+[`observability.py`](integration/course_integration/observability.py). Dispatcher и reconciler
+поднимают служебный адрес на порту `8080`, adapter отвечает на те же три пути на своём порту
+`8082`. Probe готовности идёт отдельным соединением (у dispatcher — чтобы запрос во время
+provider-таймаута не занимал соединение, на котором вот-вот будет отчёт; у reconciler — чтобы не
+ждать за блокировками одного батча) и посылает `SELECT 1`, не расширяя роль. Служебный порт
+отвечает только на GET трёх известных путей: активировать через него точку остановки нельзя.
 
 ### Provider
 
@@ -599,10 +736,190 @@ recreate — это свойство внешнего компонента, а �
 PROVIDER_SIMULATOR_MODE=lost-response docker compose up -d --no-deps provider-simulator
 ```
 
+### Надёжность и восстановление
+
+Граница, durable-факт и владелец восстановления — одной таблицей. Ни одна строка не требует
+ручного SQL: восстановление выполняют обычные loops по состоянию PostgreSQL.
+
+| Граница | Durable-факт до сбоя | Кто восстанавливает |
+|---|---|---|
+| После захвата задания | аренда с `leaseVersion` | любой worker после истечения `COURSE_JOB_LEASE_MS`, `leaseVersion` растёт |
+| После действия, до `finish_job` | ничего: транзакция откатывается | тот же job, следующая попытка с прежним `executionId` |
+| После захвата доставки | аренда доставки в Outbox | любой dispatcher после истечения `COURSE_OUTBOX_LEASE_MS`, тело и ключ те же |
+| После ответа provider | внешний эффект возможен | повтор с тем же `externalRequestId`; provider дедуплицирует |
+| После commit Inbox | строка `delivery.inbox` в `RECEIVED` | любой reconciler через `delivery.reconcile_inbox` |
+| После ручного решения, до commit | ничего: транзакция откатывается | повтор команды с тем же `Idempotency-Key` создаёт ровно одно решение |
+
+Идентичность повторов:
+
+```text
+jobId              стабилен для логического задания
+executionId        стабилен для предметного эффекта (он же requestId идемпотентности действия)
+attemptId          новый на каждую попытку
+leaseVersion       растёт при каждом захвате и перезахвате
+externalRequestId  стабилен для всех попыток доставки
+outboxId           стабилен для одной доставки
+```
+
+HTTP к provider выполняется ВНЕ транзакции захвата, а результат принимается только условным
+обновлением по паре «владелец + версия аренды»: просроченная попытка не может перезаписать
+результат нового владельца (`delivery.lease_stale`).
+
+`DEAD` — технический исход доставки, а не операции. Он не переводит операцию в `REJECTED`, а
+ожидающий квитанцию процесс — в `FAILED`: provider мог принять запрос и потерять ответ. Диагностика
+исчерпания хранится в Outbox (`state = DEAD`, `dead_at`, `last_error_code`, сохранённый
+`attempt_count`), а поздняя валидная квитанция переводит доставку `DEAD → CONFIRMED` и продолжает
+процесс, не стирая эту диагностику ([ADR 0007](docs/adr/0007-delivery-policy-in-the-database.md)).
+
+Точки аварийной остановки закрытого профиля. Они включаются только при `COURSE_TEST_PROFILE=1` и
+только переменной окружения процесса — публичного способа их активировать нет:
+
+| `COURSE_FAILPOINT` | Сервис | Граница |
+|---|---|---|
+| `after_job_claim` | `worker-a` | после commit аренды, до действия |
+| `after_action_before_finish` | `worker-a` | после эффекта и проверки контракта, внутри транзакции, до `finish_job` |
+| `after_outbox_claim` | `outbox-dispatcher` | после commit захвата, до HTTP |
+| `after_provider_response` | `outbox-dispatcher` | после ответа provider, до условного завершения доставки |
+| `after_inbox_saved` | `api` | после commit Inbox, квитанции и результата идемпотентности, до HTTP-ответа |
+| `after_manual_decision` | `api` | после `workflow.manual` и проверки результата, до commit общей транзакции |
+
+Достигнув точки, компонент печатает ровно одну строку и блокируется до принудительной остановки:
+
+```json
+{"event":"failpoint.reached","name":"after_outbox_claim","instanceId":"outbox-dispatcher"}
+```
+
+Ручной прогон одной точки (на примере доставки; конкурирующий экземпляр гасится заранее, чтобы
+работу получил целевой):
+
+```bash
+docker compose stop outbox-dispatcher-b
+COURSE_FAILPOINT=after_outbox_claim docker compose up -d --no-deps outbox-dispatcher
+docker compose logs -f outbox-dispatcher | grep failpoint.reached   # ждём подтверждение
+docker compose kill outbox-dispatcher
+docker compose up -d --no-deps outbox-dispatcher outbox-dispatcher-b   # уже без failpoint
+```
+
+### Наблюдаемость и runbook
+
+Служебные адреса — `GET /health/live`, `GET /health/ready`, `GET /metrics` — есть у `api`, обоих
+worker, обоих dispatcher, обоих reconciler (порт `8080`) и у `receipt-adapter` (порт `8082`).
+Наружу они не публикуются.
+
+`api` публикует шесть обязательных серий как согласованную проекцию PostgreSQL: их считает функция
+`api.runtime_metrics()` по тем же таблицам, из которых построены представления `autocheck`, поэтому
+метрика и очередь расходиться не могут ([ADR 0008](docs/adr/0008-observability-from-saved-facts.md)):
+
+| Метрика | Тип | Значение |
+|---|---|---|
+| `workflow_jobs_ready` | gauge | Задания, доступные для захвата сейчас — то же условие, по которому кандидатов выбирает `claim_jobs`: `READY` и `RETRY_WAIT`, чьё время пришло, и `LEASED` с истёкшей арендой |
+| `workflow_job_oldest_age_seconds` | gauge | Возраст старейшего доступного задания: от `next_attempt_at`, а у брошенного задания — от истечения аренды; `0`, если таких нет |
+| `workflow_processes_waiting` | gauge | Процессы в `WAITING_SIGNAL` и `WAITING_MANUAL` |
+| `outbox_pending` | gauge | Доставки в `PENDING`, `LEASED`, `RETRY_WAIT` |
+| `outbox_oldest_age_seconds` | gauge | Возраст старейшей неотправленной доставки |
+| `workflow_failures_total` | counter | Зафиксированные terminal-отказы процессов |
+
+Серии публикуются без labels вообще: единственный надёжный способ не поместить UUID в label — не
+иметь labels.
+
+Журнал всех процессов — одна запись одной строкой JSON. Идентификаторы передаются полями, а не
+вклеиваются в текст сообщения, поэтому путь операции находится фильтром по `correlationId`, а не
+разбором строки. Каждая запись worker'а о попытке шага (`attempt.*`) несёт один и тот же минимум:
+`processId`, `flowName`, `flowVersion`, `stepKey`, `jobId`, `executionId`, `attemptId`,
+`attemptNumber`, `leaseVersion`, `action`, `actionVersion` — плюс `correlationId` вызова, `outcome`
+либо `errorCode` и `durationMs`; dispatcher пишет `outbox.attempt` с `outboxId`,
+`externalRequestId`, `correlationId`, `leaseVersion`, статусом HTTP, кодом и решением базы:
+
+```bash
+docker compose logs --no-color api | grep -o '{.*}' \
+  | python3 -c 'import json,sys; [print(r.get("event") or r.get("message"), r.get("correlationId")) \
+      for r in map(json.loads, sys.stdin)]'
+```
+
+JWT, HMAC-секрет и подпись, пароли, полные тела, текст provider `message` и причина ручного
+решения в журнал не попадают: от исключения остаётся только класс сбоя и SQLSTATE.
+
+```bash
+# метрики api и любого другого процесса
+docker compose exec -T outbox-dispatcher python -c \
+  'import urllib.request;print(urllib.request.urlopen("http://api:8080/metrics").read().decode())'
+```
+
+`diagnostics.trace` — обычное действие generic-маршрута. Оно требует policy `diagnostics:read`,
+не требует `Idempotency-Key` и принимает любой сквозной идентификатор: `correlationId`,
+`requestId`, `operationId`, `processId`, `stepInstanceId`, `jobId`, `executionId`, `attemptId`,
+`externalRequestId`, `messageId`, `decisionId`.
+
+```bash
+OBS=$(python3 -c 'import os,sys; sys.path.insert(0,"scripts"); from dev_env import issue_token; \
+  print(issue_token(os.environ["COURSE_JWT_SIGNING_KEY"],"observer","ops",["diagnostics:read"],3600))')
+
+# путь операции целиком: dispatch, операция и её события, процесс, шаги, задания, попытки,
+# Outbox с признаками исчерпания, Inbox, квитанции и аудит решений
+curl -s http://localhost:8080/api/diagnostics/trace -H "Authorization: Bearer $OBS" \
+  -H 'Content-Type: application/json' -d "{\"identifier\":\"$OP\"}" | python3 -m json.tool
+
+# тот же результат по любому другому концу цепочки
+curl -s http://localhost:8080/api/diagnostics/trace -H "Authorization: Bearer $OBS" \
+  -H 'Content-Type: application/json' -d '{"identifier":"ext-<executionId>"}' | python3 -m json.tool
+
+# что именно совпало и полный ли путь собрался
+... | python3 -c 'import json,sys; t=json.load(sys.stdin)["result"]; \
+  print(t["query"]["matchedBy"], t["operation"]["status"], [o["state"] for o in t["outbox"]])'
+```
+
+Неизвестный идентификатор — `404` с кодом `diagnostics.trace_not_found`. Trace не содержит JWT,
+подписи, секретов, полных тел, текста provider `message` и причины ручного решения — только
+отпечатки и состояния.
+
+`diagnostics.stalled` отвечает на операционный вопрос «по каким операциям автоматические попытки
+доставки исчерпаны, а предметный результат до сих пор не решён». Payload — пустой объект,
+результат — `{"items":[...]}` с `operationId`, `processId` и `externalRequestId`, упорядоченный по
+`operationId`; пустая выборка — `{"items":[]}`:
+
+```bash
+curl -s http://localhost:8080/api/diagnostics/stalled -H "Authorization: Bearer $OBS" \
+  -H 'Content-Type: application/json' -d '{}' | python3 -m json.tool
+
+# каждую найденную операцию разбирают через trace по её externalRequestId
+curl -s http://localhost:8080/api/diagnostics/stalled -H "Authorization: Bearer $OBS" \
+  -H 'Content-Type: application/json' -d '{}' \
+  | python3 -c 'import json,sys; [print(i["externalRequestId"]) for i in json.load(sys.stdin)["result"]["items"]]'
+```
+
+Действие ничего не меняет: оно не создаёт заданий, не запускает доставку и не трогает предметное
+состояние. Обычный access log и audit действия при этом пополняются — это единственный его след.
+
+Чтение проверочных проекций глазами наблюдателя. Пароль роли — `COURSE_AUTOCHECK_PASSWORD` из
+окружения того запуска, который инициализировал том (`scripts/dev_env.py` его генерирует); по сети
+Compose вход возможен только с ним, внутри контейнера `postgres` локальный сокет доверенный:
+
+```bash
+docker compose exec -T -e PGPASSWORD="$COURSE_AUTOCHECK_PASSWORD" postgres \
+  psql -U autocheck_reader -d course -c \
+  "SELECT external_request_id, state, attempt_count, last_error_code, dead_at FROM autocheck.outbox ORDER BY created_at DESC LIMIT 5"
+```
+
 ### Проверка
 
-Открытая black-box проверка недели 3 живёт в отдельном репозитории задания и получает решение
-явно; её `check.sh` не копируется поверх скриптов прежних недель:
+Одна команда полной проверки недели 4. Репозиторий задания остаётся отдельным клоном, его
+`check.sh` не копируется поверх скриптов прежних недель:
+
+```bash
+git clone https://github.com/fintech-dev-lab/moduledev-week-4-reliability-task.git
+./moduledev-week-4-reliability-task/check.sh --repo /path/to/this/repository
+```
+
+Требуется Python 3.11+, клиент `psql`, Docker Engine и Docker Compose v2 с поддержкой
+`!override`, `!reset` и `config --no-env-resolution`. Checker поднимает изолированный проект с
+synthetic secrets, выполняет cold build и regression недели 3, проверяет два dispatcher и два
+reconciler из одного Python-образа, гасит provider и проверяет durable retry с автоматическим
+продолжением, читает health и OpenMetrics всех восьми процессов, пересоздаёт Compose project без
+удаления тома PostgreSQL, проверяет `diagnostics.trace` по нескольким идентификаторам и контракт
+`diagnostics.stalled`, затем пишет `week-4-public-report.json` (файл не хранится в Git). Exit code
+`0` — все проверки пройдены, `1` — нарушен контракт решения, `2` — не готово окружение.
+
+Проверка недели 3 запускается тем же способом из своего клона:
 
 ```bash
 git clone https://github.com/fintech-dev-lab/moduledev-week-3-python-perimeter-task.git
@@ -644,7 +961,9 @@ Schema с обязательной проверкой `format`, матрица �
 RFC 6901, согласование срока аренды с бюджетом границы завершения (включая разбор `leaseUntil` в
 том виде, в каком его отдаёт PostgreSQL), на опубликованных fixtures проверки — приём валидных
 карт и отклонение каждой заведомо испорченной, копирование с жёсткой границей, которым шлюз
-пересылает ответ, и бит исполнения скриптов, которые README предлагает запускать напрямую.
+пересылает ответ, бит исполнения скриптов, которые README предлагает запускать напрямую, проводку
+каждой переменной таблицы конфигурации этого README в `compose.yaml` или образ и отсутствие в
+`compose.yaml` значений по умолчанию там, где контракт конфигурации их не разрешает.
 
 ```bash
 dotnet test src/Course.sln
@@ -659,6 +978,13 @@ dotnet test src/Course.sln
 запрет unknown fields, версий и CR/LF), описания подписи в OpenAPI и классификации отказов
 PostgreSQL (deadlock и serialization failure — повторяемый `503`).
 
+Неделя 4 добавляет unit-тесты контракта наблюдаемости: документ OpenMetrics (завершающий `# EOF`,
+только LF, объявление counter по имени семейства без суффикса `_total`, число без разделителя из
+локали и без экспоненты, отсутствие labels), статус `404` у `diagnostics.trace_not_found` и
+поведение барьера подтверждения — вне тестового профиля точки остановки нет вовсе, а в профиле она
+печатает ровно одну строку заданной формы, не возвращает управление и срабатывает только на
+объявленной границе объявленного действия.
+
 Python unit/contract-тесты периметра — только стандартная библиотека, без Docker и без драйвера
 PostgreSQL:
 
@@ -671,6 +997,16 @@ cd integration && python3 -m unittest discover -s tests -t .
 живом локальном HTTP-сервере: redirect не выполняется, timeout и refused — retryable), неизменность
 ключа и тела между повторами, ответы adapter `404/400/passthrough/503`, отсутствие секретов и
 текста callback в журнале и отказ конфигурации без секретов и URL.
+
+Неделя 4 добавляет контракт служебных адресов на живом сокете: `live` не зависит от зависимости,
+`ready` отражает её и отвечает `503` с кодом `dependency.unavailable`, `/metrics` отдаёт корректный
+документ OpenMetrics нужного media type, неизвестный путь и любой метод, меняющий состояние, дают
+`404` — включая попытку активировать failpoint через служебный порт. Отдельно проверяются
+кеширование probe, отсутствие текста ошибки зависимости в журнале и счётчики доставки, среди них
+отказ отчёта по устаревшей аренде. Бюджет попытки закреплён на границах: он не переживает аренду
+доставки при любом сочетании таймаута и аренды (в том числе равных), а опубликованный профиль
+остаётся нетронутым; экземпляр dispatcher'а называется своим владельцем аренды, а не именем
+контейнера.
 
 End-to-end сценарии недели 3 на поднятом стеке —
 [`scripts/e2e_perimeter.py`](scripts/e2e_perimeter.py): durable Outbox при остановленном dispatcher,
@@ -689,12 +1025,56 @@ receipts, decisions, flow binding и жизненного цикла опера�
 (`PROCESSING` / `WAITING_SIGNAL`) и подтверждение поздней квитанцией; provider, вернувшийся после
 трёх отказов, получает четвёртую попытку — один платёж с исходным ключом.
 
+Неделя 4 добавляет десять сценариев к тому же набору:
+
+- failpoint `after_provider_response`: provider принял платёж, dispatcher убит до отчёта —
+  доставку завершает квитанция либо повтор другого арендатора под тем же ключом, и у provider
+  остаётся ровно один платёж;
+- failpoint `after_job_claim`: worker убит сразу после захвата — задание остаётся арендованным без
+  единого эффекта, затем перехватывается с `leaseVersion = 2` при прежнем `executionId`, попытки —
+  `STALE` и `SUCCEEDED`, решение правила лимита одно;
+- fencing доставки на самих границах `delivery.*`: после перехвата истёкшей аренды отчёт прежнего
+  арендатора — успешный или об отказе, с любой комбинацией «не тот владелец / не та версия» —
+  получает `delivery.lease_stale` и ничего не меняет; отчёт действующего владельца о втором отказе
+  даёт вторую задержку опубликованной лестницы (400 мс плюс jitter), а повторить его уже нельзя;
+- неизвестный исход у настоящего simulator: режимы `lost-response` и `transient-error` — попыток
+  может быть больше одной, платёж, квитанция и завершение операции ровно одни;
+
+- health, readiness и корректный документ OpenMetrics у всех восьми процессов; совпадение
+  `outbox_pending` с очередью при остановленных dispatcher; недоступность provider не делает
+  `not ready` ни api, ни worker, ни dispatcher, а восстановление даёт `paymentCount = 1`;
+- очередь заданий при остановленных worker'ах: `workflow_jobs_ready` равен числу заданий,
+  доступных для захвата, и до, и после того, как «исполнитель» захватил задание и исчез —
+  брошенное задание с истёкшей арендой считается доступным и имеет возраст; затем настоящий worker
+  перехватывает его (`STALE`, потом `SUCCEEDED` с `leaseVersion = 2`), и операция завершается;
+- исчерпание доставки при выключенном provider: `DEAD` с сохранёнными `attempt_count`, `dead_at` и
+  кодом отказа, операция при этом остаётся `PROCESSING`, процесс — `WAITING_SIGNAL`, операция
+  попадает в `diagnostics.stalled`, а поздняя валидная квитанция переводит доставку в `CONFIRMED`,
+  не стирая след исчерпания, и убирает операцию из выборки;
+- `diagnostics.trace` по каждому из одиннадцати опубликованных видов идентификатора (список
+  берётся из схемы результата, поэтому непокрытый вид — это падение сценария) возвращает один и
+  тот же набор предметных фактов, отличается только `query`. `requestId` и `correlationId`
+  проверяются для каждого рода вызова цепочки: команда, создавшая операцию, submit, ручное
+  решение, квитанция и действие, вызванное исполнителем. Цепочек две — платёж с квитанцией и
+  review с аудированным решением. Неизвестный идентификатор — `404`, вызов без policy — `403`, а
+  в ответе нет ни секретов, ни текста сообщений, ни причины решения;
+- оба failpoint api: сохранённый Inbox переживает смерть процесса и применяется обычным
+  согласователем, а незавершённое ручное решение откатывается целиком и повтор с тем же ключом
+  создаёт ровно одно решение;
+- роль наблюдателя: читает представления `autocheck` и не может ни `TABLE delivery.outbox`, ни
+  `api.invoke`, ни `delivery.reconcile_inbox`, ни `CREATE TABLE`.
+
+Сценарии, которым нужна неподвижная очередь, останавливают ОБА арендатора: оставленный работать
+второй экземпляр просто забирает доставку, и сценарий тихо перестаёт что-либо доказывать.
+
 Интеграционные тесты закрывают то, что без живого контура доказать нельзя: гонку версий между
 валидацией и исполнением, повтор по ключу идемпотентности через смену версии по умолчанию,
 отказ публикации версии с другой семантикой идемпотентности (и вставки её в обход публикации),
 конкурентные команды каталога и границы прав ролей, границу ответа шлюза на настоящем ответе api
 (контрактный отказ вместо усечённого тела), числа профиля доставки как утверждения (четыре попытки,
-три задержки, форма закреплена ограничением таблицы) и действие длиннее настроенного срока аренды
+экспонента 200/400/800 мс с jitter до 100 мс и аренда 2 с — из настроек базы, форма строки профиля
+закреплена ограничением таблицы, её лестница задержек совпадает с экспонентой у каждого профиля,
+а сессионный `SET course.outbox_*` действующую политику не меняет) и действие длиннее настроенного срока аренды
 под двумя живыми исполнителями (аренда покрывает бюджет шага, версия аренды не растёт, попыток
 `STALE` нет, эффект один), а для недели 2 — неизменяемость опубликованной
 версии карты, append-only историю, неизменяемость личности состояния (ключ идемпотентности,
@@ -753,13 +1133,19 @@ docker compose logs -f api
 docker compose logs cli
 docker compose logs worker-a worker-b
 
-# health
+docker compose logs -f outbox-dispatcher-b inbox-reconciler-b
+
+# health: live отвечает {"status":"live"}, ready — {"status":"ready"} либо 503
+# {"status":"not_ready","code":"dependency.unavailable"}
 curl -i http://localhost:8080/health/live     # процесс gateway
 curl -i http://localhost:8080/health/ready    # готовность api и PostgreSQL
 
 # OpenAPI: только включённые default-версии и точный документ одной версии
 curl -s http://localhost:8080/openapi/default.json | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)["paths"]))'
 curl -s http://localhost:8080/openapi/actions/payment/request/1.json | head -c 400
+# очереди по метрикам api, не по догадке
+docker compose exec -T outbox-dispatcher python -c \
+  'import urllib.request;print(urllib.request.urlopen("http://api:8080/metrics").read().decode())'
 
 # компактный снимок процесса
 ./course.sh flow get <process-id>
@@ -779,7 +1165,15 @@ docker compose exec -T postgres psql -U postgres -d course -c "SELECT request_id
 # Python-периметр: структурные JSON-логи
 docker compose logs -f outbox-dispatcher receipt-adapter inbox-reconciler provider-simulator
 
-# путь одного платежа по operationId
+# путь одного платежа целиком, одним действием и без SQL (см. «Наблюдаемость и runbook»)
+curl -s http://localhost:8080/api/diagnostics/trace -H "Authorization: Bearer $OBS" \
+  -H 'Content-Type: application/json' -d '{"identifier":"<operation-id>"}' | python3 -m json.tool
+
+# операции с исчерпанными попытками доставки и нерешённым результатом
+curl -s http://localhost:8080/api/diagnostics/stalled -H "Authorization: Bearer $OBS" \
+  -H 'Content-Type: application/json' -d '{}' | python3 -m json.tool
+
+# тот же путь напрямую из проверочных проекций
 docker compose exec -T postgres psql -U postgres -d course -c "
   SELECT o.status, e.external_request_id, e.state AS external_state, x.state AS outbox_state,
          x.attempt_count, x.last_error_code, x.next_attempt_at, r.message_id, r.outcome, i.state AS inbox_state
@@ -815,8 +1209,13 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
 | Действие отвечает `503 dependency.unavailable` c `retryable: true` и `details.sqlstate` `40P01`/`40001` | конфликт блокировок или сериализации в PostgreSQL; транзакция откатана целиком, ту же команду с тем же ключом можно повторить. Worker в этом случае планирует повтор, а не переводит процесс в `FAILED` |
 | `executionId` из `autocheck.jobs` | связывает задание, все его попытки, строку `autocheck.action_dispatches` и предметный эффект |
 | Operation `PROCESSING`, Outbox `PENDING` | dispatcher остановлен или не может подключиться: `docker compose logs outbox-dispatcher`, событие `outbox.cycle_failed` |
-| Outbox `RETRY_WAIT`, `last_error_code` = `transport.error.retryable` или `http.5xx.retryable` | provider недоступен или медленнее `PROVIDER_TIMEOUT_MS`; следующая попытка — `next_attempt_at` |
-| Outbox `DEAD` | исчерпаны попытки или terminal-ответ (`http.4xx.terminal`, `response.invalid.terminal`); процесс продолжает ждать квитанцию |
+| Outbox `RETRY_WAIT`, `last_error_code` = `transport.error.retryable` или `http.5xx.retryable` | provider недоступен или медленнее `COURSE_PROVIDER_TIMEOUT_MS`; следующая попытка — `next_attempt_at` |
+| Outbox `DEAD`, непустой `dead_at` | исчерпаны попытки или terminal-ответ (`http.4xx.terminal`, `response.invalid.terminal`). Операция остаётся `PROCESSING`, процесс — `WAITING_SIGNAL`: это технический исход доставки, а не отказ платежа. Такие операции перечисляет `diagnostics.stalled`, поздняя квитанция переведёт доставку в `CONFIRMED` |
+| Два dispatcher, а попыток больше числа платежей | так и должно быть: audit provider показывает `paymentCount = 1`, потому что `externalRequestId` и тело у всех попыток одни и те же |
+| `delivery.lease_stale` в журнале dispatcher | отчёт пришёл от прежнего владельца после перехвата аренды; доставку уже ведёт другой экземпляр |
+| `/metrics` у `api` отвечает `503` | PostgreSQL недоступен. Документ из нулей вместо снятого значения не отдаётся сознательно: по метрике принимают решения |
+| `diagnostics.trace` отвечает `404 diagnostics.trace_not_found` | идентификатор не встречается ни в одной сохранённой цепочке — опечатка либо чужой контур |
+| В журнале `api` строка `Cannot load library libgssapi_krb5.so.2` | сообщение нативного загрузчика Npgsql, а не запись приложения: Kerberos-аутентификация к PostgreSQL не используется, контур работает. Единственные строки во всём журнале, которые не являются JSON-объектами |
 | Outbox `CONFIRMED`, Inbox `RECEIVED` дольше секунды | reconciler остановлен или процесс ещё не дошёл до `wait_receipt`: `docker compose logs inbox-reconciler` |
 | Inbox `CONFLICT` | сообщение пришло после того, как процесс уже применил другую квитанцию или завершился |
 | Outbox `last_error_code = lease.expired.retryable` | прежний dispatcher захватил доставку и не отчитался (остановлен или потерял базу); попытка учтена в `attempt_count` |
@@ -830,20 +1229,28 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
 - Exactly-once не обещается. Доставка в provider и callback — at-least-once; один платёж и одно
   применение обеспечивают ключи: `Idempotency-Key = externalRequestId` у provider, глобальный
   `messageId` с hash тела в Inbox, `executionId` у шагов процесса.
-- Один dispatcher и один reconciler. Функции `delivery.*` уже безопасны при нескольких экземплярах
-  (`SKIP LOCKED`, owner + `lease_version`), но jitter, операционная работа с `DEAD`, health и
-  metrics периметра — неделя 4. `DEAD` Outbox не валит процесс: поздняя квитанция всё равно будет
-  принята и применена.
-- Числа политики доставки — строка профиля в `delivery.delivery_policy`, выбираемая признаком
-  `COURSE_TEST_PROFILE` при bootstrap; интервалы worker, dispatcher и reconciler задаются
-  переменными окружения, а попытки и задержки Outbox — нет. Вынос их в конфигурацию — неделя 4.
-- Аренда задания равна объявленному бюджету шага плюс 500 мс (но не меньше настроенного срока):
-  после гибели исполнителя длинный шаг восстанавливается не раньше, чем истёк бы его бюджет, — до
-  30,5 с при контрактном максимуме `timeout_ms`. Продление аренды живым исполнителем не вводится:
-  контракт недели 2 закрепляет за `workflow_worker` ровно четыре функции, и проверка сверяет их
-  множество точно.
-- Failpoints `after_outbox_claim` и `after_provider_response` у dispatcher работают только в test
-  profile; `after_inbox_saved` и `after_manual_decision` не реализованы — это приёмка недели 4.
+- Профиль доставки приходит в PostgreSQL один раз, при инициализации тома. На уже созданном томе
+  скрипт инициализации не выполняется, и изменённые `COURSE_OUTBOX_*` или `COURSE_JOB_LEASE_MS` не
+  применятся, пока том не пересоздан либо значения не выставлены вручную через `ALTER DATABASE`.
+  Это цена того, что политику держит сама база, а не клиент
+  ([ADR 0007](docs/adr/0007-delivery-policy-in-the-database.md)).
+- Метрики без labels вообще. Это строже контракта, который разрешает labels ограниченной
+  кардинальности, и выбрано сознательно: добавить label нельзя, не изменив тип-строитель.
+- `/metrics` у `api` отвечает `503` при недоступной PostgreSQL, а не документом из нулей: метрика,
+  придуманная вместо снятой, хуже отсутствующей.
+- Trace показывает только то, что сохранено. Команда, не дошедшая до разрешения версии действия, в
+  путь операции не попадает: у неё нет ни версии, ни ключа запроса, по которому её связать. По той
+  же причине с цепочкой не связывается вызов без `Idempotency-Key` (чтение: `operation.get`,
+  `operation.events`, `workflow.get`, сами `diagnostics.*`): его `correlationId` известен, и trace
+  отвечает `FOUND`, но с пустыми `operation` и `process`.
+- Бюджет попытки dispatcher'а ограничен сверху арендой доставки минус 500 мс. Таймаут provider,
+  заданный длиннее, молча не действует целиком — урезанное значение видно в записи
+  `dispatcher.configured`. Продлить аренду под таймаут нельзя: срок аренды решает PostgreSQL, а
+  таймаут provider он не знает.
+- Две точки аварийной остановки `api` привязаны к границам конкретных действий, и это единственное
+  место, где имя предметного действия встречается в C#. Таблица декларативна и существует только
+  для закрытого профиля; остановка на первой же встреченной границе поймала бы посторонний вызов
+  ([ADR 0008](docs/adr/0008-observability-from-saved-facts.md)).
 - Доверие к callback provider v0.2.0 держится на изолированной сети Compose и capability URL: сам
   provider не подписывает сообщения. HMAC доказывает только участок adapter → platform
   ([ADR 0005](docs/adr/0005-provider-trust-boundary-and-anti-corruption-layer.md)).
@@ -869,9 +1276,9 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
   `payment.validate`.
 - Идентичность тела идемпотентной HTTP-команды — точные байты запроса. Записи идемпотентности,
   сделанные до миграции 020, хранят jsonb-отпечаток; стенд недели 3 и так требует чистого тома.
-- У JWT/HMAC/capability/токенов нет default в `compose.yaml`, поэтому голый
-  `docker compose up` без окружения не поднимет `api` и adapter; для локального запуска есть
-  `scripts/dev_env.py`.
+- У JWT/HMAC/capability/токенов и пароля наблюдателя нет default в `compose.yaml`, поэтому голый
+  `docker compose up` без окружения не поднимет `api` и adapter, а роль `autocheck_reader` создаст
+  без пароля; для локального запуска есть `scripts/dev_env.py`.
 - Реализовано ограниченное исполняемое подмножество `course-1`, а не BPMN-движок: нет импорта BPMN
   XML, параллельных и inclusive-шлюзов, таймеров, boundary events, компенсаций, подпроцессов и
   произвольных выражений. Карта может адресовать значения указателями, но не вычислять их.
@@ -879,9 +1286,12 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
   свойство закреплено уникальностью `(process_id, step_key)` в хранилище.
 - Миграция уже запущенного процесса между версиями карты не поддерживается сознательно: процесс
   обязан оставаться воспроизводимым на закреплённой версии.
-- Аренда ограничена сроком без heartbeat. Гибель исполнителя стоит одного срока аренды: перехват
-  происходит не раньше `lease_until`. Это осознанный размен простоты на задержку восстановления,
-  см. [ADR 0004](docs/adr/0004-lease-and-fencing.md).
+- Аренда ограничена сроком без heartbeat. Срок равен объявленному бюджету шага плюс 500 мс, но не
+  меньше `COURSE_JOB_LEASE_MS`: после гибели исполнителя длинный шаг восстанавливается не раньше,
+  чем истёк бы его бюджет, — до 30,5 с при контрактном максимуме `timeout_ms`. Продление аренды
+  живым исполнителем не вводится: контракт недели 2 закрепляет за `workflow_worker` ровно четыре
+  функции, и проверка сверяет их множество точно. Это осознанный размен простоты на задержку
+  восстановления, см. [ADR 0004](docs/adr/0004-lease-and-fencing.md).
 - Доставка задания — at-least-once. Ровно один предметный эффект обеспечивает не движок, а
   стабильный `executionId` в роли ключа идемпотентности: зарегистрированное действие обязано быть
   идемпотентным по нему. Действие, которое это требование нарушает, движок не спасёт.
@@ -912,10 +1322,11 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
 - Неизменяемость проверяется относительно прикладных ролей и дополнительно закреплена триггерами
   (каталог, версии карт, история). Административный superuser PostgreSQL в модель угроз задания
   не входит.
-- Разделение ролей включается только на **чистом томе**: роли, включая `outbox_dispatcher` и
-  `inbox_reconciler`, создаются один раз при инициализации кластера, а выполнить `CREATE ROLE` из
-  миграции нельзя — у `course_owner` нет `CREATEROLE`. На базе, развёрнутой раньше, гранты тихо
-  пропускаются, а Python-процессы не смогут подключиться.
+- Разделение ролей включается только на **чистом томе**: роли, включая `outbox_dispatcher`,
+  `inbox_reconciler` и `autocheck_reader`, создаются один раз при инициализации кластера, а
+  выполнить `CREATE ROLE` из миграции нельзя — у `course_owner` нет `CREATEROLE`. На базе,
+  развёрнутой раньше, гранты тихо пропускаются, Python-процессы не смогут подключиться, а
+  наблюдатель не увидит схему `autocheck`.
 - Бюджет ожидания шлюза фиксирован (35 секунд) и заведомо больше контрактного потолка `timeout_ms`
   (30 секунд): по контракту шлюз не имеет права знать каталог, а значит и `timeout_ms` манифеста.
 - Пароли ролей в `compose.yaml` — явно обозначенные local-only значения для разработки, а не
@@ -924,23 +1335,23 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
 ## Структура репозитория
 
 ```text
-compose.yaml              десять сервисов, единственный публичный порт 127.0.0.1:8080
-check.sh, autocheck/      открытая black-box проверка недель 1–2 (проверка недели 3 — отдельный репозиторий)
+compose.yaml              двенадцать сервисов, единственный публичный порт 127.0.0.1:8080
+check.sh, autocheck/      открытая black-box проверка недель 1–2 (проверки недель 3–4 — отдельные репозитории)
 course.sh                 обёртка над сервисом cli
-contracts/course-1/       машинные схемы: манифест, карта, provider v0.2.0, receipt v1, submit, manual
-db/init/                  создание ролей при инициализации кластера
-db/migrations/            checksummed миграции: каталог, invoke, предметная схема, workflow, периметр, autocheck
-db/actions/               встроенные манифесты действий
+contracts/course-1/       машинные схемы: манифест, карта, provider v0.2.0, receipt v1, submit, manual, diagnostics, score manifests недель 3-4
+db/init/                  создание ролей и профиля доставки при инициализации кластера
+db/migrations/            checksummed миграции: каталог, invoke, предметная схема, workflow, периметр, autocheck, надёжность
+db/actions/               встроенные манифесты действий, включая diagnostics.trace и diagnostics.stalled
 db/flows/                 встроенные карты workflow-smoke v1/v2, payment-processing v1, payment-review v1
 docker/                   Dockerfile сервисов, включая образ postgres со скриптом ролей и Python-образ периметра
-docs/                     C4 Container diagram, ADR и тексты заданий недель 2–3
-integration/              Python-пакет периметра и его unit/contract-тесты
+docs/                     C4 Container diagram, ADR и тексты заданий недель 2–4
+integration/              Python-пакет периметра (включая health/OpenMetrics) и его unit/contract-тесты
 scripts/                  локальное окружение, интеграционные тесты и e2e-сценарии на живом контуре
-src/Course.Shared/        envelope, JWT, JSON Schema, OpenAPI, контракт карты, доступ к PostgreSQL
-src/Course.Api/           generic action runtime
+src/Course.Shared/        envelope, JWT, JSON Schema, OpenAPI, контракт карты, OpenMetrics, failpoints, доступ к PostgreSQL
+src/Course.Api/           generic action runtime, health, метрики и привязка точек остановки
 src/Course.Gateway/       публичный gateway
 src/Course.Cli/           Course CLI
-src/Course.Workflow.Worker/   сменный исполнитель процессов
-src/Course.Tests/         unit-тесты границ C#-слоя и контракта карт
+src/Course.Workflow.Worker/   сменный исполнитель процессов и его служебный адрес наблюдаемости
+src/Course.Tests/         unit-тесты границ C#-слоя, контракта карт и контракта наблюдаемости
 src/Course.IntegrationTests/  тесты гонок версий, конкурентной публикации и границ ролей
 ```

@@ -1,6 +1,7 @@
 import json
 import socket
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -167,6 +168,62 @@ class SendPaymentTests(unittest.TestCase):
             port = probe.getsockname()[1]
         result = send_payment(f"http://127.0.0.1:{port}", build_payment_request(MESSAGE), 0.5)
         self.assertEqual(result.error_code, TRANSPORT_RETRYABLE)
+
+
+class AttemptBudgetTests(unittest.TestCase):
+    """The declared external timeout is the budget of the WHOLE attempt, not just of the socket."""
+
+    def test_an_attempt_that_outlives_its_budget_is_retryable_transport_error(self):
+        entered = threading.Event()
+
+        def hanging(host, port, timeout):
+            # Stands in for name resolution of an absent provider: getaddrinfo ignores the socket
+            # timeout entirely, and on a Docker host an unknown name costs seconds.
+            entered.set()
+            time.sleep(5)
+            raise AssertionError("the abandoned attempt must not decide the outcome")
+
+        started = time.monotonic()
+        result = send_payment("http://provider-simulator:8081", build_payment_request(MESSAGE), 0.2, hanging)
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(entered.wait(1), "the attempt never started")
+        self.assertEqual(result.error_code, "transport.error.retryable")
+        self.assertIsNone(result.provider_payment_id)
+        # The delivery lease is measured in seconds, so an attempt must not spend more than its
+        # own budget: otherwise its report is refused by fencing and the attempt is wasted twice.
+        self.assertLess(elapsed, 1.5, f"attempt took {elapsed:.2f}s with a 0.2s budget")
+
+    def test_an_answer_within_the_budget_is_returned_unchanged(self):
+        class Accepting:
+            status = 202
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return self
+
+            def read(self, _limit):
+                return b'{"providerPaymentId":"provider-1","status":"ACCEPTED"}'
+
+            def close(self):
+                return None
+
+        result = send_payment(
+            "http://provider-simulator:8081",
+            build_payment_request(MESSAGE),
+            1.0,
+            lambda host, port, timeout: Accepting(),
+        )
+        self.assertEqual(result.provider_payment_id, "provider-1")
+
+    def test_an_unexpected_failure_still_reaches_the_caller(self):
+        def broken(host, port, timeout):
+            raise RuntimeError("driver is misconfigured")
+
+        with self.assertRaises(RuntimeError):
+            send_payment("http://provider-simulator:8081", build_payment_request(MESSAGE), 1.0, broken)
 
 
 if __name__ == "__main__":

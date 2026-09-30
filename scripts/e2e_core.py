@@ -155,9 +155,26 @@ def scenario_gateway_whitelist_and_limits() -> None:
     e.check(raw("GET", "/openapi/actions/payment/request/99.json")[0] == 404, "an unknown version document must be 404")
 
     oversized = e.compact({**REQUEST, "note": "x" * (MAX_REQUEST_BYTES + 64 * 1024)})
-    status, body = request(None, key=str(uuid.uuid4()), body=oversized)
+    status, body = send_until_answered(oversized)
     e.check(status == 413 and code(body) == "request.invalid" and (body or {}).get("retryable") is False,
             f"an oversized body is a non-retryable client error: {status} {code(body)} retryable={(body or {}).get('retryable')}")
+
+
+def send_until_answered(body: bytes, attempts: int = 5) -> tuple[int, dict[str, Any] | None]:
+    """Sends an oversized body until the gateway's answer is actually observed.
+
+    The gateway answers 413 and closes the connection as soon as the declared size is over the
+    limit - while the client may still be writing. A Linux client then reads the answer that is
+    already in its receive buffer; a Windows client reports the aborted send (WinError 10053/10054)
+    and loses the answer with it. That is a property of the client socket, not of the gateway, so
+    the request is repeated until the answer is seen.
+    """
+    for _ in range(attempts):
+        try:
+            return request(None, key=str(uuid.uuid4()), body=body)
+        except OSError:  # urllib.error.URLError is an OSError as well
+            time.sleep(0.2)
+    raise e.Failure("the answer to an oversized body was never observed")
 
 
 def scenario_catalog_versions_and_policy() -> None:
@@ -201,7 +218,7 @@ def scenario_limit_rule_boundary() -> None:
 
 def scenario_privilege_hygiene() -> None:
     """PUBLIC reaches no application function or relation, and only the migrator inherits the owner."""
-    schemas = "('api','payment','workflow','delivery','training','itest','course_meta','autocheck')"
+    schemas = "('api','payment','workflow','delivery','diagnostics','training','itest','course_meta','autocheck')"
     functions = e.sql_rows(
         "SELECT n.nspname || '.' || p.proname AS f FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
         f"WHERE n.nspname IN {schemas} AND has_function_privilege('public', p.oid, 'EXECUTE') AND p.prorettype <> 'trigger'::regtype")
@@ -212,7 +229,8 @@ def scenario_privilege_hygiene() -> None:
     e.check(relations == [], f"relations readable by PUBLIC: {relations}")
     memberships = e.sql_rows(
         "SELECT r.rolname || '->' || g.rolname AS m FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.member "
-        "JOIN pg_roles g ON g.oid = am.roleid WHERE r.rolname LIKE 'course_%' OR r.rolname IN ('workflow_worker','outbox_dispatcher','inbox_reconciler') ORDER BY 1")
+        "JOIN pg_roles g ON g.oid = am.roleid WHERE r.rolname LIKE 'course_%' "
+        "OR r.rolname IN ('workflow_worker','outbox_dispatcher','inbox_reconciler','autocheck_reader') ORDER BY 1")
     e.check([m["m"] for m in memberships] == ["course_migrator->course_owner"], f"role memberships: {memberships}")
 
 
