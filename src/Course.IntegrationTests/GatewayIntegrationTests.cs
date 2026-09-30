@@ -67,6 +67,66 @@ public sealed class GatewayIntegrationTests
         }
     }
 
+    /// <summary>
+    /// Тело запроса сверх границы шлюза — ошибка клиента, названная как ошибка клиента.
+    ///
+    /// Раньше объявленная длина не проверялась, Kestrel прерывал чтение уже во время пересылки, и
+    /// HttpClient сообщал об этом как о сбое отправки — клиент получал 503 «api недоступен» с
+    /// предложением повторить запрос, который не пройдёт никогда. Проверяются обе формы: с
+    /// Content-Length и потоком без него.
+    /// </summary>
+    [SkippableFact]
+    public async Task ARequestOverTheGatewayBodyLimitIsAClientErrorNotAnOutage()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+
+        using var client = IntegrationEnvironment.CreateClient();
+        var token = IntegrationEnvironment.Token("itest-large", "web", "payment:write");
+        var oversized = System.Text.Encoding.UTF8.GetBytes(
+            "{\"operationKind\":\"PAYMENT_EXECUTION\",\"amount\":\"1.00\",\"currency\":\"RUB\",\"note\":\"" +
+            new string('x', (int)GatewayOptions_MaxRequestBytes + 64 * 1024) + "\"}");
+
+        foreach (var chunked in new[] { false, true })
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/api/payment/request");
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+            request.Headers.Add("Idempotency-Key", $"itest-large-{Guid.NewGuid():N}");
+            request.Content = chunked
+                ? new StreamContent(new NonSeekableStream(oversized))
+                : new ByteArrayContent(oversized);
+            request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+
+            using var response = await client.SendAsync(request);
+            var text = await response.Content.ReadAsStringAsync();
+            var envelope = JsonNode.Parse(text);
+
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+            Assert.Equal("error", envelope?["status"]?.GetValue<string>());
+            Assert.Equal("request.invalid", envelope?["code"]?.GetValue<string>());
+            Assert.False(envelope?["retryable"]?.GetValue<bool>() ?? true, $"chunked={chunked}: an oversized body must not be retryable");
+        }
+    }
+
+    // Граница шлюза — одно число, но тестовый проект не ссылается на проект шлюза: константа
+    // повторена здесь и сверяется поведением, а не компиляцией.
+    private const long GatewayOptions_MaxRequestBytes = 1024 * 1024;
+
+    /// <summary>Поток без известной длины: HttpClient отправляет его chunked, без Content-Length.</summary>
+    private sealed class NonSeekableStream(byte[] data) : Stream
+    {
+        private readonly MemoryStream _inner = new(data);
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     /// <summary>Опрос готовности, а не пауза: время старта контейнера зависит от машины.</summary>
     private static async Task<bool> WaitUntilLiveAsync(HttpClient client)
     {

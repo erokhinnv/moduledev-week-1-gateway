@@ -94,6 +94,8 @@ inbox-reconciler  → PostgreSQL (delivery.reconcile_inbox)
 | Платёжные действия, `receipt.accept`, `workflow.manual`, `delivery.*` | [`db/migrations/018_perimeter_actions.sql`](db/migrations/018_perimeter_actions.sql) |
 | Проекции периметра и права Python-ролей | [`db/migrations/019_perimeter_autocheck.sql`](db/migrations/019_perimeter_autocheck.sql) |
 | Семантика идемпотентности, закреплённая за маршрутом | [`db/migrations/021_idempotency_semantics.sql`](db/migrations/021_idempotency_semantics.sql) |
+| Бюджет повторов доставки test profile: четыре попытки, задержек ровно на одну меньше | [`db/migrations/022_outbox_retry_budget.sql`](db/migrations/022_outbox_retry_budget.sql) |
+| Аренда задания покрывает бюджет действия | [`db/migrations/023_lease_covers_the_action_budget.sql`](db/migrations/023_lease_covers_the_action_budget.sql) |
 | Python-периметр | [`integration/course_integration`](integration/course_integration) |
 | Карты платёжных процессов | [`db/flows/payment-processing-v1.flow.yaml`](db/flows/payment-processing-v1.flow.yaml), [`db/flows/payment-review-v1.flow.yaml`](db/flows/payment-review-v1.flow.yaml) |
 | Общий разбор границы `api.invoke` | [`src/Course.Shared/RegisteredAction.cs`](src/Course.Shared/RegisteredAction.cs) |
@@ -189,6 +191,11 @@ docker compose down -v
 значений по умолчанию; для паролей PostgreSQL заданы явно обозначенные local-only значения, которые
 проверка всегда заменяет synthetic-значениями через собственный Compose override.
 
+Каждую переменную таблицы `compose.yaml` пробрасывает в контейнер из окружения запуска
+(`docker compose up`); не заданная или пустая переменная означает умолчание самого процесса.
+Исключения: `COURSE_GATEWAY_PORT` задаёт только host-порт, а порт adapter `8082` закреплён в
+`compose.yaml`, потому что на него ссылаются `expose` и callback URL provider.
+
 | Переменная | Сервис | Значение открытого профиля | Назначение |
 |---|---|---|---|
 | `COURSE_GATEWAY_PORT` | `gateway` | `8080` | Host-порт на `127.0.0.1` |
@@ -205,7 +212,7 @@ docker compose down -v
 | `PROVIDER_SIMULATOR_MODE` | `provider-simulator` | `success` | Режим simulator для ручных экспериментов |
 | `PROVIDER_TIMEOUT_MS` | `outbox-dispatcher` | `500` в test profile, иначе `5000` | Бюджет одной HTTP-попытки |
 | `OUTBOX_POLL_INTERVAL_MS` / `INBOX_POLL_INTERVAL_MS` | dispatcher / reconciler | `100` / `200` в test profile | Интервал опроса; у reconciler в test profile не более 500 мс |
-| `RECEIPT_ADAPTER_HOST`, `RECEIPT_ADAPTER_PORT`, `RECEIPT_API_TIMEOUT_MS` | `receipt-adapter` | `0.0.0.0`, `8082`, `10000` | Адрес и порт внутри сети Compose, бюджет ожидания API |
+| `RECEIPT_ADAPTER_HOST`, `RECEIPT_API_TIMEOUT_MS` | `receipt-adapter` | `0.0.0.0`, `10000` | Адрес прослушивания внутри сети Compose и бюджет ожидания API; порт `8082` закреплён в `compose.yaml` |
 | `INBOX_BATCH_SIZE` | `inbox-reconciler` | `50` | Сколько сообщений Inbox согласуется одним вызовом `delivery.reconcile_inbox` (1–100) |
 | `COURSE_POSTGRES_STATEMENT_TIMEOUT_MS` | dispatcher, reconciler | `10000` | Потолок одного вызова SQL-границы: ожидание блокировки заканчивается ошибкой и переподключением, а не зависанием |
 | `COURSE_OUTBOX_PASSWORD`, `COURSE_INBOX_PASSWORD` | `postgres`, dispatcher / reconciler | local-only значения | Пароли ролей `outbox_dispatcher` и `inbox_reconciler` |
@@ -383,9 +390,14 @@ claim_jobs(owner)                     короткая транзакция; lea
 | `leaseVersion` | Возрастающая версия права на завершение |
 
 Срок аренды не берётся из конфигурации вслепую, но и не отдаётся карте целиком: `claim_jobs`
-вычисляет его как `min(max(настроенный срок, timeout_ms + 500 мс), настроенный срок × 3)`. Нижняя
-граница не даёт перехватить задание на середине работы; верхняя не даёт карте задавать наблюдаемое
-время восстановления — иначе задача с бюджетом в полминуты отодвигала бы перехват настолько же.
+выдаёт `max(настроенный срок, min(timeout_ms, 30 с) + 500 мс)`. Настроенный профилем срок (2 с в
+test profile, 30 с в обычном) — нижняя граница для коротких действий; для длинных аренда покрывает
+объявленный бюджет шага целиком, поэтому живого исполнителя нельзя перехватить на середине
+работы. Потолок — контрактный максимум бюджета шага плюс запас: карта не может отодвинуть перехват
+дальше 30,5 с. Прежний потолок «настроенный срок × 3» (6 с в test profile) делал любой шаг длиннее
+5,5 с невыполнимым: аренда истекала на середине действия, задание перехватывалось, готовый эффект
+откатывался по `lease_stale`, и так до потолка попыток. Восстановление после гибели исполнителя
+стоит одного срока аренды — не больше бюджета того шага, который он исполнял.
 
 При перехвате истёкшей аренды `jobId` и `executionId` сохраняются, создаётся новая попытка и
 растёт `leaseVersion`. `finish_job` принимает завершение только при совпадении задания, владельца,
@@ -513,8 +525,12 @@ requestId → operationId → processId → jobId → executionId
 | `202` с некорректным UTF-8/JSON/телом | `fail_outbox(..., 'response.invalid.terminal')` |
 
 Состояние, `next_attempt_at` и предел попыток определяет PostgreSQL (`delivery.delivery_policy`: в
-test profile 3 попытки, задержки 200/400/800 мс, аренда 3 с). Если база пропала между HTTP и
-отчётом, аренда истекает и следующий claim повторяет те же ключ и тело — provider дедуплицирует.
+test profile четыре попытки, включая первую, с задержками 200/400/800 мс между ними и арендой
+3 с; в обычном профиле — пять попыток и 1/5/15/60 с). Задержек ровно на одну меньше, чем попыток,
+и это ограничение таблицы: список из N задержек означает N + 1 попыток, а не N. Каждый отказ
+пишется в журнал dispatcher'а событием `outbox.attempt` с решением базы — `state` и
+`nextAttemptInMs`. Если база пропала между HTTP и отчётом, аренда истекает и следующий claim
+повторяет те же ключ и тело — provider дедуплицирует.
 
 **Adapter.** `POST /callbacks/provider-v02/{capability}` на внутреннем порту `8082`:
 
@@ -666,14 +682,21 @@ End-to-end сценарии недели 3 на поднятом стеке —
 Python-ролей, failpoint `after_outbox_claim` (остановленный dispatcher не доходит до provider, а
 новый перехватывает аренду со следом `lease.expired.retryable` и одним платежом), квитанция во время
 шага процесса на барьерах PostgreSQL (встаёт в очередь за шагом, а не получает deadlock), отказ
-submit привязать операцию к процессу, запущенному в обход, и триггеры неизменяемости Outbox, Inbox,
-receipts, decisions, flow binding и жизненного цикла операции.
+submit привязать операцию к процессу, запущенному в обход, триггеры неизменяемости Outbox, Inbox,
+receipts, decisions, flow binding и жизненного цикла операции, и бюджет повторов доставки: provider,
+недоступный весь бюджет (dispatcher смотрит на закрытый порт), даёт ровно четыре попытки с
+задержками 200/400/800 мс из журнала самого dispatcher'а, `DEAD` без ложного результата операции
+(`PROCESSING` / `WAITING_SIGNAL`) и подтверждение поздней квитанцией; provider, вернувшийся после
+трёх отказов, получает четвёртую попытку — один платёж с исходным ключом.
 
 Интеграционные тесты закрывают то, что без живого контура доказать нельзя: гонку версий между
 валидацией и исполнением, повтор по ключу идемпотентности через смену версии по умолчанию,
 отказ публикации версии с другой семантикой идемпотентности (и вставки её в обход публикации),
 конкурентные команды каталога и границы прав ролей, границу ответа шлюза на настоящем ответе api
-(контрактный отказ вместо усечённого тела), а для недели 2 — неизменяемость опубликованной
+(контрактный отказ вместо усечённого тела), числа профиля доставки как утверждения (четыре попытки,
+три задержки, форма закреплена ограничением таблицы) и действие длиннее настроенного срока аренды
+под двумя живыми исполнителями (аренда покрывает бюджет шага, версия аренды не растёт, попыток
+`STALE` нет, эффект один), а для недели 2 — неизменяемость опубликованной
 версии карты, append-only историю, неизменяемость личности состояния (ключ идемпотентности,
 закрепление за версией, тело принятого сигнала), отклонение испорченной карты самим хранилищем в
 обход клиента, границы роли `workflow_worker`, конкурентные `flow activate` и `flow start`, полный
@@ -689,16 +712,34 @@ worker на failpoint `after_action_before_finish` — ни одного эфф�
 сохранённого; и отсутствие исходного текста ошибки PostgreSQL (маркер в имени роли) в stdout и
 stderr CLI. На время первых двух штатные worker'ы останавливаются.
 
+Инварианты ядра недель 1–2, которые скрытая проверка варьирует, закреплены отдельным набором
+[`scripts/e2e_core.py`](scripts/e2e_core.py) — через HTTP, CLI и проекции `autocheck`: края контракта
+`payment.request` (девять невалидных форм суммы и чужая валюта — `422`, идемпотентность по ключу,
+`409` на другое тело, `400` без ключа), неизвестные action и версия, испорченный заголовок версии,
+не-JSON и не-объект, поле, выбирающее target; каждый дефект JWT (нет токена, просрочен, чужой ключ,
+`alg=none`) — `401`, отсутствие scope — `403`; чужой `X-Correlation-ID` игнорируется и не попадает в
+`action_dispatches`; whitelist шлюза, документы OpenAPI и `413` на тело больше 1 МиБ; выключенная
+версия действия — `404`, включённая отвечает, policy действия — `403`; граница `course-limit-v1`
+(`100000.00` одобряет правило, `100000.01` ждёт человека); ни одной функции и таблицы прикладных схем
+у `PUBLIC`, членство ролей только `course_migrator → course_owner`; readiness после рестарта
+PostgreSQL без пересоздания `api`; семантика CLI недели 2 — сигнал необъявленного типа отклоняется
+без строки, поздний сигнал сохраняется и не двигает процесс, ранний сигнал `ACCEPTED` применяется на
+входе в ожидание, идемпотентный `flow start` и конфликт данных, запуск опубликованной, но не
+активированной карты — контролируемая ошибка без процесса.
+
 ```bash
 ./scripts/integration-tests.sh
 ```
 
 Скрипт генерирует одноразовое synthetic-окружение (если оно не задано), поднимает отдельный
-Compose-проект, выполняет C# интеграционные тесты и e2e-сценарии периметра и гасит контур за
+Compose-проект, выполняет C# интеграционные тесты, e2e-сценарии периметра и ядра и гасит контур за
 собой. Без поднятого контура C#-тесты помечаются пропущенными, поэтому `dotnet test` без Docker
 остаётся зелёным.
 
 Тесты дополняют checker, но не заменяют его.
+
+Статус каждого замечания прежних проверок — со ссылками на тест или файл, где оно закреплено, —
+ведётся в [docs/review-history.md](docs/review-history.md).
 
 ### Диагностика
 
@@ -715,6 +756,10 @@ docker compose logs worker-a worker-b
 # health
 curl -i http://localhost:8080/health/live     # процесс gateway
 curl -i http://localhost:8080/health/ready    # готовность api и PostgreSQL
+
+# OpenAPI: только включённые default-версии и точный документ одной версии
+curl -s http://localhost:8080/openapi/default.json | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)["paths"]))'
+curl -s http://localhost:8080/openapi/actions/payment/request/1.json | head -c 400
 
 # компактный снимок процесса
 ./course.sh flow get <process-id>
@@ -761,6 +806,7 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
 | `/health/live` 200, `/health/ready` 503 | `api` не отвечает или PostgreSQL недоступен: `docker compose logs api`, `docker compose ps postgres` |
 | Действие отвечает `404 action.not_found` | версия не опубликована или выключена: `./course.sh action list` |
 | Действие отвечает `500 action.contract_violation` | функция вернула необъявленный `outcome` или `result`, не проходящий `response_schema` |
+| Шлюз отвечает `413 request.invalid` | тело запроса больше 1 МиБ — собственная граница шлюза, `retryable: false`; повтор того же запроса не поможет |
 | Процесс стоит в `RUNNING`, задание `READY` | оба worker остановлены или не могут подключиться: `docker compose logs worker-a` |
 | Задание в `RETRY_WAIT` | попытка отклонена с `retryable=true`; время следующей — в `autocheck.jobs.next_attempt_at` |
 | Задание `DEAD`, процесс `FAILED` | причина — в `autocheck.jobs.dead_reason`, код отказа — в `autocheck.attempts.error_code`, событие `TaskFailed` или `TaskAbandoned` — в истории |
@@ -788,6 +834,14 @@ docker compose exec -T -e AUDIT="$PROVIDER_AUDIT_TOKEN" receipt-adapter python -
   (`SKIP LOCKED`, owner + `lease_version`), но jitter, операционная работа с `DEAD`, health и
   metrics периметра — неделя 4. `DEAD` Outbox не валит процесс: поздняя квитанция всё равно будет
   принята и применена.
+- Числа политики доставки — строка профиля в `delivery.delivery_policy`, выбираемая признаком
+  `COURSE_TEST_PROFILE` при bootstrap; интервалы worker, dispatcher и reconciler задаются
+  переменными окружения, а попытки и задержки Outbox — нет. Вынос их в конфигурацию — неделя 4.
+- Аренда задания равна объявленному бюджету шага плюс 500 мс (но не меньше настроенного срока):
+  после гибели исполнителя длинный шаг восстанавливается не раньше, чем истёк бы его бюджет, — до
+  30,5 с при контрактном максимуме `timeout_ms`. Продление аренды живым исполнителем не вводится:
+  контракт недели 2 закрепляет за `workflow_worker` ровно четыре функции, и проверка сверяет их
+  множество точно.
 - Failpoints `after_outbox_claim` и `after_provider_response` у dispatcher работают только в test
   profile; `after_inbox_saved` и `after_manual_decision` не реализованы — это приёмка недели 4.
 - Доверие к callback provider v0.2.0 держится на изолированной сети Compose и capability URL: сам

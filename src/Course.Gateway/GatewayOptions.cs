@@ -12,6 +12,12 @@ public sealed class GatewayOptions
     public const string ProbeClient = "course-api-probe";
 
     /// <summary>Базовый адрес внутреннего сервиса api (по DNS-имени Docker Compose, не localhost).</summary>
+    /// <summary>
+    /// Верхняя граница тела запроса, которое шлюз принимает от клиента. Одно число для Kestrel и
+    /// для самой пересылки: превышение — ошибка клиента (413), а не недоступность внутреннего api.
+    /// </summary>
+    public const long MaxRequestBytes = 1024 * 1024;
+
     public required Uri UpstreamBaseAddress { get; init; }
 
     public required int ListenPort { get; init; }

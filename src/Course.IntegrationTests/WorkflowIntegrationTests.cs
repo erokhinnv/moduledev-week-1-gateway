@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json.Nodes;
 using Xunit;
 
@@ -13,7 +14,7 @@ namespace Course.IntegrationTests;
 /// карте <c>workflow-smoke</c>.
 /// </summary>
 [Collection(ProbeFixture.CollectionName)]
-public sealed class WorkflowIntegrationTests
+public sealed class WorkflowIntegrationTests(ProbeFixture fixture)
 {
     private const string SmokeFlow = "workflow-smoke";
 
@@ -898,6 +899,52 @@ public sealed class WorkflowIntegrationTests
 
             IntegrationEnvironment.Service("start", "worker-a", "worker-b");
         }
+    }
+
+    /// <summary>
+    /// Действие длиннее настроенного срока аренды под двумя живыми исполнителями.
+    ///
+    /// Настроенный срок test profile — 2 секунды, бюджет шага здесь — 15, само действие работает
+    /// 8. Прежний потолок «× 3» выдавал не больше шести секунд: аренда истекала на середине
+    /// работы, второй исполнитель перехватывал задание, первый получал lease_stale и откатывал
+    /// готовый эффект — и так до потолка попыток, без единого завершения. Теперь аренда покрывает
+    /// бюджет шага: версия аренды не растёт, попыток STALE нет, эффект ровно один.
+    /// </summary>
+    [SkippableFact]
+    public void ALongActionIsNotReclaimedWhileItsBudgetLasts()
+    {
+        Skip.If(!IntegrationEnvironment.Enabled, IntegrationEnvironment.SkipReason);
+        Skip.If(
+            SingleValue("SELECT test_profile FROM workflow.runtime_setting") != "t",
+            "outside the test profile the configured lease already outlives the action");
+        fixture.EnsurePublished();
+
+        var (exitCode, envelope) = IntegrationEnvironment.Cli(
+            null, "flow", "start", "itest-slow", "--business-key", $"itest-slow-{Guid.NewGuid():N}");
+        Assert.True(exitCode == 0, $"slow process could not be started: {envelope?.ToJsonString()}");
+        var processId = envelope!["result"]!["processId"]!.GetValue<string>();
+
+        Assert.True(
+            WaitFor(() => SingleValue(
+                $"SELECT count(*) FROM autocheck.jobs WHERE process_id = '{processId}' AND state = 'LEASED'") == "1", seconds: 10),
+            "the slow job was not claimed");
+
+        // Аренда выдана на бюджет шага (15 с плюс запас), а не на настроенные 2 с и не на их
+        // тройной потолок: она заведомо переживает восьмисекундное действие.
+        var leaseLeft = double.Parse(
+            SingleValue("SELECT round(extract(epoch from (lease_until - clock_timestamp()))::numeric, 1) " +
+                        $"FROM autocheck.jobs WHERE process_id = '{processId}'"),
+            CultureInfo.InvariantCulture);
+        Assert.True(leaseLeft is > 8 and <= 15.5, $"the lease ({leaseLeft}s) must cover the 15-second budget of the step");
+
+        Assert.True(WaitForState(processId, "COMPLETED"), "the long action did not complete");
+        Assert.Equal("1", SingleValue($"SELECT lease_version FROM autocheck.jobs WHERE process_id = '{processId}'"));
+        Assert.Equal("SUCCEEDED", SingleValue(
+            "SELECT string_agg(a.status, ',' ORDER BY a.attempt_number) FROM autocheck.attempts a " +
+            $"JOIN autocheck.jobs j ON j.job_id = a.job_id WHERE j.process_id = '{processId}'"));
+        Assert.Equal("1", SingleValue(
+            "SELECT count(*) FROM itest.slow_effect e JOIN autocheck.jobs j ON j.execution_id::text = e.execution_id " +
+            $"WHERE j.process_id = '{processId}'"));
     }
 
     /// <summary>

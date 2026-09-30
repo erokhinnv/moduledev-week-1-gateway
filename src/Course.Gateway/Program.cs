@@ -20,7 +20,7 @@ builder.Logging.AddFilter("System.Net.Http", LogLevel.Warning);
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.AddServerHeader = false;
-    options.Limits.MaxRequestBodySize = 1024 * 1024;
+    options.Limits.MaxRequestBodySize = GatewayOptions.MaxRequestBytes;
 });
 
 var options = GatewayOptions.FromEnvironment();

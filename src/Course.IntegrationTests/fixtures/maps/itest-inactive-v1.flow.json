@@ -1,0 +1,27 @@
+{
+  "contract_version": "course-1",
+  "flow_name": "itest-inactive",
+  "version": 1,
+  "start_step": "run",
+  "steps": [
+    {
+      "key": "run",
+      "type": "automatic",
+      "task": {
+        "service": "postgres",
+        "module": "itest",
+        "action": "slow",
+        "action_version": 1,
+        "required_policy": ["workflow:execute"],
+        "timeout_ms": 15000,
+        "retry": {"max_attempts": 3, "delays_ms": [500, 1000]},
+        "input_mapping": {},
+        "input_constants": {"marker": "itest-inactive-v1"}
+      }
+    },
+    {"key": "done", "type": "end", "outcome": "COMPLETED"}
+  ],
+  "transitions": [
+    {"from": "run", "outcome": "DONE", "to": "done"}
+  ]
+}

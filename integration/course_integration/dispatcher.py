@@ -76,6 +76,9 @@ class Dispatcher:
             reportStatus=report.get("status"),
             reportCode=report.get("code"),
             state=report.get("state"),
+            # The schedule is PostgreSQL's decision; the log only repeats it so that a delivery can
+            # be traced attempt by attempt without reading the physical tables.
+            nextAttemptInMs=report.get("nextAttemptInMs"),
         )
 
 
