@@ -8,11 +8,8 @@ using Course.Shared;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Logging.ClearProviders();
-builder.Logging.AddSimpleConsole(options =>
-{
-    options.SingleLine = true;
-    options.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
-});
+// Тот же формат, что у api и Python-периметра: одна строка — один JSON object.
+builder.Logging.AddProvider(new JsonConsoleLoggerProvider("gateway"));
 builder.Logging.SetMinimumLevel(LogLevel.Information);
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 builder.Logging.AddFilter("System.Net.Http", LogLevel.Warning);
@@ -109,26 +106,34 @@ app.MapGet("/openapi/default.json", (HttpContext context, UpstreamProxy proxy) =
 app.MapGet("/openapi/actions/{module}/{action}/{document}",
     (HttpContext context, UpstreamProxy proxy) => proxy.ForwardAsync(context));
 
-// Liveness отвечает только за сам процесс gateway и остаётся зелёным, даже если внутренний api недоступен.
-app.MapGet("/health/live", (HttpContext context) => GatewayResponses.WriteAsync(context, 200, new JsonObject
-{
-    ["status"] = "ok",
-    ["service"] = "gateway",
-    ["check"] = "process",
-}));
+// Форма ответов та же, что у остальных проверяемых процессов (контракт наблюдаемости недели 4):
+// причина отказа уходит в журнал, а не в тело probe.
+//
+// Liveness отвечает только за сам процесс gateway и остаётся зелёным, даже если внутренний api
+// недоступен: перезапускать живой шлюз из-за недоступного api — не восстановление, а его имитация.
+app.MapGet("/health/live", (HttpContext context) =>
+    GatewayResponses.WriteAsync(context, 200, new JsonObject { ["status"] = "live" }));
 
 // Готовность gateway — это готовность внутреннего api, что в свою очередь доказывает готовность
-// PostgreSQL: gateway просто спрашивает /health/ready у api и пересылает его вывод.
+// PostgreSQL: gateway просто спрашивает /health/ready у api.
 app.MapGet("/health/ready", async (HttpContext context, UpstreamProxy proxy) =>
 {
     var upstream = await proxy.ProbeReadinessAsync(context.RequestAborted);
-    await GatewayResponses.WriteAsync(context, upstream.Ready ? 200 : 503, new JsonObject
+    if (upstream.Ready)
     {
-        ["status"] = upstream.Ready ? "ok" : "error",
-        ["service"] = "gateway",
-        ["check"] = "api",
-        ["reason"] = upstream.Reason,
-        ["upstreamStatus"] = upstream.Status,
+        await GatewayResponses.WriteAsync(context, 200, new JsonObject { ["status"] = "ready" });
+        return;
+    }
+
+    context.RequestServices.GetRequiredService<ILogger<Program>>().LogWarning(
+        "gateway readiness reported not ready reason={Reason} upstreamStatus={UpstreamStatus}",
+        upstream.Reason,
+        upstream.Status);
+
+    await GatewayResponses.WriteAsync(context, 503, new JsonObject
+    {
+        ["status"] = "not_ready",
+        ["code"] = ContractCodes.DependencyUnavailable,
     });
 });
 

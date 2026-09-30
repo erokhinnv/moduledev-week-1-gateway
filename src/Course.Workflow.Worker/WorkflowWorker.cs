@@ -15,7 +15,7 @@ namespace Course.Workflow.Worker;
 /// контекстом и сообщить исход. Всё остальное приходит вместе с арендой из опубликованного
 /// определения. Поэтому неизвестная на момент сборки карта исполняется без пересборки образа.
 /// </summary>
-public sealed class WorkflowWorker(WorkerOptions options)
+public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
 {
     private const string FailpointAfterClaim = "after_job_claim";
     private const string FailpointAfterAction = "after_action_before_finish";
@@ -39,8 +39,11 @@ public sealed class WorkflowWorker(WorkerOptions options)
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        Log($"worker started instance={options.InstanceId} lease={options.LeaseMs}ms poll={options.PollMs}ms " +
-            $"testProfile={options.TestProfile} failpoint={(options.Failpoint.Length == 0 ? "none" : options.Failpoint)}");
+        Log("worker.started",
+            ("leaseMs", options.LeaseMs),
+            ("pollMs", options.PollMs),
+            ("testProfile", options.TestProfile),
+            ("failpoint", options.Failpoint.Length == 0 ? "none" : options.Failpoint));
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -58,10 +61,20 @@ public sealed class WorkflowWorker(WorkerOptions options)
 
                 foreach (var job in jobs)
                 {
-                    // Начатая попытка доводится до конца даже при остановке контейнера: прерваться
-                    // посередине означало бы оставить аренду висеть до истечения срока и потратить
-                    // лишнюю попытку на ровном месте. Остановка проверяется между заданиями.
-                    await ExecuteAsync(connection, job, CancellationToken.None);
+                    metrics.JobClaimed();
+                    var settled = false;
+                    try
+                    {
+                        // Начатая попытка доводится до конца даже при остановке контейнера:
+                        // прерваться посередине означало бы оставить аренду висеть до истечения
+                        // срока и потратить лишнюю попытку на ровном месте. Остановка
+                        // проверяется между заданиями.
+                        settled = await ExecuteAsync(connection, job, CancellationToken.None);
+                    }
+                    finally
+                    {
+                        metrics.JobSettled(settled);
+                    }
 
                     if (cancellationToken.IsCancellationRequested)
                     {
@@ -89,7 +102,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
         }
 
         Reset();
-        Log($"worker stopped instance={options.InstanceId}");
+        Log("worker.stopped");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -123,8 +136,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
         if (jobs.Length != array.Count && !_incompleteDescriptorReported)
         {
             _incompleteDescriptorReported = true;
-            Log($"claim returned an incomplete descriptor instance={options.InstanceId} " +
-                $"leased={array.Count} usable={jobs.Length}");
+            Log("claim.incomplete_descriptor", ("leased", array.Count), ("usable", jobs.Length));
         }
 
         return jobs;
@@ -134,7 +146,11 @@ public sealed class WorkflowWorker(WorkerOptions options)
     // Выполнение одной попытки
     // -----------------------------------------------------------------------------------------
 
-    private async Task ExecuteAsync(
+    /// <summary>
+    /// Выполняет одну попытку. Возвращает true, если исполнителю больше нечего сообщать по этому
+    /// заданию (успех или потерянная аренда), и false, если попытка была отчитана как отказ.
+    /// </summary>
+    private async Task<bool> ExecuteAsync(
         NpgsqlConnection connection,
         LeasedJob job,
         CancellationToken cancellationToken)
@@ -148,34 +164,35 @@ public sealed class WorkflowWorker(WorkerOptions options)
         if (!job.ActionAvailable || job.RequestSchema is null || job.ResponseSchema is null)
         {
             await FailAsync(connection, job, ContractCodes.WorkflowActionUnavailable, false, null, cancellationToken);
-            return;
+            return false;
         }
 
         // Отсутствующий источник данных — объявленный неповторяемый отказ: действие не вызывается
         // вообще, поэтому никакого частичного эффекта появиться не может.
         if (!WorkflowPayload.TryBuild(job.InputConstants, job.InputMapping, job.ProcessData, out var payload, out var missing))
         {
-            Log($"mapping source missing instance={options.InstanceId} job={job.JobId} pointer={missing}");
+            Log("attempt.mapping_missing", ("jobId", job.JobId), ("pointer", missing));
             await FailAsync(connection, job, ContractCodes.WorkflowMappingMissing, false, null, cancellationToken);
-            return;
+            return false;
         }
 
         // Сформированный payload проходит схему запроса действия ДО обращения к api.invoke.
         if (!SchemaValidator.TryValidate(job.RequestSchema, payload, out _))
         {
             await FailAsync(connection, job, ContractCodes.PayloadInvalid, false, null, cancellationToken);
-            return;
+            return false;
         }
 
         var attempt = await InvokeAsync(connection, job, payload, cancellationToken);
         if (attempt.Settled)
         {
-            return;
+            return true;
         }
 
         // Транзакция действия уже откачена. Отдельная транзакция сохраняет попытку и расписание
         // повтора: сам факт неудачи обязан пережить откат предметного эффекта.
         await FailAsync(connection, job, attempt.Code, attempt.Retryable, attempt.Dispatch, cancellationToken);
+        return false;
     }
 
     /// <summary>
@@ -243,8 +260,13 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 // Объявленная ошибка или нарушение контракта откатывают предметный эффект целиком.
                 // Технический след при этом не теряется: его запишет отдельная транзакция fail_job.
                 await transaction.RollbackAsync(CancellationToken.None);
-                Log($"attempt rejected instance={options.InstanceId} job={job.JobId} " +
-                    $"attempt={job.AttemptNumber} code={outcome.Code} retryable={outcome.Retryable}");
+                Log("attempt.rejected",
+                    ("jobId", job.JobId),
+                    ("executionId", job.ExecutionId),
+                    ("attemptId", job.AttemptId),
+                    ("attemptNumber", job.AttemptNumber),
+                    ("errorCode", outcome.Code),
+                    ("retryable", outcome.Retryable));
                 return new AttemptResult(
                     false,
                     outcome.Code,
@@ -277,8 +299,11 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 await transaction.RollbackAsync(CancellationToken.None);
 
                 var refusal = finish?["code"]?.GetValue<string>() ?? ContractCodes.WorkflowBoundaryFailed;
-                Log($"finish refused instance={options.InstanceId} job={job.JobId} " +
-                    $"attempt={job.AttemptNumber} code={refusal}");
+                Log("attempt.finish_refused",
+                    ("jobId", job.JobId),
+                    ("executionId", job.ExecutionId),
+                    ("attemptNumber", job.AttemptNumber),
+                    ("errorCode", refusal));
 
                 // Потерянная аренда — единственный отказ, при котором сообщать больше нечего:
                 // заданием владеет другой арендатор, и любая наша запись была бы тем самым
@@ -302,14 +327,28 @@ public sealed class WorkflowWorker(WorkerOptions options)
             }
 
             await transaction.CommitAsync(CancellationToken.None);
-            Log($"attempt succeeded instance={options.InstanceId} job={job.JobId} " +
-                $"attempt={job.AttemptNumber} outcome={outcome.Outcome} durationMs={durationMs}");
+            Log("attempt.succeeded",
+                ("correlationId", correlationId),
+                ("processId", job.ProcessId),
+                ("stepKey", job.StepKey),
+                ("jobId", job.JobId),
+                ("executionId", job.ExecutionId),
+                ("attemptId", job.AttemptId),
+                ("attemptNumber", job.AttemptNumber),
+                ("leaseVersion", job.LeaseVersion),
+                ("action", job.Module + "." + job.Action),
+                ("actionVersion", outcome.ActionVersion ?? job.ActionVersion),
+                ("outcome", outcome.Outcome),
+                ("durationMs", durationMs));
             return AttemptResult.Done;
         }
         catch (PostgresException exception) when (exception.SqlState == PostgresErrorCodes.QueryCanceled)
         {
             await SafeRollbackAsync(transaction);
-            Log($"attempt timed out instance={options.InstanceId} job={job.JobId} attempt={job.AttemptNumber}");
+            Log("attempt.timed_out",
+                ("jobId", job.JobId),
+                ("attemptNumber", job.AttemptNumber),
+                ("errorCode", ContractCodes.ActionTimeout));
             return new AttemptResult(
                 false,
                 ContractCodes.ActionTimeout,
@@ -332,8 +371,11 @@ public sealed class WorkflowWorker(WorkerOptions options)
             // быть повторяемым — иначе конкурентная квитанция или решение переводили бы процесс
             // в FAILED из-за очерёдности блокировок, а не из-за ошибки действия.
             await SafeRollbackAsync(transaction);
-            Log($"attempt hit a transient database conflict instance={options.InstanceId} job={job.JobId} " +
-                $"attempt={job.AttemptNumber} failure={Redaction.Describe(exception)}");
+            Log("attempt.database_conflict",
+                ("jobId", job.JobId),
+                ("attemptNumber", job.AttemptNumber),
+                ("errorCode", ContractCodes.DependencyUnavailable),
+                ("failure", Redaction.Describe(exception)));
             return new AttemptResult(
                 false,
                 ContractCodes.DependencyUnavailable,
@@ -346,8 +388,11 @@ public sealed class WorkflowWorker(WorkerOptions options)
             // важно: сбой ВНУТРИ границы завершения (например несогласованная карта) не тратит
             // бюджет max_attempts, и без явного отчёта задание перезахватывалось бы бесконечно.
             await SafeRollbackAsync(transaction);
-            Log($"attempt rejected by database instance={options.InstanceId} job={job.JobId} " +
-                $"attempt={job.AttemptNumber} failure={Redaction.Describe(exception)}");
+            Log("attempt.database_rejected",
+                ("jobId", job.JobId),
+                ("attemptNumber", job.AttemptNumber),
+                ("errorCode", ContractCodes.WorkflowBoundaryFailed),
+                ("failure", Redaction.Describe(exception)));
             return new AttemptResult(false, ContractCodes.WorkflowBoundaryFailed, false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -356,8 +401,10 @@ public sealed class WorkflowWorker(WorkerOptions options)
             // соединением нельзя. Задание остаётся арендованным и будет перехвачено по истечении
             // срока — теперь под защитой абсолютного потолка попыток в claim_jobs.
             await SafeRollbackAsync(transaction);
-            Log($"attempt failed instance={options.InstanceId} job={job.JobId} " +
-                $"failure={Redaction.Describe(exception)}");
+            Log("attempt.failed",
+                ("jobId", job.JobId),
+                ("attemptNumber", job.AttemptNumber),
+                ("failure", Redaction.Describe(exception)));
             throw;
         }
     }
@@ -371,8 +418,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
         if (job.LeaseUntil == DateTimeOffset.MaxValue && !_missingLeaseDeadlineReported)
         {
             _missingLeaseDeadlineReported = true;
-            Log("lease deadline is unreadable, finish budget falls back to the configured maximum " +
-                $"instance={options.InstanceId}");
+            Log("lease.deadline_unreadable", ("jobId", job.JobId), ("finishTimeoutMs", options.FinishTimeoutMs));
         }
 
         return LeaseBudget.FinishMs(job.LeaseUntil, DateTimeOffset.UtcNow, options.FinishTimeoutMs);
@@ -454,8 +500,17 @@ public sealed class WorkflowWorker(WorkerOptions options)
                     ?? envelope?["code"]?.GetValue<string>()
                     ?? "unknown";
 
-        Log($"attempt reported instance={options.InstanceId} job={job.JobId} " +
-            $"attempt={job.AttemptNumber} code={code} retryable={retryable} state={state}");
+        Log("attempt.reported",
+            ("processId", job.ProcessId),
+            ("stepKey", job.StepKey),
+            ("jobId", job.JobId),
+            ("executionId", job.ExecutionId),
+            ("attemptId", job.AttemptId),
+            ("attemptNumber", job.AttemptNumber),
+            ("leaseVersion", job.LeaseVersion),
+            ("errorCode", code),
+            ("retryable", retryable),
+            ("state", state));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -478,8 +533,7 @@ public sealed class WorkflowWorker(WorkerOptions options)
                 ["name"] = name,
                 ["instanceId"] = options.InstanceId,
             };
-            Console.Out.WriteLine(acknowledgement.ToJsonString());
-            Console.Out.Flush();
+            StructuredLog.Write(acknowledgement);
         }
 
         await Task.Delay(Timeout.Infinite, CancellationToken.None);
@@ -561,17 +615,25 @@ public sealed class WorkflowWorker(WorkerOptions options)
         // Пока база поднимается, повторяющийся отказ — норма: журнал не должен превращаться в шум.
         if (_consecutiveFailures == 1 || _consecutiveFailures % 40 == 0)
         {
-            Log($"worker cycle failed instance={options.InstanceId} " +
-                $"failure={Redaction.Describe(exception)} consecutive={_consecutiveFailures}");
+            Log("worker.cycle_failed",
+                ("failure", Redaction.Describe(exception)),
+                ("consecutive", _consecutiveFailures));
         }
     }
 
     /// <summary>
-    /// Диагностика идёт в stderr: stdout остаётся чистым каналом структурных событий worker'а.
-    /// Ни payload, ни учётные данные, ни текст исключения PostgreSQL в журнал не попадают.
+    /// Одна строка журнала — один JSON object, как требует контракт наблюдаемости.
+    ///
+    /// Идентификаторы передаются полями, а не вклеиваются в текст сообщения: путь одной попытки
+    /// тогда находится фильтром по полю, а не разбором строки. Ни payload, ни учётные данные, ни
+    /// текст исключения PostgreSQL в журнал не попадают — только классификация отказа.
     /// </summary>
-    private static void Log(string message)
-        => Console.Error.WriteLine($"{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss.fff} {message}");
+    private void Log(string @event, params (string Name, object? Value)[] fields)
+    {
+        var record = StructuredLog.Record("workflow-worker", "info", @event);
+        record["instanceId"] = options.InstanceId;
+        StructuredLog.Write(StructuredLog.Fill(record, fields));
+    }
 
     private static NpgsqlParameter Text(string value)
         => new() { NpgsqlDbType = NpgsqlDbType.Text, Value = value };

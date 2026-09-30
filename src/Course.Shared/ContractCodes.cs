@@ -94,6 +94,15 @@ public static class ContractCodes
     /// </summary>
     public const string ReceiptSignatureRequired = "receipt.signature_required";
 
+    // --- Коды наблюдаемости (неделя 4) ---
+
+    /// <summary>
+    /// Сквозной идентификатор не встречается ни в одной сохранённой цепочке. Код возвращает сама
+    /// зарегистрированная функция, а здесь он получает статус 404: «искали и не нашли» — это
+    /// отсутствующий ресурс, а не отклонённое по содержанию обращение.
+    /// </summary>
+    public const string DiagnosticsTraceNotFound = "diagnostics.trace_not_found";
+
     /// <summary>
     /// HTTP-статус для кода ошибки, который НЕ входит в техническую матрицу выше — то есть для
     /// предметного (доменного) кода ошибки, объявленного самой зарегистрированной функцией
@@ -114,6 +123,7 @@ public static class ContractCodes
         IdempotencyRequired => 400,
         AccessDenied => 403,
         ActionNotFound => 404,
+        DiagnosticsTraceNotFound => 404,
         IdempotencyConflict => 409,
         WorkflowDecisionConflict => 409,
         SignatureInvalid => 401,

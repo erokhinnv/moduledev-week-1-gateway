@@ -2,8 +2,10 @@ using System.Runtime.InteropServices;
 using Course.Shared;
 using Course.Workflow.Worker;
 
-// Точка входа сменного исполнителя процессов. Ни одного host-порта: worker разговаривает только
-// с PostgreSQL, и только через четыре функции-границы под минимально привилегированной ролью.
+// Точка входа сменного исполнителя процессов. Наружу он по-прежнему не публикует ни одного
+// host-порта: служебный адрес наблюдаемости доступен только внутри сети Compose, а предметно
+// исполнитель разговаривает только с PostgreSQL и только через функции-границы под минимально
+// привилегированной ролью.
 
 using var lifetime = new CancellationTokenSource();
 
@@ -24,7 +26,21 @@ using var sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, context =>
 try
 {
     var options = WorkerOptions.FromEnvironment();
-    await new WorkflowWorker(options).RunAsync(lifetime.Token);
+    var metrics = new WorkerMetrics();
+    await using var readiness = new WorkerReadiness();
+    var worker = new WorkflowWorker(options, metrics);
+
+    var endpoint = new ObservabilityEndpoint(
+        "workflow-worker",
+        options.ObservabilityPort,
+        readiness.IsReadyAsync,
+        metrics.Render);
+
+    // Служебный адрес живёт рядом с циклом, а не вместо него: отказ probe-сокета не имеет права
+    // остановить обработку очереди, а остановка процесса обязана закрыть оба.
+    var observability = endpoint.RunAsync(lifetime.Token);
+    await worker.RunAsync(lifetime.Token);
+    await observability;
     return 0;
 }
 catch (OperationCanceledException)
@@ -34,6 +50,6 @@ catch (OperationCanceledException)
 catch (Exception exception)
 {
     // Наружу уходит только тип сбоя: сообщения PostgreSQL умеют содержать значения данных.
-    Console.Error.WriteLine($"worker terminated failure={Redaction.Describe(exception)}");
+    StructuredLog.Error("workflow-worker", "worker.terminated", ("failure", Redaction.Describe(exception)));
     return 1;
 }

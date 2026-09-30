@@ -81,7 +81,7 @@ public sealed class CatalogClient(NpgsqlDataSource dataSource)
             catch (Exception exception)
                 when (attempt < maxAttempts && PostgresFailure.IsTransientConflict(exception))
             {
-                Console.Error.WriteLine($"retrying catalog command after a concurrency conflict, attempt {attempt}");
+                StructuredLog.Error("cli", "catalog.retry_after_conflict", ("attempt", attempt));
                 await Task.Delay(TimeSpan.FromMilliseconds(50 * attempt), cancellationToken);
             }
         }

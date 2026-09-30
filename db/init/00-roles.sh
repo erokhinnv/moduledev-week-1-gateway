@@ -23,6 +23,14 @@
 #                      delivery.claim_outbox / succeed_outbox / fail_outbox, ни одной таблицы.
 #   inbox_reconciler - роль Python-согласователя Inbox (неделя 3). EXECUTE ровно на одну функцию
 #                      delivery.reconcile_inbox. Обе роли не состоят ни в одной другой роли.
+#   autocheck_reader - роль наблюдателя (неделя 4). Здесь у неё только CONNECT, а USAGE схемы
+#                      autocheck и SELECT её представлений выдаёт миграция 022. Ни членства,
+#                      ни прав на физические отношения, функции, последовательности, CREATE
+#                      и TEMP у неё нет.
+#
+# Здесь же закрепляется профиль доставки и аренды. Значения приходят в сервис postgres
+# переменными окружения и становятся настройками САМОЙ базы (ALTER DATABASE ... SET):
+# политику повторов определяет авторитетное состояние, а не клиент, вызывающий границу.
 #
 # Почему миграции и публикация разведены. Раньше обе задачи выполняла одна роль course_migrator,
 # а она — член course_owner с атрибутом INHERIT, то есть обладает правами владельца НЕЯВНО, даже
@@ -30,6 +38,36 @@
 # заодно полный DDL и прямой доступ к предметному состоянию. Теперь публикацию можно доверить
 # отдельной стороне (например сборочному конвейеру), не выдавая ей ничего сверх каталога.
 set -e
+
+# Числовые настройки профиля проверяются до ALTER DATABASE: пустое, нулевое или нечисловое
+# значение обязано остановить инициализацию, а не молча стать частью политики доставки.
+require_positive_integer() {
+    case "$2" in
+        ''|*[!0-9]*|0) echo "$1 must be a positive integer" >&2; exit 1;;
+    esac
+}
+
+# Отсутствие jitter — осмысленная настройка (один dispatcher, предсказуемое расписание), поэтому
+# ноль здесь допустим, в отличие от числа попыток или срока аренды.
+require_non_negative_integer() {
+    case "$2" in
+        ''|*[!0-9]*) echo "$1 must be a non-negative integer" >&2; exit 1;;
+    esac
+}
+
+: "${COURSE_OUTBOX_MAX_ATTEMPTS:=5}"
+: "${COURSE_OUTBOX_BACKOFF_BASE_MS:=1000}"
+: "${COURSE_OUTBOX_BACKOFF_MAX_MS:=60000}"
+: "${COURSE_OUTBOX_JITTER_MAX_MS:=0}"
+: "${COURSE_OUTBOX_LEASE_MS:=30000}"
+: "${COURSE_JOB_LEASE_MS:=30000}"
+
+require_positive_integer COURSE_OUTBOX_MAX_ATTEMPTS "$COURSE_OUTBOX_MAX_ATTEMPTS"
+require_positive_integer COURSE_OUTBOX_BACKOFF_BASE_MS "$COURSE_OUTBOX_BACKOFF_BASE_MS"
+require_positive_integer COURSE_OUTBOX_BACKOFF_MAX_MS "$COURSE_OUTBOX_BACKOFF_MAX_MS"
+require_non_negative_integer COURSE_OUTBOX_JITTER_MAX_MS "$COURSE_OUTBOX_JITTER_MAX_MS"
+require_positive_integer COURSE_OUTBOX_LEASE_MS "$COURSE_OUTBOX_LEASE_MS"
+require_positive_integer COURSE_JOB_LEASE_MS "$COURSE_JOB_LEASE_MS"
 
 psql -v ON_ERROR_STOP=1 \
      --username "$POSTGRES_USER" \
@@ -41,7 +79,14 @@ psql -v ON_ERROR_STOP=1 \
      -v worker_password="$COURSE_WORKER_PASSWORD" \
      -v operator_password="$COURSE_OPERATOR_PASSWORD" \
      -v outbox_password="$COURSE_OUTBOX_PASSWORD" \
-     -v inbox_password="$COURSE_INBOX_PASSWORD" <<'EOSQL'
+     -v inbox_password="$COURSE_INBOX_PASSWORD" \
+     -v autocheck_password="$COURSE_AUTOCHECK_PASSWORD" \
+     -v outbox_max_attempts="$COURSE_OUTBOX_MAX_ATTEMPTS" \
+     -v outbox_backoff_base_ms="$COURSE_OUTBOX_BACKOFF_BASE_MS" \
+     -v outbox_backoff_max_ms="$COURSE_OUTBOX_BACKOFF_MAX_MS" \
+     -v outbox_jitter_max_ms="$COURSE_OUTBOX_JITTER_MAX_MS" \
+     -v outbox_lease_ms="$COURSE_OUTBOX_LEASE_MS" \
+     -v job_lease_ms="$COURSE_JOB_LEASE_MS" <<'EOSQL'
 CREATE ROLE course_owner NOLOGIN;
 CREATE ROLE course_migrator LOGIN PASSWORD :'migrator_password' IN ROLE course_owner;
 CREATE ROLE course_publisher LOGIN PASSWORD :'publisher_password';
@@ -50,9 +95,10 @@ CREATE ROLE course_operator LOGIN PASSWORD :'operator_password';
 CREATE ROLE workflow_worker LOGIN PASSWORD :'worker_password';
 CREATE ROLE outbox_dispatcher LOGIN PASSWORD :'outbox_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 CREATE ROLE inbox_reconciler LOGIN PASSWORD :'inbox_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE autocheck_reader LOGIN PASSWORD :'autocheck_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
 REVOKE ALL ON DATABASE :"dbname" FROM PUBLIC;
-GRANT CONNECT ON DATABASE :"dbname" TO course_owner, course_migrator, course_publisher, course_runtime, course_operator, workflow_worker, outbox_dispatcher, inbox_reconciler;
+GRANT CONNECT ON DATABASE :"dbname" TO course_owner, course_migrator, course_publisher, course_runtime, course_operator, workflow_worker, outbox_dispatcher, inbox_reconciler, autocheck_reader;
 GRANT CREATE ON DATABASE :"dbname" TO course_owner;
 
 ALTER SCHEMA public OWNER TO course_owner;
@@ -66,4 +112,13 @@ ALTER DEFAULT PRIVILEGES FOR ROLE course_owner REVOKE EXECUTE ON FUNCTIONS FROM 
 ALTER DEFAULT PRIVILEGES FOR ROLE course_migrator REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE course_owner REVOKE ALL ON TABLES FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE course_migrator REVOKE ALL ON TABLES FROM PUBLIC;
+
+-- Профиль доставки и аренды как настройки базы: их видит любая сессия, включая границы
+-- delivery.* и workflow.claim_jobs, и ни один клиент не может подменить их своим параметром.
+ALTER DATABASE :"dbname" SET course.outbox_max_attempts    = :'outbox_max_attempts';
+ALTER DATABASE :"dbname" SET course.outbox_backoff_base_ms = :'outbox_backoff_base_ms';
+ALTER DATABASE :"dbname" SET course.outbox_backoff_max_ms  = :'outbox_backoff_max_ms';
+ALTER DATABASE :"dbname" SET course.outbox_jitter_max_ms   = :'outbox_jitter_max_ms';
+ALTER DATABASE :"dbname" SET course.outbox_lease_ms        = :'outbox_lease_ms';
+ALTER DATABASE :"dbname" SET course.job_lease_ms           = :'job_lease_ms';
 EOSQL

@@ -7,11 +7,10 @@ using Course.Shared;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Logging.ClearProviders();
-builder.Logging.AddSimpleConsole(options =>
-{
-    options.SingleLine = true;
-    options.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
-});
+// Одна строка журнала — один JSON object (контракт наблюдаемости недели 4). Именованные
+// placeholder'ы вызовов logger.Log* становятся полями записи, поэтому путь операции находится
+// фильтром по correlationId, а не разбором текста строки.
+builder.Logging.AddProvider(new JsonConsoleLoggerProvider("api"));
 
 // Учётные данные, токены и полные тела запросов НИКОГДА не попадают в логи: в лог пишутся только
 // технические события жизненного цикла фреймворка и собственные структурированные события этого
@@ -42,7 +41,12 @@ builder.Services.AddSingleton<DispatchRecorder>();
 builder.Services.AddSingleton<DispatchQueue>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<DispatchQueue>());
 builder.Services.AddSingleton<ReadinessProbe>();
+builder.Services.AddSingleton<RuntimeMetrics>();
 builder.Services.AddSingleton(_ => SignatureBoundary.FromEnvironment());
+// Точка аварийной остановки читается один раз при старте: она принадлежит процессу целиком, а не
+// отдельному запросу, и менять её на лету было бы способом остановить работающий контур.
+builder.Services.AddSingleton(_ => Failpoint.FromEnvironment("COURSE_APPLICATION_NAME"));
+builder.Services.AddSingleton<ActionFailpoints>();
 builder.Services.AddSingleton<ActionRuntime>();
 
 var app = builder.Build();
@@ -150,31 +154,59 @@ app.MapGet("/openapi/actions/{module}/{action}/{document}", async (
 });
 
 // ---------------------------------------------------------------------------
-// Проверки состояния (health checks).
+// Проверки состояния (health checks) и метрики.
+//
+// Форма ответов закреплена контрактом наблюдаемости недели 4 и намеренно минимальна: причина
+// отказа уходит в журнал, а не в тело probe. Живость и готовность имеют РАЗНУЮ семантику —
+// liveness не выполняет глубокую проверку зависимостей и остаётся зелёной, пока процесс способен
+// ответить, иначе перезапускали бы живой сервис из-за недоступной базы.
 // ---------------------------------------------------------------------------
-
-// Liveness ("процесс жив") не проверяет ничего, кроме самого факта, что HTTP-сервер отвечает.
 app.MapGet("/health/live", async (HttpContext context) =>
-    await WriteAsync(context, 200, new JsonObject
-    {
-        ["status"] = "ok",
-        ["service"] = "api",
-        ["check"] = "process",
-    }));
+    await WriteAsync(context, 200, new JsonObject { ["status"] = "live" }));
 
 // Readiness ("готов принимать реальную нагрузку") реально проверяет доступность PostgreSQL и
 // завершённость инициализации — см. подробности в ReadinessProbe.cs.
 app.MapGet("/health/ready", async (HttpContext context, ReadinessProbe probe) =>
 {
     var state = await probe.CheckAsync(context.RequestAborted);
-    await WriteAsync(context, state.Ready ? 200 : 503, new JsonObject
+    if (state.Ready)
     {
-        ["status"] = state.Ready ? "ok" : "error",
-        ["service"] = "api",
-        ["check"] = "postgres",
-        ["reason"] = state.Reason,
-        ["details"] = state.Details?.DeepClone(),
+        await WriteAsync(context, 200, new JsonObject { ["status"] = "ready" });
+        return;
+    }
+
+    var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+    logger.LogWarning("readiness reported not ready reason={Reason}", state.Reason);
+    await WriteAsync(context, 503, new JsonObject
+    {
+        ["status"] = "not_ready",
+        ["code"] = ContractCodes.DependencyUnavailable,
     });
+});
+
+// Метрики — проекция авторитетного состояния, а не собственный счётчик процесса: значение
+// очереди обязано совпадать с тем, что показывают проверочные представления PostgreSQL.
+app.MapGet("/metrics", async (HttpContext context, RuntimeMetrics metrics) =>
+{
+    var document = await metrics.RenderAsync(context.RequestAborted);
+    if (document is null)
+    {
+        await WriteAsync(context, 503, new JsonObject
+        {
+            ["status"] = "not_ready",
+            ["code"] = ContractCodes.DependencyUnavailable,
+        });
+        return;
+    }
+
+    if (context.Response.HasStarted)
+    {
+        return;
+    }
+
+    context.Response.StatusCode = 200;
+    context.Response.ContentType = OpenMetrics.MediaType;
+    await context.Response.WriteAsync(document, context.RequestAborted);
 });
 
 // Любой маршрут, не подпадающий под перечисленные выше — это маршрут вне контракта курса.

@@ -16,7 +16,7 @@ if [[ -z "${COURSE_JWT_SIGNING_KEY:-}" ]]; then
   eval "$(python3 scripts/dev_env.py)"
 fi
 
-project="${COURSE_INTEGRATION_COMPOSE_PROJECT:-moduledev-week-3-itest}"
+project="${COURSE_INTEGRATION_COMPOSE_PROJECT:-moduledev-week-4-itest}"
 export COURSE_INTEGRATION_COMPOSE_PROJECT="$project"
 export COURSE_GATEWAY_PORT="${COURSE_GATEWAY_PORT:-8080}"
 export COURSE_INTEGRATION_BASE_URL="${COURSE_INTEGRATION_BASE_URL:-http://localhost:$COURSE_GATEWAY_PORT}"

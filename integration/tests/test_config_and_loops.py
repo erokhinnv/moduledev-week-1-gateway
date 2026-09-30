@@ -72,7 +72,7 @@ class ConfigurationTests(unittest.TestCase):
         settings = dispatcher_settings({**DISPATCHER, "COURSE_TEST_PROFILE": "1"})
         self.assertEqual(settings.provider_timeout_s, 0.5)
         self.assertLessEqual(settings.poll_interval_s, 0.1)
-        reconciler = reconciler_settings({**DATABASE, "COURSE_TEST_PROFILE": "1", "INBOX_POLL_INTERVAL_MS": "5000"})
+        reconciler = reconciler_settings({**DATABASE, "COURSE_TEST_PROFILE": "1", "COURSE_INBOX_POLL_MS": "5000"})
         self.assertLessEqual(reconciler.poll_interval_s, 0.5)
 
     def test_database_calls_are_bounded_by_a_statement_timeout(self):

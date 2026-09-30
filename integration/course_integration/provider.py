@@ -9,6 +9,7 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import threading
 import urllib.parse
 from dataclasses import dataclass
 from typing import Callable
@@ -128,6 +129,41 @@ def _default_connection(scheme: str) -> ConnectionFactory:
     return lambda host, port, timeout: http.client.HTTPConnection(host, port, timeout=timeout)
 
 
+def _within_budget(attempt: Callable[[], AttemptResult], timeout_s: float) -> AttemptResult:
+    """Bound one attempt by the configured budget, INCLUDING name resolution.
+
+    A socket timeout covers connect and read, but never ``getaddrinfo``: an absent provider name
+    costs whatever the resolver decides, and on a Docker host that is seconds while the declared
+    budget is milliseconds. Such an attempt also outlives the delivery lease, so the report it
+    eventually brings is refused by fencing - the attempt is then wasted twice, and the delivery
+    looks stuck for reasons nothing in the stored state explains.
+
+    The attempt therefore runs on a daemon thread and is abandoned when the budget expires. An
+    abandoned attempt may still reach the provider: the stable ``externalRequestId`` keeps that to
+    one payment, and its result is ignored anyway, because the report is conditional on owner and
+    lease version.
+    """
+    outcome: list[AttemptResult | BaseException] = []
+    finished = threading.Event()
+
+    def run() -> None:
+        try:
+            outcome.append(attempt())
+        except BaseException as error:  # noqa: BLE001 - re-raised on the calling thread
+            outcome.append(error)
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, name="provider-attempt", daemon=True).start()
+    if not finished.wait(timeout_s):
+        return AttemptResult(error_code=TRANSPORT_RETRYABLE)
+
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
 def send_payment(
     base_url: str,
     request: PaymentRequest,
@@ -138,6 +174,19 @@ def send_payment(
     default_port = 443 if parsed.scheme == "https" else 80
     factory = connection_factory or _default_connection(parsed.scheme)
     path = parsed.path.rstrip("/") + request.path
+    return _within_budget(
+        lambda: _exchange(factory, parsed, default_port, path, request, timeout_s), timeout_s
+    )
+
+
+def _exchange(
+    factory: ConnectionFactory,
+    parsed: urllib.parse.SplitResult,
+    default_port: int,
+    path: str,
+    request: PaymentRequest,
+    timeout_s: float,
+) -> AttemptResult:
     connection = factory(parsed.hostname or "", parsed.port or default_port, timeout_s)
     try:
         connection.request("POST", path, body=request.body, headers=request.headers)

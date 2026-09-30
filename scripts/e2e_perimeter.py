@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""End-to-end scenarios of the week-3 perimeter against a running Compose stack.
+"""End-to-end scenarios of the weeks 3-4 perimeter against a running Compose stack.
 
     eval "$(python3 scripts/dev_env.py)"
     docker compose -p course-e2e up -d --build
     COMPOSE_PROJECT=course-e2e python3 scripts/e2e_perimeter.py
 
-Behaviour is observed through HTTP actions, provider audit and the read-only ``autocheck`` views -
-the same seams the course checker uses. Two scenarios deliberately go below them: the storage
-invariants attack physical tables inside rolled-back transactions to prove the triggers hold, and the
-lock-order scenario holds row locks of a process step to reproduce a race deterministically.
-Exit code 0 means every scenario passed.
+Behaviour is observed through HTTP actions, provider audit, internal health/OpenMetrics addresses
+and the read-only ``autocheck`` views - the same seams the course checker uses. Two scenarios
+deliberately go below them: the storage invariants attack physical tables inside rolled-back
+transactions to prove the triggers hold, and the lock-order scenario holds row locks of a process
+step to reproduce a race deterministically.
+
+Scenarios that need a queue to stand still stop BOTH tenants of it, and every failpoint scenario
+waits for the published acknowledgement instead of sleeping. Exit code 0 means every scenario
+passed.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from typing import Any, Callable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dev_env import issue_token  # noqa: E402
 
-PROJECT = os.environ.get("COMPOSE_PROJECT", "moduledev-week-3")
+PROJECT = os.environ.get("COMPOSE_PROJECT", "moduledev-week-4")
 GATEWAY = f"http://127.0.0.1:{os.environ.get('COURSE_GATEWAY_PORT', '8080')}"
 KEY = os.environ["COURSE_JWT_SIGNING_KEY"]
 HMAC_SECRET = os.environ["PROVIDER_HMAC_SECRET"]
@@ -45,6 +49,26 @@ CLIENT = issue_token(KEY, "e2e-client", "web", ["payment:write", "payment:read",
 REVIEWER = issue_token(KEY, "e2e-reviewer", "backoffice", ["workflow:manual", "payment:read"], 3600)
 RECEIPT = issue_token(KEY, "receipt-provider", "integration", ["receipt:write"], 3600)
 OTHER_REVIEWER = issue_token(KEY, "e2e-reviewer-2", "backoffice", ["workflow:manual"], 3600)
+OBSERVER = issue_token(KEY, "e2e-observer", "ops", ["diagnostics:read"], 3600)
+
+# Week 4 runs two of each queue tenant. A scenario that needs the queue to stand still has to stop
+# BOTH instances: leaving the second one running means the delivery is simply picked up by it, and
+# the scenario silently proves nothing.
+DISPATCHERS = ("outbox-dispatcher", "outbox-dispatcher-b")
+RECONCILERS = ("inbox-reconciler", "inbox-reconciler-b")
+PERIMETER = (*DISPATCHERS, "receipt-adapter", *RECONCILERS)
+
+# Internal observability addresses. Nothing here is published to the host.
+OBSERVABILITY = {
+    "api": "http://api:8080",
+    "worker-a": "http://worker-a:8080",
+    "worker-b": "http://worker-b:8080",
+    "outbox-dispatcher": "http://outbox-dispatcher:8080",
+    "outbox-dispatcher-b": "http://outbox-dispatcher-b:8080",
+    "receipt-adapter": "http://receipt-adapter:8082",
+    "inbox-reconciler": "http://inbox-reconciler:8080",
+    "inbox-reconciler-b": "http://inbox-reconciler-b:8080",
+}
 
 
 class Failure(AssertionError):
@@ -70,6 +94,48 @@ def compose(*args: str, timeout: float = 120) -> subprocess.CompletedProcess[str
         ["docker", "compose", "-p", PROJECT, *args],
         capture_output=True, text=True, timeout=timeout, env=env, check=False,
     )
+
+
+def stop(*services: str) -> None:
+    check(compose("stop", *services).returncode == 0, f"cannot stop {', '.join(services)}")
+
+
+def start(*services: str, recreate: bool = False, environment: dict[str, str] | None = None) -> None:
+    arguments = ["up", "-d", "--no-build", "--no-deps"]
+    if recreate:
+        arguments.append("--force-recreate")
+    if environment is None:
+        check(compose(*arguments, *services).returncode == 0, f"cannot start {', '.join(services)}")
+        return
+    # A failpoint is read by the process at start-up, so it has to be part of the environment of
+    # the launch itself rather than set afterwards.
+    merged = {**os.environ, "MSYS2_ARG_CONV_EXCL": "*", **environment}
+    result = subprocess.run(
+        ["docker", "compose", "-p", PROJECT, *arguments, *services],
+        capture_output=True, text=True, timeout=180, env=merged, check=False,
+    )
+    check(result.returncode == 0, f"cannot start {', '.join(services)}: {result.stderr[-300:]}")
+
+
+def wait_gateway(timeout: float = 120) -> None:
+    """Poll gateway readiness. A recreated API answers a moment later, not instantly."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(GATEWAY + "/health/ready", timeout=2) as response:
+                if response.status == 200:
+                    return
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            pass
+        time.sleep(0.3)
+    raise Failure("gateway readiness did not become 200")
+
+
+def wait_for_log(service: str, needle: str, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    while needle not in compose("logs", "--no-color", service).stdout:
+        check(time.monotonic() < deadline, f"{service} did not log {needle}")
+        time.sleep(0.2)
 
 
 def sql_rows(query: str) -> list[dict[str, Any]]:
@@ -134,6 +200,42 @@ def internal(url: str, body: bytes | None = None, headers: dict[str, str] | None
     return int(value["status"]), base64.b64decode(value["data"])
 
 
+def observe(service: str, path: str, source: str = "receipt-adapter") -> tuple[int, bytes, str]:
+    """GET an internal observability address from inside the Compose network.
+
+    The vantage point is a Python service of the perimeter, because the addresses are reachable
+    only there - no host port publishes them. The default is the adapter: it is the one perimeter
+    service no scenario stops, and a probe launched from a stopped container fails for reasons
+    that have nothing to do with the service being probed.
+    """
+    script = (
+        "import base64,json,sys,urllib.error,urllib.request\n"
+        "req=urllib.request.Request(sys.argv[1],method='GET')\n"
+        "try:\n r=urllib.request.urlopen(req,timeout=10);s=r.status;o=r.read();t=r.headers.get('Content-Type','')\n"
+        "except urllib.error.HTTPError as e:\n s=e.code;o=e.read();t=e.headers.get('Content-Type','')\n"
+        "print(json.dumps({'status':s,'data':base64.b64encode(o).decode(),'type':t}))\n"
+    )
+    result = compose("exec", "-T", source, "python", "-c", script, OBSERVABILITY[service] + path)
+    check(result.returncode == 0, f"observability probe failed for {service}: {result.stderr[-300:]}")
+    value = json.loads(result.stdout.strip())
+    return int(value["status"]), base64.b64decode(value["data"]), value["type"]
+
+
+def openmetrics(document: bytes) -> dict[str, float]:
+    """Parse the scalar samples of a document and reject anything the contract forbids."""
+    text = document.decode("utf-8")
+    check("\r" not in text and text.endswith("# EOF\n"), "document must be LF-only and end with # EOF")
+    samples: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        check(len(parts) >= 2, f"invalid OpenMetrics sample: {line}")
+        check("{" not in parts[0], f"published series must carry no labels: {line}")
+        samples[parts[0]] = float(parts[1])
+    return samples
+
+
 def audit(external_id: str) -> tuple[int, dict[str, Any] | None]:
     status, raw = internal(
         f"http://provider-simulator:8081/internal/audit/{urllib.parse.quote(external_id, safe='')}",
@@ -173,7 +275,7 @@ def signed_receipt(external_id: str, message_id: str, outcome: str = "COMPLETED"
 
 
 def scenario_provider_path() -> None:
-    check(compose("stop", "outbox-dispatcher").returncode == 0, "cannot stop dispatcher")
+    stop(*DISPATCHERS)
     try:
         operation_id, submitted = create_and_submit("PAYMENT_EXECUTION", "1000.00")
         check(submitted["flowName"] == "payment-processing", "server-side binding chose a wrong flow")
@@ -200,7 +302,7 @@ def scenario_provider_path() -> None:
         check(sql_rows(f"SELECT 1 FROM autocheck.inbox WHERE message_id = {sql_text(receipt['messageId'])}") == [],
               "invalid receipts mutated the inbox")
     finally:
-        check(compose("up", "-d", "--no-build", "outbox-dispatcher").returncode == 0, "cannot start dispatcher")
+        start(*DISPATCHERS)
 
     wait_status(operation_id, "COMPLETED")
     status, payment = audit(external_id)
@@ -223,12 +325,12 @@ def scenario_provider_path() -> None:
 
 
 def scenario_adapter_and_recreate() -> None:
-    check(compose("stop", "outbox-dispatcher", "inbox-reconciler").returncode == 0, "cannot stop services")
+    stop(*DISPATCHERS, *RECONCILERS)
     try:
         adapter_and_recreate_steps()
     finally:
         # A failed step must not leave the perimeter stopped for the scenarios that follow.
-        compose("up", "-d", "--no-build", "outbox-dispatcher", "receipt-adapter", "inbox-reconciler")
+        compose("up", "-d", "--no-build", "--no-deps", *PERIMETER)
 
 
 def adapter_and_recreate_steps() -> None:
@@ -268,8 +370,7 @@ def adapter_and_recreate_steps() -> None:
     check(rows[0]["state"] == "RECEIVED" and rows[0]["body_hash"] == hashlib.sha256(compact(receipt)).hexdigest(),
           f"inbox must wait for the reconciler with exact body hash: {rows}")
 
-    check(compose("up", "-d", "--no-build", "--force-recreate", "outbox-dispatcher", "receipt-adapter",
-                  "inbox-reconciler").returncode == 0, "cannot recreate python services")
+    start(*PERIMETER, recreate=True)
     wait_status(operation_id, "REJECTED")
     poll(f"SELECT state FROM autocheck.inbox WHERE message_id = {sql_text(legacy['providerPaymentId'])}",
          lambda rows: rows[0]["state"] == "APPLIED")
@@ -360,28 +461,28 @@ def scenario_failpoint_and_lease_expiry() -> None:
     if os.environ.get("COURSE_TEST_PROFILE") != "1":
         # Failpoints and the short outbox lease exist only in the test profile of the stand.
         raise Skipped("requires a stand started with COURSE_TEST_PROFILE=1")
-    failpoint_env = {**os.environ, "COURSE_FAILPOINT": "after_outbox_claim", "MSYS2_ARG_CONV_EXCL": "*"}
-    started = subprocess.run(
-        ["docker", "compose", "-p", PROJECT, "up", "-d", "--no-build", "--force-recreate", "outbox-dispatcher"],
-        capture_output=True, text=True, timeout=120, env=failpoint_env, check=False)
-    check(started.returncode == 0, "cannot start dispatcher with a failpoint")
+    # The competing tenant is stopped BEFORE the work exists, so the target instance is the one
+    # that claims it. Otherwise the second dispatcher delivers the payment and the barrier proves
+    # nothing about the boundary it was supposed to hold.
+    stop("outbox-dispatcher-b")
+    start("outbox-dispatcher", recreate=True, environment={"COURSE_FAILPOINT": "after_outbox_claim"})
     try:
         operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1012.00")
         external_id = external_request(operation_id)
-        deadline = time.monotonic() + 30
-        while '"event":"failpoint.reached"' not in compose("logs", "--no-color", "outbox-dispatcher").stdout:
-            check(time.monotonic() < deadline, "dispatcher did not acknowledge the failpoint")
-            time.sleep(0.2)
-        check(compose("stop", "outbox-dispatcher").returncode == 0, "cannot stop the dispatcher at the failpoint")
-        leased = sql_rows(f"SELECT state, attempt_count FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}")
-        check(leased == [{"state": "LEASED", "attempt_count": 1}], f"claim must be durable at the barrier: {leased}")
+        wait_for_log("outbox-dispatcher", '"event":"failpoint.reached"')
+        stop("outbox-dispatcher")
+        leased = sql_rows("SELECT state, attempt_count, lease_owner FROM autocheck.outbox "
+                          f"WHERE external_request_id = {sql_text(external_id)}")
+        check(leased == [{"state": "LEASED", "attempt_count": 1, "lease_owner": "outbox-dispatcher"}],
+              f"claim must be durable at the barrier and owned: {leased}")
         check(audit(external_id)[0] == 404, "a stopped failpoint must never reach the provider")
     finally:
-        compose("up", "-d", "--no-build", "--force-recreate", "outbox-dispatcher")
+        start(*DISPATCHERS, recreate=True)
     wait_status(operation_id, "COMPLETED")
     outbox = sql_rows("SELECT state, attempt_count, last_error_code FROM autocheck.outbox "
                       f"WHERE external_request_id = {sql_text(external_id)}")
-    check(outbox == [{"state": "CONFIRMED", "attempt_count": 2, "last_error_code": "lease.expired.retryable"}],
+    check(len(outbox) == 1 and outbox[0]["state"] == "CONFIRMED" and outbox[0]["attempt_count"] == 2
+          and outbox[0]["last_error_code"] == "lease.expired.retryable",
           f"expired lease must be reclaimed with a visible trace: {outbox}")
     status, payment = audit(external_id)
     check(status == 200 and payment and payment["paymentCount"] == 1, f"one payment expected: {payment}")
@@ -395,7 +496,7 @@ def scenario_receipt_lock_order() -> None:
     so the interleaving is deterministic rather than timed.
     """
     barrier = 733001
-    check(compose("stop", "outbox-dispatcher").returncode == 0, "cannot stop dispatcher")
+    stop(*DISPATCHERS)
     holder = None
     try:
         operation_id, submitted = create_and_submit("PAYMENT_EXECUTION", "1013.00")
@@ -440,7 +541,7 @@ def scenario_receipt_lock_order() -> None:
     finally:
         if holder is not None and holder.poll() is None:
             holder.kill()
-        compose("up", "-d", "--no-build", "outbox-dispatcher")
+        compose("up", "-d", "--no-build", "--no-deps", *DISPATCHERS)
 
 
 def scenario_submit_rejects_foreign_process() -> None:
@@ -526,7 +627,7 @@ def attempt_log(container: str, external_id: str) -> list[dict[str, Any]]:
 
 
 def scenario_outbox_retry_budget() -> None:
-    """Four attempts including the first, delays 200/400/800 ms, and what exhaustion means.
+    """Four attempts including the first, delays 200/400/800 ms plus jitter, and what exhaustion means.
 
     The provider is made unreachable by pointing a one-off dispatcher at a closed port. A stopped
     container would leave its name unresolvable, so the provider timeout no longer bounds an
@@ -535,10 +636,12 @@ def scenario_outbox_retry_budget() -> None:
     """
     if os.environ.get("COURSE_TEST_PROFILE") != "1":
         raise Skipped("requires the published test profile of a stand started with COURSE_TEST_PROFILE=1")
-    policy = sql_rows("SELECT max_attempts, delays_ms::text AS delays FROM delivery.active_policy()")
-    check(policy == [{"max_attempts": 4, "delays": "[200, 400, 800]"}], f"published test profile expected: {policy}")
+    policy = sql_rows("SELECT max_attempts, backoff_base_ms, backoff_max_ms, jitter_max_ms FROM delivery.active_policy()")
+    check(policy == [{"max_attempts": 4, "backoff_base_ms": 200, "backoff_max_ms": 800, "jitter_max_ms": 100}],
+          f"published test profile expected: {policy}")
 
-    check(compose("stop", "outbox-dispatcher").returncode == 0, "cannot stop the dispatcher")
+    # Both regular tenants stand still: a one-off dispatcher must be the only one attempting.
+    stop(*DISPATCHERS)
     try:
         # 1. Unreachable through the whole budget: every attempt, every delay, then a terminal state
         #    that does not pretend to know the subject result.
@@ -560,7 +663,10 @@ def scenario_outbox_retry_budget() -> None:
                 attempts = attempt_log(container, external_id)
             check([a["state"] for a in attempts] == ["RETRY_WAIT", "RETRY_WAIT", "RETRY_WAIT", "DEAD"],
                   f"attempt states: {attempts}")
-            check([a.get("nextAttemptInMs") for a in attempts] == [200, 400, 800, None],
+            # The exponent is exact, the jitter is uniform over 0..100 ms and added to every delay.
+            delays = [a.get("nextAttemptInMs") for a in attempts]
+            check(delays[3] is None and all(isinstance(d, int) and base <= d <= base + 100
+                                            for d, base in zip(delays[:3], (200, 400, 800))),
                   f"delays decided by PostgreSQL: {attempts}")
             check(all(a["errorCode"] == "transport.error.retryable" and a["httpStatus"] is None for a in attempts),
                   f"an unreachable provider is a retryable transport error: {attempts}")
@@ -586,7 +692,10 @@ def scenario_outbox_retry_budget() -> None:
         # 2. Unreachable for three attempts, back before the fourth: the last attempt is still there.
         #    Attempts are gated by the dispatcher poll: with a four-second poll the wait before the
         #    fourth attempt lasts seconds, and the one-off dispatcher is killed inside that window.
-        container = run_dispatcher(PROVIDER_URL="http://127.0.0.1:9", OUTBOX_POLL_INTERVAL_MS="4000")
+        #    The test profile clamps the poll to 100 ms, so this one dispatcher runs outside it; the
+        #    attempt budget and the delays still come from PostgreSQL, not from its profile.
+        container = run_dispatcher(PROVIDER_URL="http://127.0.0.1:9", COURSE_OUTBOX_POLL_MS="4000",
+                                   COURSE_TEST_PROFILE="0")
         try:
             operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1060.00")
             external_id = external_request(operation_id)
@@ -595,7 +704,7 @@ def scenario_outbox_retry_budget() -> None:
         finally:
             remove_container(container)
     finally:
-        check(compose("start", "outbox-dispatcher").returncode == 0, "cannot start the dispatcher")
+        start(*DISPATCHERS)
 
     wait_status(operation_id, "COMPLETED")
     outbox = sql_rows(f"SELECT state, attempt_count FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}")
@@ -605,10 +714,275 @@ def scenario_outbox_retry_budget() -> None:
           and payment["idempotencyKey"] == external_id,
           f"the restored provider must see one request with the original key: {payment}")
 
+def scenario_health_and_metrics() -> None:
+    """Live, ready and metrics of all eight processes, and what a provider outage may not break."""
+    for service in OBSERVABILITY:
+        status, body, content_type = observe(service, "/health/live")
+        check(status == 200 and json.loads(body) == {"status": "live"}
+              and content_type.startswith("application/json"),
+              f"{service} liveness: {status} {body!r} {content_type}")
+        status, body, _ = observe(service, "/health/ready")
+        check(status == 200 and json.loads(body) == {"status": "ready"},
+              f"{service} readiness: {status} {body!r}")
+        status, document, content_type = observe(service, "/metrics")
+        check(status == 200 and content_type == "application/openmetrics-text; version=1.0.0; charset=utf-8",
+              f"{service} metrics media type: {status} {content_type}")
+        openmetrics(document)
+
+    required = {"workflow_jobs_ready", "workflow_job_oldest_age_seconds", "workflow_processes_waiting",
+                "outbox_pending", "outbox_oldest_age_seconds", "workflow_failures_total"}
+    samples = openmetrics(observe("api", "/metrics")[1])
+    check(required <= set(samples), f"api must publish every required series: {sorted(set(samples))}")
+
+    # The metric is a projection of the authoritative state, so it has to agree with the queue it
+    # describes. Both are read with the dispatchers stopped, so nothing moves between the reads.
+    stop(*DISPATCHERS)
+    try:
+        operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1030.00")
+        external_id = external_request(operation_id)
+        poll(f"SELECT state FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}",
+             lambda rows: len(rows) == 1 and rows[0]["state"] in ("PENDING", "RETRY_WAIT"))
+        pending = sql_rows("SELECT count(*) AS value FROM autocheck.outbox "
+                           "WHERE state IN ('PENDING', 'LEASED', 'RETRY_WAIT')")[0]["value"]
+        samples = openmetrics(observe("api", "/metrics")[1])
+        check(samples["outbox_pending"] == float(pending) and samples["outbox_pending"] >= 1,
+              f"outbox_pending {samples['outbox_pending']} must equal the queue {pending}")
+        check(samples["outbox_oldest_age_seconds"] > 0, "an undelivered message must have an age")
+
+        # A provider outage is a designed mode: it shows up in delivery state and metrics, never in
+        # readiness of the runtime. Otherwise the orchestrator is asked to drain the very processes
+        # that are supposed to work the backlog off.
+        stop("provider-simulator")
+        try:
+            start("outbox-dispatcher")
+            for service in ("api", "worker-a", "worker-b", "outbox-dispatcher"):
+                status, body, _ = observe(service, "/health/ready", source="inbox-reconciler")
+                check(status == 200 and json.loads(body) == {"status": "ready"},
+                      f"{service} must stay ready while the provider is away: {status} {body!r}")
+            retry = poll("SELECT state, attempt_count, last_error_code FROM autocheck.outbox "
+                         f"WHERE external_request_id = {sql_text(external_id)}",
+                         lambda rows: len(rows) == 1 and rows[0]["state"] in ("RETRY_WAIT", "DEAD"),
+                         timeout=20)
+            check(str(retry[0]["last_error_code"]).endswith(".retryable"),
+                  f"provider outage must be classified as retryable: {retry}")
+        finally:
+            start("provider-simulator")
+    finally:
+        start(*DISPATCHERS)
+    wait_status(operation_id, "COMPLETED")
+    status, payment = audit(external_id)
+    check(status == 200 and payment and payment["paymentCount"] == 1,
+          f"recovery after the outage must produce exactly one payment: {payment}")
+
+
+def scenario_dead_letter_and_late_receipt() -> None:
+    """Exhausted delivery is a technical outcome, and a late receipt still wins."""
+    if os.environ.get("COURSE_TEST_PROFILE") != "1":
+        raise Skipped("requires the short retry profile of a stand started with COURSE_TEST_PROFILE=1")
+    stop("provider-simulator")
+    try:
+        operation_id, submitted = create_and_submit("PAYMENT_EXECUTION", "1040.00")
+        external_id = external_request(operation_id)
+        dead = poll("SELECT state, attempt_count, last_error_code, dead_at IS NOT NULL AS has_dead_at "
+                    f"FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}",
+                    lambda rows: len(rows) == 1 and rows[0]["state"] == "DEAD", timeout=40)
+        check(dead[0]["attempt_count"] == 4 and dead[0]["has_dead_at"]
+              and str(dead[0]["last_error_code"]).endswith(".retryable"),
+              f"exhaustion must keep the attempt count, the moment and the last code: {dead}")
+
+        # The provider may have accepted the request and lost the response, so DEAD answers only
+        # the question about delivery attempts. A false subject failure here would be a lie.
+        state = sql_rows(
+            "SELECT o.status AS operation_status, p.state AS process_state "
+            "FROM autocheck.operations o JOIN autocheck.processes p USING (process_id) "
+            f"WHERE o.operation_id = '{operation_id}'::uuid")
+        check(state == [{"operation_status": "PROCESSING", "process_state": "WAITING_SIGNAL"}],
+              f"DEAD delivery must not fail the operation or the process: {state}")
+
+        status, stalled = action("diagnostics", "stalled", {}, OBSERVER)
+        items = (stalled or {}).get("result", {}).get("items", [])
+        check(status == 200 and stalled and stalled["outcome"] == "FOUND", f"stalled: {status} {stalled}")
+        check(any(item["operationId"] == operation_id and item["externalRequestId"] == external_id
+                  and item["processId"] == submitted["processId"] for item in items),
+              f"an exhausted delivery must be reported as stalled: {items}")
+        identifiers = [item["operationId"] for item in items]
+        check(identifiers == sorted(set(identifiers)), f"stalled items must be unique and ordered: {identifiers}")
+
+        # A valid receipt arriving after exhaustion confirms the delivery and continues the process.
+        message_id = f"e2e-late-{secrets.token_hex(5)}"
+        receipt, signature = signed_receipt(external_id, message_id)
+        status, body = action("receipt", "accept", receipt, RECEIPT, message_id, signature)
+        check(status == 200 and body and body["outcome"] == "RECEIVED", f"late receipt: {status} {body}")
+        wait_status(operation_id, "COMPLETED")
+        outbox = sql_rows("SELECT state, dead_at IS NOT NULL AS has_dead_at, attempt_count "
+                          f"FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}")
+        check(outbox == [{"state": "CONFIRMED", "has_dead_at": True, "attempt_count": 4}],
+              f"late receipt must confirm without erasing the exhaustion evidence: {outbox}")
+
+        status, stalled = action("diagnostics", "stalled", {}, OBSERVER)
+        items = (stalled or {}).get("result", {}).get("items", [])
+        check(status == 200 and all(item["operationId"] != operation_id for item in items),
+              f"a settled operation must leave the stalled selection: {items}")
+    finally:
+        start("provider-simulator")
+
+
+def scenario_diagnostics_trace() -> None:
+    """Every known identifier of one chain returns the same subject facts."""
+    operation_id, submitted = create_and_submit("PAYMENT_EXECUTION", "1050.00")
+    wait_status(operation_id, "COMPLETED")
+    external_id = external_request(operation_id)
+    process_id = submitted["processId"]
+    job = sql_rows(f"SELECT job_id, execution_id FROM autocheck.jobs WHERE process_id = '{process_id}'::uuid "
+                   "ORDER BY job_id LIMIT 1")
+    message = sql_rows(f"SELECT message_id FROM autocheck.receipts WHERE external_request_id = {sql_text(external_id)}")
+    check(len(job) == 1 and len(message) == 1, f"trace sources missing: {job} {message}")
+
+    expectations = {
+        "operationId": operation_id,
+        "processId": process_id,
+        "externalRequestId": external_id,
+        "jobId": job[0]["job_id"],
+        "executionId": job[0]["execution_id"],
+        "messageId": message[0]["message_id"],
+    }
+    required = {"query", "dispatches", "operation", "operationEvents", "process", "steps", "jobs",
+                "attempts", "outbox", "inbox", "receipts", "decisions"}
+    baseline: dict[str, Any] | None = None
+    for kind, identifier in expectations.items():
+        status, body = action("diagnostics", "trace", {"identifier": identifier}, OBSERVER)
+        result = (body or {}).get("result")
+        check(status == 200 and body and body["outcome"] == "FOUND" and isinstance(result, dict),
+              f"trace by {kind}: {status} {body}")
+        check(required <= set(result), f"trace by {kind} is incomplete: {sorted(set(result))}")
+        check(kind in result["query"]["matchedBy"] and result["query"]["identifier"] == identifier,
+              f"trace by {kind} reported {result['query']}")
+        check(result["operation"]["operationId"] == operation_id
+              and result["process"]["processId"] == process_id
+              and result["receipts"] and result["outbox"],
+              f"trace by {kind} lost the chain: {result['operation']} {result['process']}")
+        subject = {key: value for key, value in result.items() if key != "query"}
+        if baseline is None:
+            baseline = subject
+        else:
+            check(subject == baseline, f"trace by {kind} returned different subject facts")
+
+    # Nothing sensitive may travel in a diagnostic projection.
+    serialized = json.dumps(baseline)
+    for forbidden in (HMAC_SECRET, CAPABILITY, AUDIT_TOKEN, RECEIPT, "e2e rejection"):
+        check(forbidden not in serialized, "trace leaked a secret or a message body")
+
+    status, body = action("diagnostics", "trace", {"identifier": f"unknown-{secrets.token_hex(8)}"}, OBSERVER)
+    check(status == 404 and body and body["code"] == "diagnostics.trace_not_found", f"unknown identifier: {status} {body}")
+    status, body = action("diagnostics", "trace", {"identifier": operation_id}, CLIENT)
+    check(status == 403 and body and body["code"] == "access.denied", f"trace without policy: {status} {body}")
+    status, body = action("diagnostics", "stalled", {"unexpected": True}, OBSERVER)
+    check(status == 422 and body and body["code"] == "payload.invalid", f"stalled payload: {status} {body}")
+
+
+def scenario_api_failpoints() -> None:
+    """The two commit boundaries of the API: a durable Inbox and a rolled-back manual decision."""
+    if os.environ.get("COURSE_TEST_PROFILE") != "1":
+        raise Skipped("requires a stand started with COURSE_TEST_PROFILE=1")
+
+    # after_inbox_saved: the receipt is committed, the API dies before answering, and the signal is
+    # applied later by an ordinary reconciler - not by the API.
+    #
+    # The dispatchers are stopped too, and not out of caution: a delivered payment brings the
+    # provider's OWN callback, and then the synthetic receipt below is a second message for the
+    # same waiting step. The reconciler would settle it as CONFLICT - correctly - and the scenario
+    # would be measuring the wrong thing.
+    stop(*DISPATCHERS, *RECONCILERS)
+    try:
+        operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1060.00")
+        external_id = external_request(operation_id)
+        poll("SELECT p.state FROM autocheck.processes p JOIN autocheck.operations o USING (process_id) "
+             f"WHERE o.operation_id = '{operation_id}'::uuid",
+             lambda rows: len(rows) == 1 and rows[0]["state"] == "WAITING_SIGNAL")
+        message_id = f"e2e-inbox-{secrets.token_hex(5)}"
+        start("api", recreate=True, environment={"COURSE_FAILPOINT": "after_inbox_saved"})
+        wait_gateway()
+        receipt, signature = signed_receipt(external_id, message_id)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool.submit(action, "receipt", "accept", receipt, RECEIPT, message_id, signature)
+        wait_for_log("api", '"name":"after_inbox_saved"')
+        check(compose("kill", "api").returncode == 0, "cannot kill the API at the barrier")
+        pool.shutdown(wait=False)
+        saved = sql_rows(f"SELECT state FROM autocheck.inbox WHERE message_id = {sql_text(message_id)}")
+        check(saved == [{"state": "RECEIVED"}], f"the Inbox commit must survive the API: {saved}")
+        check(sql_rows(f"SELECT 1 FROM autocheck.signals WHERE message_id = {sql_text(message_id)}") == [],
+              "the API must not do the reconciler's work")
+    finally:
+        start("api", recreate=True)
+        start(*DISPATCHERS, *RECONCILERS)
+        wait_gateway()
+    wait_status(operation_id, "COMPLETED")
+    poll(f"SELECT state FROM autocheck.inbox WHERE message_id = {sql_text(message_id)}",
+         lambda rows: rows == [{"state": "APPLIED"}])
+
+    # after_manual_decision: the decision, the transition and the successful idempotency result are
+    # rolled back together, and the repeat under the same key creates exactly one decision.
+    manual_operation, manual = create_and_submit("PAYMENT_APPROVAL", "100000.01")
+    step = poll("SELECT step_instance_id FROM autocheck.steps "
+                f"WHERE process_id = '{manual['processId']}'::uuid AND step_type = 'MANUAL' AND state = 'WAITING'",
+                lambda rows: len(rows) == 1)
+    payload = {"processId": manual["processId"], "stepInstanceId": step[0]["step_instance_id"],
+               "decision": "APPROVED", "reason": "e2e failpoint repeat"}
+    key = f"e2e-manual-{secrets.token_hex(5)}"
+    try:
+        start("api", recreate=True, environment={"COURSE_FAILPOINT": "after_manual_decision"})
+        wait_gateway()
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool.submit(action, "workflow", "manual", payload, REVIEWER, key)
+        wait_for_log("api", '"name":"after_manual_decision"')
+        check(compose("kill", "api").returncode == 0, "cannot kill the API at the barrier")
+        pool.shutdown(wait=False)
+        rolled_back = sql_rows(f"SELECT 1 FROM autocheck.decisions WHERE step_instance_id = '{step[0]['step_instance_id']}'::uuid")
+        check(rolled_back == [], f"an uncommitted decision must leave nothing behind: {rolled_back}")
+    finally:
+        start("api", recreate=True)
+        wait_gateway()
+    status, body = action("workflow", "manual", payload, REVIEWER, key)
+    check(status == 200 and body and body["outcome"] == "APPROVED", f"manual repeat: {status} {body}")
+    decisions = sql_rows("SELECT source, outcome FROM autocheck.decisions "
+                         f"WHERE step_instance_id = '{step[0]['step_instance_id']}'::uuid")
+    check(decisions == [{"source": "MANUAL", "outcome": "APPROVED"}],
+          f"the repeat must create exactly one decision: {decisions}")
+    wait_status(manual_operation, "COMPLETED")
+
+
+def scenario_observer_role() -> None:
+    """The observer reads the published projections and nothing else."""
+    password = os.environ.get("COURSE_AUTOCHECK_PASSWORD", "course_local_autocheck")
+    readable = compose("exec", "-T", "-e", f"PGPASSWORD={password}", "postgres", "psql", "-X",
+                       "-v", "ON_ERROR_STOP=1", "-U", "autocheck_reader", "-d", "course", "-At",
+                       "-c", "SELECT count(*) FROM autocheck.outbox")
+    check(readable.returncode == 0, f"the observer must read autocheck views: {readable.stderr[-300:]}")
+
+    for statement in ("TABLE delivery.outbox",
+                      "SELECT api.invoke('{}'::jsonb, '{}'::jsonb)",
+                      "SELECT delivery.reconcile_inbox(1)",
+                      "CREATE TABLE public.observer_probe (value integer)"):
+        denied = compose("exec", "-T", "-e", f"PGPASSWORD={password}", "postgres", "psql", "-X",
+                         "-v", "ON_ERROR_STOP=1", "-U", "autocheck_reader", "-d", "course", "-c", statement)
+        check(denied.returncode != 0, f"the observer must not run: {statement}")
+
+    elevated = sql_rows("SELECT rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls "
+                        "FROM pg_catalog.pg_roles WHERE rolname = 'autocheck_reader'")
+    check(elevated == [{"rolsuper": False, "rolcreaterole": False, "rolcreatedb": False,
+                        "rolreplication": False, "rolbypassrls": False}], f"observer attributes: {elevated}")
+    memberships = sql_rows("SELECT granted.rolname AS granted_role FROM pg_catalog.pg_auth_members m "
+                           "JOIN pg_catalog.pg_roles member ON member.oid = m.member "
+                           "JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid "
+                           "WHERE member.rolname = 'autocheck_reader'")
+    check(memberships == [], f"the observer must not be a member of any role: {memberships}")
+
 
 SCENARIOS = [scenario_provider_path, scenario_adapter_and_recreate, scenario_review, scenario_concurrent_submit,
              scenario_least_privilege, scenario_failpoint_and_lease_expiry, scenario_receipt_lock_order,
-             scenario_submit_rejects_foreign_process, scenario_storage_invariants, scenario_outbox_retry_budget]
+             scenario_submit_rejects_foreign_process, scenario_storage_invariants,
+             scenario_health_and_metrics, scenario_dead_letter_and_late_receipt, scenario_diagnostics_trace,
+             scenario_api_failpoints, scenario_observer_role, scenario_outbox_retry_budget]
 
 
 def main() -> int:

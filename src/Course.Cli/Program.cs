@@ -64,7 +64,7 @@ internal static class CourseCli
             // содержит значения данных и идентификатор вызывающего, и они оседают в сборщике
             // логов, даже когда сам ответ команды выглядит безобидно. Тип и SQLSTATE отвечают на
             // вопрос «что за сбой», не отвечая на вопрос «с какими данными».
-            Console.Error.WriteLine($"command failed code={code} failure={Redaction.Describe(exception)}");
+            StructuredLog.Error("cli", "command.failed", ("errorCode", code), ("failure", Redaction.Describe(exception)));
             Write(stdout, Envelope.CliError(
                 code,
                 code == ContractCodes.DependencyUnavailable
@@ -566,7 +566,7 @@ internal static class CourseCli
             }
             catch (Exception) when (DateTimeOffset.UtcNow < deadline)
             {
-                Console.Error.WriteLine("waiting for postgres");
+                StructuredLog.Error("cli", "bootstrap.waiting_for_postgres");
                 await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
             }
         }

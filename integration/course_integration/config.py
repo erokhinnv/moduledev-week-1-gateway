@@ -110,6 +110,13 @@ class DispatcherSettings:
     test_profile: bool
     provider_timeout_s: float
     poll_interval_s: float
+    # The retry policy itself belongs to PostgreSQL: the dispatcher never decides whether a
+    # delivery is retried, when, or in which state it lands. These two values are the effective
+    # policy as configured for the contour, published as gauges so the endpoint answers "under
+    # which policy is this process running" without reading anyone's environment.
+    max_attempts: int
+    lease_ms: int
+    health_port: int
     database: DatabaseSettings
     failpoint: str
     instance_id: str
@@ -122,11 +129,14 @@ def dispatcher_settings(env: Mapping[str, str]) -> DispatcherSettings:
         raise ConfigError("OUTBOX_OWNER must be a printable identifier up to 128 characters")
     test_profile = _flag(env, "COURSE_TEST_PROFILE")
     timeout_ms = _positive_int(
-        env, "PROVIDER_TIMEOUT_MS", 500 if test_profile else 5000, maximum=60000
+        env, "COURSE_PROVIDER_TIMEOUT_MS", 500 if test_profile else 5000, maximum=60000
     )
     poll_ms = _positive_int(
-        env, "OUTBOX_POLL_INTERVAL_MS", 100 if test_profile else 1000, maximum=60000
+        env, "COURSE_OUTBOX_POLL_MS", 100 if test_profile else 1000, maximum=60000
     )
+    if test_profile:
+        # Test profile contract: the dispatcher polls at least every 100 ms.
+        poll_ms = min(poll_ms, 100)
     failpoint = env.get("COURSE_FAILPOINT", "") if test_profile else ""
     return DispatcherSettings(
         provider_url=urllib.parse.urlunsplit(parsed),
@@ -134,6 +144,13 @@ def dispatcher_settings(env: Mapping[str, str]) -> DispatcherSettings:
         test_profile=test_profile,
         provider_timeout_s=timeout_ms / 1000.0,
         poll_interval_s=poll_ms / 1000.0,
+        max_attempts=_positive_int(
+            env, "COURSE_OUTBOX_MAX_ATTEMPTS", 4 if test_profile else 5, maximum=20
+        ),
+        lease_ms=_positive_int(
+            env, "COURSE_OUTBOX_LEASE_MS", 2000 if test_profile else 30000, maximum=600000
+        ),
+        health_port=_positive_int(env, "COURSE_DISPATCHER_HEALTH_PORT", 8080, maximum=65535),
         database=database_settings(env, "course-outbox-dispatcher"),
         failpoint=failpoint,
         instance_id=env.get("HOSTNAME") or owner,
@@ -146,6 +163,10 @@ class AdapterSettings:
     callback_token: str = field(repr=False)
     hmac_secret: bytes = field(repr=False)
     receipt_api_url: str
+    # Readiness of the adapter is readiness of the gateway: it owns no state and cannot confirm a
+    # callback without the platform. PostgreSQL is deliberately absent - the adapter has no
+    # database credentials at all, so it could not probe it even if the contract asked.
+    dependency_probe_url: str
     listen_host: str
     listen_port: int
     api_timeout_s: float
@@ -167,6 +188,9 @@ def adapter_settings(env: Mapping[str, str]) -> AdapterSettings:
         callback_token=token,
         hmac_secret=secret.encode("utf-8"),
         receipt_api_url=urllib.parse.urlunsplit(parsed),
+        dependency_probe_url=urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, "/health/live", "", "")
+        ),
         listen_host=env.get("RECEIPT_ADAPTER_HOST") or "0.0.0.0",
         listen_port=_positive_int(env, "RECEIPT_ADAPTER_PORT", 8082, maximum=65535),
         api_timeout_s=_positive_int(env, "RECEIPT_API_TIMEOUT_MS", 10000, maximum=60000) / 1000.0,
@@ -179,13 +203,14 @@ class ReconcilerSettings:
     poll_interval_s: float
     batch_size: int
     test_profile: bool
+    health_port: int
     database: DatabaseSettings
 
 
 def reconciler_settings(env: Mapping[str, str]) -> ReconcilerSettings:
     test_profile = _flag(env, "COURSE_TEST_PROFILE")
     poll_ms = _positive_int(
-        env, "INBOX_POLL_INTERVAL_MS", 200 if test_profile else 1000, maximum=60000
+        env, "COURSE_INBOX_POLL_MS", 500 if test_profile else 1000, maximum=60000
     )
     if test_profile:
         # Test profile contract: reconciliation interval is at most 500 ms.
@@ -194,5 +219,6 @@ def reconciler_settings(env: Mapping[str, str]) -> ReconcilerSettings:
         poll_interval_s=poll_ms / 1000.0,
         batch_size=_positive_int(env, "INBOX_BATCH_SIZE", 50, maximum=100),
         test_profile=test_profile,
+        health_port=_positive_int(env, "COURSE_RECONCILER_HEALTH_PORT", 8080, maximum=65535),
         database=database_settings(env, "course-inbox-reconciler"),
     )

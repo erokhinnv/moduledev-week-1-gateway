@@ -17,7 +17,8 @@ RUN dotnet restore src/Course.Workflow.Worker/Course.Workflow.Worker.csproj
 COPY src/ src/
 RUN dotnet publish src/Course.Workflow.Worker/Course.Workflow.Worker.csproj -c Release -o /app/publish --no-restore
 
-# У worker нет HTTP-сервера, поэтому конечный образ основан на dotnet/runtime, а не на aspnet.
+# У worker нет HTTP-стека приложения: три служебных адреса наблюдаемости обслуживает обычный
+# сокет (ObservabilityEndpoint), поэтому конечный образ основан на dotnet/runtime, а не aspnet.
 FROM mcr.microsoft.com/dotnet/runtime:10.0 AS runtime
 WORKDIR /app
 COPY --from=build /app/publish ./

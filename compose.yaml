@@ -1,16 +1,18 @@
-name: moduledev-week-3
+name: moduledev-week-4
 
-# Десять сервисов, одна публичная точка входа.
+# Двенадцать сервисов, одна публичная точка входа.
 #
 #   gateway            - публичный C# ASP.NET Core шлюз, единственный сервис с host-портом
 #   api                - внутренний C# движок исполнения действий, доступен только по сети Compose
 #   cli                - Course CLI: миграции, публикация действий и карт, trusted-команды процессов
 #                        (тремя разными ролями: миграций, публикации и операций)
-#   postgres           - авторитетное состояние в именованном томе (volume)
+#   postgres           - авторитетное состояние в именованном томе (volume) и профиль доставки
 #   worker-a, worker-b - два экземпляра ОДНОГО образа сменного исполнителя процессов
-#   outbox-dispatcher  - Python: durable Outbox (PostgreSQL) -> provider v0.2.0
+#   outbox-dispatcher    \
+#   outbox-dispatcher-b  - два экземпляра ОДНОГО Python-образа, разные владельцы аренды доставки
 #   receipt-adapter    - Python, тот же образ: legacy callback provider -> signed receipt v1 -> gateway
-#   inbox-reconciler   - Python, тот же образ: фиксированная SQL-граница согласования Inbox
+#   inbox-reconciler     \
+#   inbox-reconciler-b   - два экземпляра ОДНОГО Python-образа: согласование Inbox
 #   provider-simulator - выданный внешний provider v0.2.0, закреплён по digest
 #
 # Пароли PostgreSQL ниже — явно обозначенные local-only значения для разработки, а НЕ настоящие
@@ -20,6 +22,9 @@ name: moduledev-week-3
 # Стек самодостаточен: ни одного bind mount, ни одного внешнего ресурса. Миграции, встроенные
 # манифесты действий, карты процессов и скрипт создания ролей копируются ВНУТРЬ образов на этапе
 # сборки, поэтому "docker compose up -d --build" на чистой машине не требует ручных шагов.
+#
+# Служебные адреса наблюдаемости (health/live, health/ready, metrics) доступны только внутри сети
+# Compose: api, оба worker, оба dispatcher и оба reconciler слушают 8080, adapter — 8082.
 
 services:
   postgres:
@@ -37,10 +42,21 @@ services:
       COURSE_WORKER_PASSWORD: ${COURSE_WORKER_PASSWORD:-course_local_worker}
       COURSE_OUTBOX_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-course_local_outbox}
       COURSE_INBOX_PASSWORD: ${COURSE_INBOX_PASSWORD:-course_local_inbox}
+      # Пароль наблюдателя: роль autocheck_reader читает ТОЛЬКО представления схемы autocheck.
+      COURSE_AUTOCHECK_PASSWORD: ${COURSE_AUTOCHECK_PASSWORD:-course_local_autocheck}
+      # Профиль доставки и аренды принадлежит базе: db/init/00-roles.sh превращает эти значения в
+      # настройки самой базы (ALTER DATABASE ... SET), и границы delivery.* читают уже их.
+      # Значения ниже — тестовый профиль контракта недели 4.
+      COURSE_OUTBOX_MAX_ATTEMPTS: ${COURSE_OUTBOX_MAX_ATTEMPTS:-4}
+      COURSE_OUTBOX_BACKOFF_BASE_MS: ${COURSE_OUTBOX_BACKOFF_BASE_MS:-200}
+      COURSE_OUTBOX_BACKOFF_MAX_MS: ${COURSE_OUTBOX_BACKOFF_MAX_MS:-800}
+      COURSE_OUTBOX_JITTER_MAX_MS: ${COURSE_OUTBOX_JITTER_MAX_MS:-100}
+      COURSE_OUTBOX_LEASE_MS: ${COURSE_OUTBOX_LEASE_MS:-2000}
+      COURSE_JOB_LEASE_MS: ${COURSE_JOB_LEASE_MS:-2000}
       POSTGRES_INITDB_ARGS: --data-checksums
     volumes:
-      # Именованный том: состояние процессов переживает пересоздание любого контейнера, включая
-      # оба worker'а — это ровно то свойство, которое проверяется сценарием recreate.
+      # Именованный том: состояние процессов переживает пересоздание любого контейнера и всего
+      # Compose project целиком — ровно то свойство, которое проверяется сценарием recreate.
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d course"]
@@ -72,6 +88,11 @@ services:
       COURSE_OPERATOR_PASSWORD: ${COURSE_OPERATOR_PASSWORD:-course_local_operator}
       COURSE_APPLICATION_NAME: course-cli
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      # CLI не проверяет токены: конфигурация JWT одинакова у всех C#-сервисов по контракту
+      # конфигурации недели 4, и одно общее определение окружения надёжнее четырёх разных.
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY}
     depends_on:
       postgres:
         condition: service_healthy
@@ -100,9 +121,13 @@ services:
       COURSE_POSTGRES_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
       COURSE_APPLICATION_NAME: course-api
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
-      # Настройки из README пробрасываются из окружения запуска; пустое значение — умолчание процесса.
+      # Настройки из таблицы README пробрасываются как есть: пустое значение означает умолчание
+      # самого процесса.
       COURSE_MAX_RESULT_BYTES: ${COURSE_MAX_RESULT_BYTES:-}
       COURSE_DISPATCH_QUEUE_CAPACITY: ${COURSE_DISPATCH_QUEUE_CAPACITY:-}
+      # Точки аварийной остановки закрытого профиля. Вне COURSE_TEST_PROFILE=1 значение
+      # игнорируется, и публичного способа включить их не существует.
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
     # expose (в отличие от ports) делает порт видимым только другим сервисам ВНУТРИ сети Compose.
     expose:
       - "8080"
@@ -122,8 +147,15 @@ services:
       # Внутренний api адресуется именем сервиса Compose, а не через localhost: DNS этого имени
       # разрешается сетью Docker и продолжает работать после пересоздания контейнера api.
       COURSE_API_BASE_URL: http://api:8080
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_GATEWAY_UPSTREAM_TIMEOUT: ${COURSE_GATEWAY_UPSTREAM_TIMEOUT:-}
       COURSE_GATEWAY_MAX_RESPONSE_BYTES: ${COURSE_GATEWAY_MAX_RESPONSE_BYTES:-}
+      # Gateway не является границей доверия и НЕ проверяет токены: он передаёт Authorization
+      # как есть, а проверяет его api. Конфигурация JWT приходит сюда потому, что контракт
+      # конфигурации недели 4 задаёт её всем C#-сервисам одним набором переменных.
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY}
     ports:
       - "127.0.0.1:${COURSE_GATEWAY_PORT:-8080}:8080"
     depends_on:
@@ -143,13 +175,14 @@ services:
   # перехват аренды вторым исполнителем было бы невозможно.
   # --------------------------------------------------------------------------
   worker-a:
-    image: moduledev-week-2-workflow-worker:local
+    image: moduledev-week-4-workflow-worker:local
     build:
       context: .
       dockerfile: docker/worker.Dockerfile
     environment:
       # Идентификатор арендатора — единственное, чем два экземпляра отличаются друг от друга.
       COURSE_WORKER_ID: worker-a
+      COURSE_MAX_RESULT_BYTES: ${COURSE_MAX_RESULT_BYTES:-}
       COURSE_POSTGRES_HOST: postgres
       COURSE_POSTGRES_PORT: 5432
       COURSE_POSTGRES_DB: course
@@ -160,9 +193,13 @@ services:
       COURSE_APPLICATION_NAME: course-worker
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
-      COURSE_WORKER_LEASE_MS: ${COURSE_WORKER_LEASE_MS:-}
-      COURSE_WORKER_POLL_MS: ${COURSE_WORKER_POLL_MS:-}
-      COURSE_MAX_RESULT_BYTES: ${COURSE_MAX_RESULT_BYTES:-}
+      COURSE_JOB_LEASE_MS: ${COURSE_JOB_LEASE_MS:-2000}
+      COURSE_WORKER_POLL_MS: ${COURSE_WORKER_POLL_MS:-100}
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY}
+    expose:
+      - "8080"
     stop_grace_period: 5s
     restart: "no"
 
@@ -171,12 +208,13 @@ services:
   # падает с «image ... already exists». Один образ должен собираться ровно один раз, а второй
   # арендатор просто на него ссылается.
   worker-b:
-    image: moduledev-week-2-workflow-worker:local
+    image: moduledev-week-4-workflow-worker:local
     # Образ собирает worker-a; тянуть его из реестра нечего и незачем, поэтому попытка pull
     # должна быть явной ошибкой конфигурации, а не невнятным отказом сети.
     pull_policy: never
     environment:
       COURSE_WORKER_ID: worker-b
+      COURSE_MAX_RESULT_BYTES: ${COURSE_MAX_RESULT_BYTES:-}
       COURSE_POSTGRES_HOST: postgres
       COURSE_POSTGRES_PORT: 5432
       COURSE_POSTGRES_DB: course
@@ -185,23 +223,30 @@ services:
       COURSE_APPLICATION_NAME: course-worker
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
-      COURSE_WORKER_LEASE_MS: ${COURSE_WORKER_LEASE_MS:-}
-      COURSE_WORKER_POLL_MS: ${COURSE_WORKER_POLL_MS:-}
-      COURSE_MAX_RESULT_BYTES: ${COURSE_MAX_RESULT_BYTES:-}
+      COURSE_JOB_LEASE_MS: ${COURSE_JOB_LEASE_MS:-2000}
+      COURSE_WORKER_POLL_MS: ${COURSE_WORKER_POLL_MS:-100}
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY}
+    expose:
+      - "8080"
     stop_grace_period: 5s
     restart: "no"
 
   # --------------------------------------------------------------------------
-  # Python-периметр недели 3: ОДИН локально собранный образ, три entrypoint.
+  # Python-периметр: ОДИН локально собранный образ, пять сервисов, три entrypoint.
   #
   # Сборка объявлена только у outbox-dispatcher — по той же причине, что у worker-a: два build с
-  # одним тегом гоняются за одну ссылку. Остальные два сервиса ссылаются на уже собранный образ.
+  # одним тегом гоняются за одну ссылку. Остальные четыре сервиса ссылаются на собранный образ.
   #
   # Ни у одного Python-сервиса нет host-порта и depends_on: процессы сами переживают
   # недоступность базы или gateway, а их пересоздание не тянет за собой пересоздание ядра.
+  #
+  # Вторые экземпляры не получают ни нового образа, ни отдельного хранилища, ни дополнительных
+  # прав в базе: единственное отличие dispatcher-b — собственный владелец аренды доставки.
   # --------------------------------------------------------------------------
   outbox-dispatcher:
-    image: moduledev-week-3-integration:local
+    image: moduledev-week-4-integration:local
     build:
       context: .
       dockerfile: docker/integration.Dockerfile
@@ -210,6 +255,7 @@ services:
       PROVIDER_URL: ${PROVIDER_URL:-http://provider-simulator:8081}
       OUTBOX_OWNER: ${OUTBOX_OWNER:-outbox-dispatcher}
       COURSE_POSTGRES_HOST: postgres
+      COURSE_POSTGRES_STATEMENT_TIMEOUT_MS: ${COURSE_POSTGRES_STATEMENT_TIMEOUT_MS:-}
       COURSE_POSTGRES_PORT: 5432
       COURSE_POSTGRES_DB: course
       # Отдельная роль: EXECUTE ровно на delivery.claim_outbox / succeed_outbox / fail_outbox.
@@ -217,16 +263,46 @@ services:
       COURSE_POSTGRES_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-course_local_outbox}
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
-      PROVIDER_TIMEOUT_MS: ${PROVIDER_TIMEOUT_MS:-}
-      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-}
+      # Бюджет внешнего вызова и темп опроса — дело dispatcher. Число попыток и срок аренды он
+      # получает от PostgreSQL вместе с захватом; здесь те же значения нужны ему только для
+      # собственных метрик и журнала, поэтому источник у них один.
+      COURSE_PROVIDER_TIMEOUT_MS: ${COURSE_PROVIDER_TIMEOUT_MS:-500}
+      COURSE_OUTBOX_POLL_MS: ${COURSE_OUTBOX_POLL_MS:-100}
+      COURSE_OUTBOX_MAX_ATTEMPTS: ${COURSE_OUTBOX_MAX_ATTEMPTS:-4}
+      COURSE_OUTBOX_LEASE_MS: ${COURSE_OUTBOX_LEASE_MS:-2000}
+    expose:
+      - "8080"
+    stop_grace_period: 5s
+    restart: unless-stopped
+
+  outbox-dispatcher-b:
+    image: moduledev-week-4-integration:local
+    command: ["outbox-dispatcher"]
+    environment:
+      PROVIDER_URL: ${PROVIDER_URL:-http://provider-simulator:8081}
+      # Единственное отличие второго экземпляра: собственный владелец аренды. Один и тот же
+      # владелец у двух dispatcher сделал бы fencing бессмысленным — чужой отчёт прошёл бы
+      # проверку owner/leaseVersion как свой.
+      OUTBOX_OWNER: ${OUTBOX_OWNER_B:-outbox-dispatcher-b}
+      COURSE_POSTGRES_HOST: postgres
       COURSE_POSTGRES_STATEMENT_TIMEOUT_MS: ${COURSE_POSTGRES_STATEMENT_TIMEOUT_MS:-}
+      COURSE_POSTGRES_PORT: 5432
+      COURSE_POSTGRES_DB: course
+      COURSE_POSTGRES_USER: outbox_dispatcher
+      COURSE_POSTGRES_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-course_local_outbox}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_PROVIDER_TIMEOUT_MS: ${COURSE_PROVIDER_TIMEOUT_MS:-500}
+      COURSE_OUTBOX_POLL_MS: ${COURSE_OUTBOX_POLL_MS:-100}
+      COURSE_OUTBOX_MAX_ATTEMPTS: ${COURSE_OUTBOX_MAX_ATTEMPTS:-4}
+      COURSE_OUTBOX_LEASE_MS: ${COURSE_OUTBOX_LEASE_MS:-2000}
+    expose:
+      - "8080"
     stop_grace_period: 5s
     restart: unless-stopped
 
   receipt-adapter:
-    image: moduledev-week-3-integration:local
-    # Без pull_policy, в отличие от worker-b: проверка недели 3 считает любое значение, кроме
-    # build, признаком чужого образа у Python-сервисов («must run the locally built image»).
+    image: moduledev-week-4-integration:local
     command: ["receipt-adapter"]
     # Ни одной переменной подключения к PostgreSQL: adapter физически не может тронуть состояние
     # в обход generic API и не хранит ничего авторитетного.
@@ -247,7 +323,7 @@ services:
     restart: unless-stopped
 
   inbox-reconciler:
-    image: moduledev-week-3-integration:local
+    image: moduledev-week-4-integration:local
     command: ["inbox-reconciler"]
     environment:
       COURSE_POSTGRES_HOST: postgres
@@ -257,9 +333,33 @@ services:
       COURSE_POSTGRES_USER: inbox_reconciler
       COURSE_POSTGRES_PASSWORD: ${COURSE_INBOX_PASSWORD:-course_local_inbox}
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
-      INBOX_POLL_INTERVAL_MS: ${INBOX_POLL_INTERVAL_MS:-}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_INBOX_POLL_MS: ${COURSE_INBOX_POLL_MS:-500}
       INBOX_BATCH_SIZE: ${INBOX_BATCH_SIZE:-}
       COURSE_POSTGRES_STATEMENT_TIMEOUT_MS: ${COURSE_POSTGRES_STATEMENT_TIMEOUT_MS:-}
+    expose:
+      - "8080"
+    stop_grace_period: 5s
+    restart: unless-stopped
+
+  inbox-reconciler-b:
+    image: moduledev-week-4-integration:local
+    command: ["inbox-reconciler"]
+    # Второй согласователь не отличается от первого ничем: он берёт из очереди то, что осталось.
+    # Конкуренцию разбирает сама delivery.reconcile_inbox через FOR UPDATE SKIP LOCKED.
+    environment:
+      COURSE_POSTGRES_HOST: postgres
+      COURSE_POSTGRES_PORT: 5432
+      COURSE_POSTGRES_DB: course
+      COURSE_POSTGRES_USER: inbox_reconciler
+      COURSE_POSTGRES_PASSWORD: ${COURSE_INBOX_PASSWORD:-course_local_inbox}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_INBOX_POLL_MS: ${COURSE_INBOX_POLL_MS:-500}
+      INBOX_BATCH_SIZE: ${INBOX_BATCH_SIZE:-}
+      COURSE_POSTGRES_STATEMENT_TIMEOUT_MS: ${COURSE_POSTGRES_STATEMENT_TIMEOUT_MS:-}
+    expose:
+      - "8080"
     stop_grace_period: 5s
     restart: unless-stopped
 
