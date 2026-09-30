@@ -1025,8 +1025,10 @@ public sealed class WorkflowIntegrationTests(ProbeFixture fixture)
 
         // Диагностика при этом обязана остаться ПОЛЕЗНОЙ: без типа сбоя и SQLSTATE обезвреженный
         // журнал перестал бы отвечать на вопрос «что сломалось», и лечение было бы хуже болезни.
-        Assert.Contains("command failed code=", stderr, StringComparison.Ordinal);
-        Assert.Contains("failure=PostgresException/", stderr, StringComparison.Ordinal);
+        // С недели 4 это структурная запись `command.failed` в stderr с теми же двумя полями.
+        Assert.Contains("\"event\":\"command.failed\"", stderr, StringComparison.Ordinal);
+        Assert.Contains("\"errorCode\":\"", stderr, StringComparison.Ordinal);
+        Assert.Contains("\"failure\":\"PostgresException/", stderr, StringComparison.Ordinal);
     }
 
     /// <summary>
