@@ -488,6 +488,135 @@ def scenario_failpoint_and_lease_expiry() -> None:
     check(status == 200 and payment and payment["paymentCount"] == 1, f"one payment expected: {payment}")
 
 
+def scenario_failpoint_after_provider_response() -> None:
+    """The provider accepted the payment and the dispatcher died before reporting: one payment.
+
+    This is the unknown outcome seen from inside: PostgreSQL has no report, the provider has the
+    payment. Whatever continues the delivery - the receipt confirming it, or another dispatcher
+    repeating the request under the same key - the provider must end up with exactly one payment.
+    """
+    if os.environ.get("COURSE_TEST_PROFILE") != "1":
+        raise Skipped("requires a stand started with COURSE_TEST_PROFILE=1")
+    stop("outbox-dispatcher-b")
+    start("outbox-dispatcher", recreate=True, environment={"COURSE_FAILPOINT": "after_provider_response"})
+    try:
+        operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1081.00")
+        external_id = external_request(operation_id)
+        wait_for_log("outbox-dispatcher", '"name":"after_provider_response"')
+        check(compose("kill", "outbox-dispatcher").returncode == 0, "cannot kill the dispatcher at the barrier")
+        status, payment = audit(external_id)
+        check(status == 200 and payment and payment["paymentCount"] == 1,
+              f"the provider must have accepted the payment before the barrier: {status} {payment}")
+        unreported = sql_rows("SELECT state, attempt_count, lease_owner FROM autocheck.outbox "
+                              f"WHERE external_request_id = {sql_text(external_id)}")
+        # The dead dispatcher never reported. The delivery is still its lease - unless the
+        # provider's own callback has already confirmed it, which is the receipt taking priority.
+        check(len(unreported) == 1 and unreported[0]["attempt_count"] == 1
+              and (unreported[0]["state"] == "CONFIRMED"
+                   or (unreported[0]["state"], unreported[0]["lease_owner"]) == ("LEASED", "outbox-dispatcher")),
+              f"the attempt must stay unreported at the barrier: {unreported}")
+    finally:
+        start(*DISPATCHERS, recreate=True)
+    wait_status(operation_id, "COMPLETED")
+    outbox = sql_rows(f"SELECT state, attempt_count FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}")
+    check(len(outbox) == 1 and outbox[0]["state"] == "CONFIRMED" and outbox[0]["attempt_count"] in (1, 2),
+          f"the delivery must be confirmed without burning the budget: {outbox}")
+    status, payment = audit(external_id)
+    check(status == 200 and payment and payment["paymentCount"] == 1 and payment["idempotencyKey"] == external_id,
+          f"an unknown outcome must not become a second payment: {payment}")
+
+
+def scenario_failpoint_after_job_claim() -> None:
+    """A worker dies right after the claim: the job is reclaimed under a new lease version, once."""
+    if os.environ.get("COURSE_TEST_PROFILE") != "1":
+        raise Skipped("requires a stand started with COURSE_TEST_PROFILE=1")
+    # The competing tenant is stopped BEFORE the work exists, so the target worker claims it.
+    stop("worker-b")
+    start("worker-a", recreate=True, environment={"COURSE_FAILPOINT": "after_job_claim"})
+    try:
+        operation_id, submitted = create_and_submit("PAYMENT_APPROVAL", "11.00")
+        wait_for_log("worker-a", '"name":"after_job_claim"')
+        check(compose("kill", "worker-a").returncode == 0, "cannot kill the worker at the barrier")
+        claimed = sql_rows("SELECT job_id, execution_id, state, lease_owner, lease_version, attempt_count "
+                           f"FROM autocheck.jobs WHERE process_id = '{submitted['processId']}'::uuid")
+        check(len(claimed) == 1 and (claimed[0]["state"], claimed[0]["lease_owner"], claimed[0]["lease_version"],
+                                     claimed[0]["attempt_count"]) == ("LEASED", "worker-a", 1, 1),
+              f"the claim must be durable at the barrier: {claimed}")
+        untouched = sql_rows("SELECT o.status, (SELECT count(*) FROM autocheck.decisions d WHERE d.process_id = o.process_id) AS decisions "
+                             f"FROM autocheck.operations o WHERE o.operation_id = '{operation_id}'::uuid")
+        check(untouched == [{"status": "PROCESSING", "decisions": 0}],
+              f"a worker stopped before the action must leave no effect: {untouched}")
+    finally:
+        start("worker-a", "worker-b", recreate=True)
+    wait_status(operation_id, "COMPLETED")
+    job_id = claimed[0]["job_id"]
+    reclaimed = sql_rows(f"SELECT execution_id, lease_version FROM autocheck.jobs WHERE job_id = '{job_id}'::uuid")
+    check(reclaimed == [{"execution_id": claimed[0]["execution_id"], "lease_version": 2}],
+          f"the reclaimed job keeps its executionId and gets a new lease version: {reclaimed}")
+    attempts = sql_rows("SELECT attempt_id, status, lease_version, execution_id FROM autocheck.attempts "
+                        f"WHERE job_id = '{job_id}'::uuid ORDER BY attempt_number")
+    check([(a["status"], a["lease_version"]) for a in attempts] == [("STALE", 1), ("SUCCEEDED", 2)]
+          and len({a["attempt_id"] for a in attempts}) == 2
+          and {a["execution_id"] for a in attempts} == {claimed[0]["execution_id"]},
+          f"one stale and one successful attempt of the same execution are expected: {attempts}")
+    decisions = sql_rows(f"SELECT count(*) AS n FROM autocheck.decisions WHERE process_id = '{submitted['processId']}'::uuid")
+    check(decisions[0]["n"] == 1, f"the limit rule must decide exactly once: {decisions}")
+
+
+def scenario_delivery_fencing() -> None:
+    """A report of a previous tenant cannot overwrite the delivery of the new one.
+
+    The boundary functions are called directly, as two tenants of the same delivery: that is the
+    only way to hold a stale lease still and present it after the delivery has moved on.
+    """
+    stop(*DISPATCHERS)
+    try:
+        operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1082.00")
+        external_id = external_request(operation_id)
+        mine = f"WHERE external_request_id = {sql_text(external_id)}"
+        first = sql_rows(f"SELECT outbox_id, lease_version FROM delivery.claim_outbox('e2e-tenant-a', 16) {mine}")
+        check(len(first) == 1 and first[0]["lease_version"] == 1, f"the first tenant must get the delivery: {first}")
+        outbox_id = first[0]["outbox_id"]
+        poll(f"SELECT 1 FROM autocheck.outbox {mine} AND state = 'LEASED' AND lease_until <= clock_timestamp()",
+             lambda rows: len(rows) == 1, timeout=30)
+        second = sql_rows(f"SELECT outbox_id, lease_version FROM delivery.claim_outbox('e2e-tenant-b', 16) {mine}")
+        check(second == [{"outbox_id": outbox_id, "lease_version": 2}], f"the expired delivery must be reclaimed: {second}")
+        reclaimed = [{"state": "LEASED", "lease_owner": "e2e-tenant-b", "lease_version": 2, "attempt_count": 2,
+                      "last_error_code": "lease.expired.retryable"}]
+        snapshot = f"SELECT state, lease_owner, lease_version, attempt_count, last_error_code FROM autocheck.outbox {mine}"
+        check(sql_rows(snapshot) == reclaimed, f"the reclaim must leave a visible trace: {sql_rows(snapshot)}")
+
+        # Every combination that is not "the current owner with the current version" is stale -
+        # for a success and for a failure alike.
+        for owner, version in (("e2e-tenant-a", 1), ("e2e-tenant-a", 2), ("e2e-tenant-b", 1)):
+            for report in (f"delivery.succeed_outbox('{outbox_id}'::uuid, '{owner}', {version}, 'provider-from-the-past')",
+                           f"delivery.fail_outbox('{outbox_id}'::uuid, '{owner}', {version}, 'http.400.terminal')"):
+                refused = sql_rows(f"SELECT {report} AS report")[0]["report"]
+                check(refused.get("status") == "error" and refused.get("code") == "delivery.lease_stale",
+                      f"a stale report must be refused: {owner}/{version} -> {refused}")
+        check(sql_rows(snapshot) == reclaimed, f"refused reports must change nothing: {sql_rows(snapshot)}")
+
+        # The current owner reports the second failure: the second delay of the published ladder.
+        accepted = sql_rows(f"SELECT delivery.fail_outbox('{outbox_id}'::uuid, 'e2e-tenant-b', 2, "
+                            "'transport.error.retryable') AS report")[0]["report"]
+        check(accepted.get("status") == "ok" and accepted.get("state") == "RETRY_WAIT", f"the owner's report: {accepted}")
+        if os.environ.get("COURSE_TEST_PROFILE") == "1":
+            check(400 <= accepted.get("nextAttemptInMs", -1) <= 500,
+                  f"the second delay of the published profile is 400 ms plus jitter up to 100 ms: {accepted}")
+        # The lease was spent by that report: repeating it is stale as well.
+        repeated = sql_rows(f"SELECT delivery.fail_outbox('{outbox_id}'::uuid, 'e2e-tenant-b', 2, "
+                            "'transport.error.retryable') AS report")[0]["report"]
+        check(repeated.get("code") == "delivery.lease_stale", f"a spent lease cannot report twice: {repeated}")
+    finally:
+        start(*DISPATCHERS)
+    wait_status(operation_id, "COMPLETED")
+    outbox = sql_rows(f"SELECT state, attempt_count FROM autocheck.outbox {mine}")
+    check(outbox == [{"state": "CONFIRMED", "attempt_count": 3}], f"an ordinary dispatcher must finish the delivery: {outbox}")
+    status, payment = audit(external_id)
+    check(status == 200 and payment and payment["paymentCount"] == 1 and payment["requestCount"] == 1,
+          f"the provider must have seen exactly one request: {payment}")
+
+
 def scenario_receipt_lock_order() -> None:
     """A receipt racing a process step must queue behind it, not deadlock with it.
 
@@ -775,6 +904,73 @@ def scenario_health_and_metrics() -> None:
           f"recovery after the outage must produce exactly one payment: {payment}")
 
 
+CLAIMABLE_JOBS = ("SELECT count(*) AS value FROM autocheck.jobs "
+                  "WHERE (state IN ('READY', 'RETRY_WAIT') AND next_attempt_at <= clock_timestamp()) "
+                  "OR (state = 'LEASED' AND lease_until <= clock_timestamp())")
+
+
+def jobs_ready_sample() -> tuple[dict[str, float], int]:
+    """The metrics of ``api`` and the job queue they describe, with nothing moving between the reads.
+
+    Availability of a job depends on the clock (a retry becomes due, a lease expires), so the queue
+    is counted before and after the scrape and the sample is kept only when both counts agree.
+    """
+    deadline = time.monotonic() + 20
+    while True:
+        before = sql_rows(CLAIMABLE_JOBS)[0]["value"]
+        samples = openmetrics(observe("api", "/metrics")[1])
+        if sql_rows(CLAIMABLE_JOBS)[0]["value"] == before:
+            return samples, before
+        check(time.monotonic() < deadline, "the job queue keeps moving while both workers are stopped")
+
+
+def scenario_job_queue_metrics() -> None:
+    """``workflow_jobs_ready`` is what a worker could claim right now - an abandoned job included.
+
+    The published meaning of the series is "jobs available for claim now", and that is the very
+    predicate ``workflow.claim_jobs`` selects its candidates by: due READY/RETRY_WAIT jobs and
+    LEASED jobs whose lease has expired. A job left behind by a dead worker is not running and is
+    waiting to be reclaimed; a queue metric that does not count it reads zero while work stands.
+    """
+    workers = ("worker-a", "worker-b")
+    stop(*workers)
+    try:
+        operation_id, submitted = create_and_submit("PAYMENT_APPROVAL", "10.00")
+        job = poll(f"SELECT job_id, state FROM autocheck.jobs WHERE process_id = '{submitted['processId']}'::uuid",
+                   lambda rows: len(rows) == 1 and rows[0]["state"] == "READY")
+        job_id = job[0]["job_id"]
+        samples, ready = jobs_ready_sample()
+        check(ready >= 1 and samples["workflow_jobs_ready"] == float(ready),
+              f"workflow_jobs_ready {samples['workflow_jobs_ready']} must equal the claimable queue {ready}")
+
+        # A tenant claims everything claimable and disappears - what a killed worker leaves behind.
+        claimed = sql_rows("SELECT jsonb_array_length(workflow.claim_jobs('e2e-abandoned-worker', 16, 250)) AS claimed")
+        check(claimed[0]["claimed"] >= 1, f"the abandoned tenant claimed nothing: {claimed}")
+        leased = sql_rows(f"SELECT state, lease_owner FROM autocheck.jobs WHERE job_id = '{job_id}'::uuid")
+        check(leased == [{"state": "LEASED", "lease_owner": "e2e-abandoned-worker"}],
+              f"the job must be leased by the abandoned tenant: {leased}")
+
+        # The lease is never shorter than the declared budget of the step, so its expiry is awaited
+        # through the projection rather than slept through.
+        poll(f"SELECT 1 FROM autocheck.jobs WHERE job_id = '{job_id}'::uuid "
+             "AND state = 'LEASED' AND lease_until <= clock_timestamp()",
+             lambda rows: len(rows) == 1, timeout=60)
+        samples, ready = jobs_ready_sample()
+        check(ready >= 1 and samples["workflow_jobs_ready"] == float(ready),
+              f"an abandoned job is claimable: workflow_jobs_ready {samples['workflow_jobs_ready']}, queue {ready}")
+        check(samples["workflow_job_oldest_age_seconds"] > 0,
+              "a job waiting to be reclaimed must have an age")
+    finally:
+        start(*workers)
+
+    # Recovery is the ordinary loop: a real worker reclaims the job and the process completes.
+    wait_status(operation_id, "COMPLETED")
+    attempts = sql_rows(f"SELECT status, lease_version FROM autocheck.attempts WHERE job_id = '{job_id}'::uuid "
+                        "ORDER BY attempt_number")
+    check(attempts == [{"status": "STALE", "lease_version": 1}, {"status": "SUCCEEDED", "lease_version": 2}],
+          f"the reclaimed job must keep its history: {attempts}")
+
+
 def scenario_dead_letter_and_late_receipt() -> None:
     """Exhausted delivery is a technical outcome, and a late receipt still wins."""
     if os.environ.get("COURSE_TEST_PROFILE") != "1":
@@ -827,49 +1023,138 @@ def scenario_dead_letter_and_late_receipt() -> None:
         start("provider-simulator")
 
 
-def scenario_diagnostics_trace() -> None:
-    """Every known identifier of one chain returns the same subject facts."""
-    operation_id, submitted = create_and_submit("PAYMENT_EXECUTION", "1050.00")
-    wait_status(operation_id, "COMPLETED")
-    external_id = external_request(operation_id)
-    process_id = submitted["processId"]
-    job = sql_rows(f"SELECT job_id, execution_id FROM autocheck.jobs WHERE process_id = '{process_id}'::uuid "
-                   "ORDER BY job_id LIMIT 1")
-    message = sql_rows(f"SELECT message_id FROM autocheck.receipts WHERE external_request_id = {sql_text(external_id)}")
-    check(len(job) == 1 and len(message) == 1, f"trace sources missing: {job} {message}")
+TRACE_RESULT_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                                   "contracts", "course-1", "diagnostics-trace.result.schema.json")
+TRACE_SECTIONS = {"query", "dispatches", "operation", "operationEvents", "process", "steps", "jobs",
+                  "attempts", "outbox", "inbox", "receipts", "decisions"}
 
-    expectations = {
-        "operationId": operation_id,
-        "processId": process_id,
-        "externalRequestId": external_id,
-        "jobId": job[0]["job_id"],
-        "executionId": job[0]["execution_id"],
-        "messageId": message[0]["message_id"],
-    }
-    required = {"query", "dispatches", "operation", "operationEvents", "process", "steps", "jobs",
-                "attempts", "outbox", "inbox", "receipts", "decisions"}
+
+def wait_dispatches(request_ids: set[str]) -> dict[str, str]:
+    """Correlation id of the recorded call for every request key, once all of them have landed.
+
+    The API writes its technical trail off the request path, so a call answered a moment ago may
+    not be in ``autocheck.action_dispatches`` yet. A trace read before that would differ from a
+    trace read after it for a reason that has nothing to do with the identifier asked.
+    """
+    keys = ", ".join(sql_text(value) for value in sorted(request_ids))
+    rows = poll(f"SELECT request_id, correlation_id FROM autocheck.action_dispatches WHERE request_id IN ({keys})",
+                lambda rows: {row["request_id"] for row in rows} >= request_ids, timeout=30)
+    return {row["request_id"]: row["correlation_id"] for row in rows}
+
+
+def trace_chain(label: str, identifiers: list[tuple[str, str]], operation_id: str, process_id: str,
+                evidence: str) -> dict[str, Any]:
+    """Traces one chain by every identifier given and requires the same subject facts each time."""
     baseline: dict[str, Any] | None = None
-    for kind, identifier in expectations.items():
+    for kind, identifier in identifiers:
         status, body = action("diagnostics", "trace", {"identifier": identifier}, OBSERVER)
         result = (body or {}).get("result")
         check(status == 200 and body and body["outcome"] == "FOUND" and isinstance(result, dict),
-              f"trace by {kind}: {status} {body}")
-        check(required <= set(result), f"trace by {kind} is incomplete: {sorted(set(result))}")
+              f"{label}: trace by {kind}: {status} {body}")
+        check(TRACE_SECTIONS <= set(result), f"{label}: trace by {kind} is incomplete: {sorted(set(result))}")
         check(kind in result["query"]["matchedBy"] and result["query"]["identifier"] == identifier,
-              f"trace by {kind} reported {result['query']}")
-        check(result["operation"]["operationId"] == operation_id
-              and result["process"]["processId"] == process_id
-              and result["receipts"] and result["outbox"],
-              f"trace by {kind} lost the chain: {result['operation']} {result['process']}")
+              f"{label}: trace by {kind} reported {result['query']}")
+        check(isinstance(result["operation"], dict) and result["operation"]["operationId"] == operation_id
+              and isinstance(result["process"], dict) and result["process"]["processId"] == process_id
+              and bool(result[evidence]),
+              f"{label}: trace by {kind} ({identifier}) lost the chain: {result['operation']} {result['process']}")
         subject = {key: value for key, value in result.items() if key != "query"}
         if baseline is None:
             baseline = subject
         else:
-            check(subject == baseline, f"trace by {kind} returned different subject facts")
+            check(subject == baseline, f"{label}: trace by {kind} ({identifier}) returned different subject facts")
+    check(baseline is not None, f"{label}: nothing was traced")
+    return baseline
+
+
+def scenario_diagnostics_trace() -> None:
+    """Every published identifier kind reaches its chain, and every one returns the same facts.
+
+    The kinds are taken from the published result schema, so a kind the contract names and this
+    scenario does not trace is a failure rather than a silent gap. ``correlationId`` and
+    ``requestId`` are asked for every kind of call a chain consists of - the command that created
+    the operation, the submit, the manual decision, the receipt and an action called by a worker -
+    because each of them is linked to the chain by a different saved fact.
+    """
+    request_key, submit_key = f"e2e-trace-request-{uuid.uuid4()}", f"e2e-trace-submit-{uuid.uuid4()}"
+    status, created = action("payment", "request",
+                             {"operationKind": "PAYMENT_EXECUTION", "amount": "1051.00", "currency": "RUB"},
+                             CLIENT, request_key)
+    check(status == 200 and created and created["status"] == "ok", f"payment.request failed: {status} {created}")
+    operation_id = created["result"]["operationId"]
+    status, submitted = action("payment", "submit", {"operationId": operation_id}, CLIENT, submit_key)
+    check(status == 200 and submitted and submitted["outcome"] == "SUBMITTED", f"payment.submit failed: {status} {submitted}")
+    process_id = submitted["result"]["processId"]
+    wait_status(operation_id, "COMPLETED")
+    external_id = external_request(operation_id)
+    job = sql_rows("SELECT job_id, execution_id, step_instance_id FROM autocheck.jobs "
+                   f"WHERE process_id = '{process_id}'::uuid ORDER BY job_id LIMIT 1")
+    check(len(job) == 1, f"trace sources missing: {job}")
+    attempt = sql_rows(f"SELECT attempt_id FROM autocheck.attempts WHERE job_id = '{job[0]['job_id']}'::uuid "
+                       "ORDER BY attempt_id LIMIT 1")
+    message = sql_rows(f"SELECT message_id FROM autocheck.receipts WHERE external_request_id = {sql_text(external_id)}")
+    check(len(attempt) == 1 and len(message) == 1, f"trace sources missing: {attempt} {message}")
+    execution_id, message_id = job[0]["execution_id"], message[0]["message_id"]
+    correlation = wait_dispatches({request_key, submit_key, message_id, execution_id})
+
+    identifiers = [
+        ("operationId", operation_id),
+        ("processId", process_id),
+        ("externalRequestId", external_id),
+        ("stepInstanceId", job[0]["step_instance_id"]),
+        ("jobId", job[0]["job_id"]),
+        ("executionId", execution_id),
+        ("attemptId", attempt[0]["attempt_id"]),
+        ("messageId", message_id),
+        ("requestId", request_key),                                  # the command that created the operation
+        ("requestId", submit_key),                                   # a command whose key no subject row keeps
+        ("correlationId", created["meta"]["correlationId"]),
+        ("correlationId", submitted["meta"]["correlationId"]),
+        ("correlationId", correlation[message_id]),                  # receipt.accept called by the adapter
+        ("correlationId", correlation[execution_id]),                # a registered action called by a worker
+    ]
+    baseline = trace_chain("provider chain", identifiers, operation_id, process_id, "receipts")
+    check(bool(baseline["outbox"]), f"provider chain lost its delivery: {baseline['outbox']}")
+    routes = {(call["module"], call["action"]) for call in baseline["dispatches"]}
+    expected_routes = {("payment", "request"), ("payment", "submit"), ("payment", "prepare_external"),
+                       ("receipt", "accept")}
+    check(expected_routes <= routes, f"the trail of calls is incomplete: {sorted(routes)}")
+
+    # The second process is settled by an audited decision instead of a receipt.
+    manual_key = f"e2e-trace-manual-{uuid.uuid4()}"
+    manual_operation, manual = create_and_submit("PAYMENT_APPROVAL", "100000.01")
+    step = poll("SELECT step_instance_id FROM autocheck.steps "
+                f"WHERE process_id = '{manual['processId']}'::uuid AND step_type = 'MANUAL' AND state = 'WAITING'",
+                lambda rows: len(rows) == 1)
+    status, decided = action("workflow", "manual",
+                             {"processId": manual["processId"], "stepInstanceId": step[0]["step_instance_id"],
+                              "decision": "APPROVED", "reason": "e2e trace reason"}, REVIEWER, manual_key)
+    check(status == 200 and decided and decided["outcome"] == "APPROVED", f"manual decision: {status} {decided}")
+    wait_status(manual_operation, "COMPLETED")
+    wait_dispatches({manual_key})
+    decision_id = decided["result"]["decisionId"]
+    manual_identifiers = [
+        ("decisionId", decision_id),
+        ("stepInstanceId", step[0]["step_instance_id"]),
+        ("operationId", manual_operation),
+        ("requestId", manual_key),
+        ("correlationId", decided["meta"]["correlationId"]),
+    ]
+    manual_baseline = trace_chain("review chain", manual_identifiers, manual_operation, manual["processId"], "decisions")
+    check(any(decision["decisionId"] == decision_id and decision["source"] == "MANUAL"
+              for decision in manual_baseline["decisions"]),
+          f"the audited decision is missing from its own trace: {manual_baseline['decisions']}")
+    check(("workflow", "manual") in {(call["module"], call["action"]) for call in manual_baseline["dispatches"]},
+          f"the manual command is missing from the trail of calls: {manual_baseline['dispatches']}")
+
+    with open(TRACE_RESULT_SCHEMA, encoding="utf-8") as schema:
+        published = set(json.load(schema)["properties"]["query"]["properties"]["matchedBy"]["items"]["enum"])
+    traced = {kind for kind, _ in identifiers + manual_identifiers}
+    check(traced == published, f"identifier kinds not traced: {sorted(published - traced)}, unknown: {sorted(traced - published)}")
 
     # Nothing sensitive may travel in a diagnostic projection.
-    serialized = json.dumps(baseline)
-    for forbidden in (HMAC_SECRET, CAPABILITY, AUDIT_TOKEN, RECEIPT, "e2e rejection"):
+    serialized = json.dumps([baseline, manual_baseline])
+    for forbidden in (HMAC_SECRET, CAPABILITY, AUDIT_TOKEN, RECEIPT, "e2e rejection", "e2e trace reason"):
         check(forbidden not in serialized, "trace leaked a secret or a message body")
 
     status, body = action("diagnostics", "trace", {"identifier": f"unknown-{secrets.token_hex(8)}"}, OBSERVER)
@@ -951,9 +1236,59 @@ def scenario_api_failpoints() -> None:
     wait_status(manual_operation, "COMPLETED")
 
 
+def provider_mode(mode: str) -> None:
+    """Recreates the issued simulator in another mode and waits until it answers.
+
+    The simulator keeps its payments in memory, so an audit of anything delivered before this call
+    is gone afterwards - every scenario audits its own operations before it returns.
+    """
+    start("provider-simulator", recreate=True, environment={"PROVIDER_SIMULATOR_MODE": mode})
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            if audit(f"ext-e2e-probe-{secrets.token_hex(4)}")[0] in (200, 404):
+                return
+        except Failure:
+            pass
+        check(time.monotonic() < deadline, f"the provider did not come back in mode {mode}")
+        time.sleep(0.3)
+
+
+def scenario_provider_unknown_outcome() -> None:
+    """A lost response and a transient error of the provider: retried under one key, one payment.
+
+    ``lost-response`` is the case the whole delivery design exists for: the provider has accepted
+    the payment and the dispatcher cannot know it. ``transient-error`` is its harmless twin. In
+    both, the number of HTTP attempts may exceed one, the number of payments may not.
+    """
+    try:
+        for mode, amount in (("lost-response", "1083.00"), ("transient-error", "1084.00")):
+            provider_mode(mode)
+            operation_id, _ = create_and_submit("PAYMENT_EXECUTION", amount)
+            external_id = external_request(operation_id)
+            wait_status(operation_id, "COMPLETED")
+            status, payment = audit(external_id)
+            check(status == 200 and payment and payment["paymentCount"] == 1 and payment["idempotencyKey"] == external_id,
+                  f"{mode}: exactly one payment under the original key is expected: {status} {payment}")
+            outbox = sql_rows("SELECT state, attempt_count FROM autocheck.outbox "
+                              f"WHERE external_request_id = {sql_text(external_id)}")
+            check(len(outbox) == 1 and outbox[0]["state"] == "CONFIRMED" and 1 <= outbox[0]["attempt_count"] <= 4,
+                  f"{mode}: the delivery must be confirmed within the attempt budget: {outbox}")
+            receipts = sql_rows(f"SELECT count(*) AS n FROM autocheck.receipts WHERE external_request_id = {sql_text(external_id)}")
+            check(receipts[0]["n"] == 1, f"{mode}: one receipt must settle the operation: {receipts}")
+            events = sql_rows("SELECT count(*) AS n FROM autocheck.operation_events "
+                              f"WHERE operation_id = '{operation_id}'::uuid AND event_type = 'OPERATION_COMPLETED'")
+            check(events[0]["n"] == 1, f"{mode}: the operation must complete exactly once: {events}")
+    finally:
+        provider_mode("success")
+
+
 def scenario_observer_role() -> None:
     """The observer reads the published projections and nothing else."""
-    password = os.environ.get("COURSE_AUTOCHECK_PASSWORD", "course_local_autocheck")
+    # Tracked Compose has no default for the observer password. The probes below run inside the
+    # postgres container, where the local socket is trusted, so they hold with or without it; the
+    # password itself is exercised by the course checker, which connects over TCP from outside.
+    password = os.environ.get("COURSE_AUTOCHECK_PASSWORD", "")
     readable = compose("exec", "-T", "-e", f"PGPASSWORD={password}", "postgres", "psql", "-X",
                        "-v", "ON_ERROR_STOP=1", "-U", "autocheck_reader", "-d", "course", "-At",
                        "-c", "SELECT count(*) FROM autocheck.outbox")
@@ -979,10 +1314,14 @@ def scenario_observer_role() -> None:
 
 
 SCENARIOS = [scenario_provider_path, scenario_adapter_and_recreate, scenario_review, scenario_concurrent_submit,
-             scenario_least_privilege, scenario_failpoint_and_lease_expiry, scenario_receipt_lock_order,
+             scenario_least_privilege, scenario_failpoint_and_lease_expiry,
+             scenario_failpoint_after_provider_response, scenario_failpoint_after_job_claim,
+             scenario_delivery_fencing, scenario_receipt_lock_order,
              scenario_submit_rejects_foreign_process, scenario_storage_invariants,
-             scenario_health_and_metrics, scenario_dead_letter_and_late_receipt, scenario_diagnostics_trace,
-             scenario_api_failpoints, scenario_observer_role, scenario_outbox_retry_budget]
+             scenario_health_and_metrics, scenario_job_queue_metrics,
+             scenario_dead_letter_and_late_receipt, scenario_diagnostics_trace,
+             scenario_api_failpoints, scenario_observer_role, scenario_provider_unknown_outcome,
+             scenario_outbox_retry_budget]
 
 
 def main() -> int:

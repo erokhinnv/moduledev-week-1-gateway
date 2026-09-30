@@ -135,7 +135,10 @@ def main(env: Mapping[str, str] | None = None) -> int:
         "dispatcher.configured",
         owner=settings.owner,
         testProfile=settings.test_profile,
+        # The effective budget: a configured timeout that would outlive the delivery lease is cut
+        # to fit into it, and the record says so instead of leaving it to be guessed.
         providerTimeoutMs=int(settings.provider_timeout_s * 1000),
+        providerTimeoutLimitedByLease=settings.provider_timeout_limited,
         pollIntervalMs=int(settings.poll_interval_s * 1000),
         maxAttempts=settings.max_attempts,
         leaseMs=settings.lease_ms,

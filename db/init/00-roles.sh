@@ -24,9 +24,11 @@
 #   inbox_reconciler - роль Python-согласователя Inbox (неделя 3). EXECUTE ровно на одну функцию
 #                      delivery.reconcile_inbox. Обе роли не состоят ни в одной другой роли.
 #   autocheck_reader - роль наблюдателя (неделя 4). Здесь у неё только CONNECT, а USAGE схемы
-#                      autocheck и SELECT её представлений выдаёт миграция 022. Ни членства,
-#                      ни прав на физические отношения, функции, последовательности, CREATE
-#                      и TEMP у неё нет.
+#                      autocheck и SELECT её представлений выдаёт миграция 024_reliability.sql.
+#                      Ни членства, ни прав на физические отношения, функции, последовательности,
+#                      CREATE и TEMP у неё нет. Пароль приходит только из окружения запуска
+#                      (COURSE_AUTOCHECK_PASSWORD, значения по умолчанию в compose.yaml нет): без
+#                      него роль создаётся без пароля и войти под ней нельзя.
 #
 # Здесь же закрепляется профиль доставки и аренды. Значения приходят в сервис postgres
 # переменными окружения и становятся настройками САМОЙ базы (ALTER DATABASE ... SET):
@@ -113,8 +115,10 @@ ALTER DEFAULT PRIVILEGES FOR ROLE course_migrator REVOKE EXECUTE ON FUNCTIONS FR
 ALTER DEFAULT PRIVILEGES FOR ROLE course_owner REVOKE ALL ON TABLES FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE course_migrator REVOKE ALL ON TABLES FROM PUBLIC;
 
--- Профиль доставки и аренды как настройки базы: их видит любая сессия, включая границы
--- delivery.* и workflow.claim_jobs, и ни один клиент не может подменить их своим параметром.
+-- Профиль доставки и аренды как настройки базы. Границы delivery.* читают их из каталога
+-- (pg_db_role_setting), а не из сессии, и не принимают аргументом: клиент границы не может
+-- подменить профиль ни параметром вызова, ни собственным SET. Срок аренды задания — значение по
+-- умолчанию для workflow.claim_jobs, когда исполнитель не передал свой p_lease_ms.
 ALTER DATABASE :"dbname" SET course.outbox_max_attempts    = :'outbox_max_attempts';
 ALTER DATABASE :"dbname" SET course.outbox_backoff_base_ms = :'outbox_backoff_base_ms';
 ALTER DATABASE :"dbname" SET course.outbox_backoff_max_ms  = :'outbox_backoff_max_ms';

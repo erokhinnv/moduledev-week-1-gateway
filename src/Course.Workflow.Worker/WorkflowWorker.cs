@@ -171,7 +171,9 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
         // вообще, поэтому никакого частичного эффекта появиться не может.
         if (!WorkflowPayload.TryBuild(job.InputConstants, job.InputMapping, job.ProcessData, out var payload, out var missing))
         {
-            Log("attempt.mapping_missing", ("jobId", job.JobId), ("pointer", missing));
+            LogAttempt("attempt.mapping_missing", job,
+                ("errorCode", ContractCodes.WorkflowMappingMissing),
+                ("pointer", missing));
             await FailAsync(connection, job, ContractCodes.WorkflowMappingMissing, false, null, cancellationToken);
             return false;
         }
@@ -260,13 +262,11 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
                 // Объявленная ошибка или нарушение контракта откатывают предметный эффект целиком.
                 // Технический след при этом не теряется: его запишет отдельная транзакция fail_job.
                 await transaction.RollbackAsync(CancellationToken.None);
-                Log("attempt.rejected",
-                    ("jobId", job.JobId),
-                    ("executionId", job.ExecutionId),
-                    ("attemptId", job.AttemptId),
-                    ("attemptNumber", job.AttemptNumber),
+                LogAttempt("attempt.rejected", job,
+                    ("correlationId", correlationId),
                     ("errorCode", outcome.Code),
-                    ("retryable", outcome.Retryable));
+                    ("retryable", outcome.Retryable),
+                    ("durationMs", ElapsedMs(started)));
                 return new AttemptResult(
                     false,
                     outcome.Code,
@@ -299,11 +299,10 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
                 await transaction.RollbackAsync(CancellationToken.None);
 
                 var refusal = finish?["code"]?.GetValue<string>() ?? ContractCodes.WorkflowBoundaryFailed;
-                Log("attempt.finish_refused",
-                    ("jobId", job.JobId),
-                    ("executionId", job.ExecutionId),
-                    ("attemptNumber", job.AttemptNumber),
-                    ("errorCode", refusal));
+                LogAttempt("attempt.finish_refused", job,
+                    ("correlationId", correlationId),
+                    ("errorCode", refusal),
+                    ("durationMs", durationMs));
 
                 // Потерянная аренда — единственный отказ, при котором сообщать больше нечего:
                 // заданием владеет другой арендатор, и любая наша запись была бы тем самым
@@ -327,17 +326,8 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
             }
 
             await transaction.CommitAsync(CancellationToken.None);
-            Log("attempt.succeeded",
+            LogAttempt("attempt.succeeded", job,
                 ("correlationId", correlationId),
-                ("processId", job.ProcessId),
-                ("stepKey", job.StepKey),
-                ("jobId", job.JobId),
-                ("executionId", job.ExecutionId),
-                ("attemptId", job.AttemptId),
-                ("attemptNumber", job.AttemptNumber),
-                ("leaseVersion", job.LeaseVersion),
-                ("action", job.Module + "." + job.Action),
-                ("actionVersion", outcome.ActionVersion ?? job.ActionVersion),
                 ("outcome", outcome.Outcome),
                 ("durationMs", durationMs));
             return AttemptResult.Done;
@@ -345,10 +335,10 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
         catch (PostgresException exception) when (exception.SqlState == PostgresErrorCodes.QueryCanceled)
         {
             await SafeRollbackAsync(transaction);
-            Log("attempt.timed_out",
-                ("jobId", job.JobId),
-                ("attemptNumber", job.AttemptNumber),
-                ("errorCode", ContractCodes.ActionTimeout));
+            LogAttempt("attempt.timed_out", job,
+                ("correlationId", correlationId),
+                ("errorCode", ContractCodes.ActionTimeout),
+                ("durationMs", ElapsedMs(started)));
             return new AttemptResult(
                 false,
                 ContractCodes.ActionTimeout,
@@ -358,6 +348,10 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             await SafeRollbackAsync(transaction);
+            LogAttempt("attempt.timed_out", job,
+                ("correlationId", correlationId),
+                ("errorCode", ContractCodes.ActionTimeout),
+                ("durationMs", ElapsedMs(started)));
             return new AttemptResult(
                 false,
                 ContractCodes.ActionTimeout,
@@ -371,11 +365,11 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
             // быть повторяемым — иначе конкурентная квитанция или решение переводили бы процесс
             // в FAILED из-за очерёдности блокировок, а не из-за ошибки действия.
             await SafeRollbackAsync(transaction);
-            Log("attempt.database_conflict",
-                ("jobId", job.JobId),
-                ("attemptNumber", job.AttemptNumber),
+            LogAttempt("attempt.database_conflict", job,
+                ("correlationId", correlationId),
                 ("errorCode", ContractCodes.DependencyUnavailable),
-                ("failure", Redaction.Describe(exception)));
+                ("failure", Redaction.Describe(exception)),
+                ("durationMs", ElapsedMs(started)));
             return new AttemptResult(
                 false,
                 ContractCodes.DependencyUnavailable,
@@ -388,11 +382,11 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
             // важно: сбой ВНУТРИ границы завершения (например несогласованная карта) не тратит
             // бюджет max_attempts, и без явного отчёта задание перезахватывалось бы бесконечно.
             await SafeRollbackAsync(transaction);
-            Log("attempt.database_rejected",
-                ("jobId", job.JobId),
-                ("attemptNumber", job.AttemptNumber),
+            LogAttempt("attempt.database_rejected", job,
+                ("correlationId", correlationId),
                 ("errorCode", ContractCodes.WorkflowBoundaryFailed),
-                ("failure", Redaction.Describe(exception)));
+                ("failure", Redaction.Describe(exception)),
+                ("durationMs", ElapsedMs(started)));
             return new AttemptResult(false, ContractCodes.WorkflowBoundaryFailed, false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -401,10 +395,10 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
             // соединением нельзя. Задание остаётся арендованным и будет перехвачено по истечении
             // срока — теперь под защитой абсолютного потолка попыток в claim_jobs.
             await SafeRollbackAsync(transaction);
-            Log("attempt.failed",
-                ("jobId", job.JobId),
-                ("attemptNumber", job.AttemptNumber),
-                ("failure", Redaction.Describe(exception)));
+            LogAttempt("attempt.failed", job,
+                ("correlationId", correlationId),
+                ("failure", Redaction.Describe(exception)),
+                ("durationMs", ElapsedMs(started)));
             throw;
         }
     }
@@ -500,14 +494,9 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
                     ?? envelope?["code"]?.GetValue<string>()
                     ?? "unknown";
 
-        Log("attempt.reported",
-            ("processId", job.ProcessId),
-            ("stepKey", job.StepKey),
-            ("jobId", job.JobId),
-            ("executionId", job.ExecutionId),
-            ("attemptId", job.AttemptId),
-            ("attemptNumber", job.AttemptNumber),
-            ("leaseVersion", job.LeaseVersion),
+        LogAttempt("attempt.reported", job,
+            // Вызова могло не быть вовсе (отказ mapping, недоступная версия): тогда нет и следа.
+            ("correlationId", dispatch?["correlationId"]?.GetValue<string>()),
             ("errorCode", code),
             ("retryable", retryable),
             ("state", state));
@@ -634,6 +623,35 @@ public sealed class WorkflowWorker(WorkerOptions options, WorkerMetrics metrics)
         record["instanceId"] = options.InstanceId;
         StructuredLog.Write(StructuredLog.Fill(record, fields));
     }
+
+    /// <summary>
+    /// Запись о попытке шага. Личность попытки — процесс, закреплённая карта и её версия, шаг,
+    /// задание, исполнение, попытка, версия аренды и действие с версией — одна и та же у каждого
+    /// события попытки, успешного или нет: контракт наблюдаемости требует этот минимум от записи о
+    /// шаге, а не только от записи об успехе. Исход, код отказа, длительность и correlationId
+    /// вызова добавляет место вызова.
+    /// </summary>
+    private void LogAttempt(string @event, LeasedJob job, params (string Name, object? Value)[] fields)
+        => Log(@event, [.. AttemptIdentity(job), .. fields]);
+
+    /// <summary>Поля, общие для всех записей об одной попытке шага.</summary>
+    public static (string Name, object? Value)[] AttemptIdentity(LeasedJob job) =>
+    [
+        ("processId", job.ProcessId),
+        ("flowName", job.FlowName),
+        ("flowVersion", job.FlowVersion),
+        ("stepKey", job.StepKey),
+        ("jobId", job.JobId),
+        ("executionId", job.ExecutionId),
+        ("attemptId", job.AttemptId),
+        ("attemptNumber", job.AttemptNumber),
+        ("leaseVersion", job.LeaseVersion),
+        ("action", job.Module + "." + job.Action),
+        ("actionVersion", job.ActionVersion),
+    ];
+
+    private static int ElapsedMs(long startedAt)
+        => (int)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds;
 
     private static NpgsqlParameter Text(string value)
         => new() { NpgsqlDbType = NpgsqlDbType.Text, Value = value };

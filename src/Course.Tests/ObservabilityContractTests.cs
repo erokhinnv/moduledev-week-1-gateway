@@ -117,6 +117,58 @@ public sealed class OpenMetricsTests
 [Collection(ConsoleCapture.Name)]
 public sealed class StructuredLogTests
 {
+    /// <summary>
+    /// Запись о попытке шага несёт безопасный минимум контракта: процесс, карту и её версию, шаг,
+    /// задание, исполнение, попытку, версию аренды, действие и его версию — одинаково у каждого
+    /// события попытки, а не только у успешного. Карта и версия приходят из описания аренды.
+    /// </summary>
+    [Fact]
+    public void EveryAttemptRecordNamesTheProcessTheFlowTheStepAndTheAction()
+    {
+        var job = LeasedJob.FromDescriptor((JsonObject)JsonNode.Parse("""
+            {
+              "jobId": "11111111-1111-1111-1111-111111111111",
+              "executionId": "22222222-2222-2222-2222-222222222222",
+              "attemptId": "33333333-3333-3333-3333-333333333333",
+              "attemptNumber": 2,
+              "leaseVersion": 3,
+              "processId": "44444444-4444-4444-4444-444444444444",
+              "flowName": "payment-processing",
+              "flowVersion": 1,
+              "stepKey": "validate_operation",
+              "module": "payment",
+              "action": "validate",
+              "actionVersion": 1,
+              "timeoutMs": 2000,
+              "actionAvailable": true
+            }
+            """)!);
+
+        var record = StructuredLog.Fill(
+            StructuredLog.Record("workflow-worker", "info", "attempt.reported"),
+            WorkflowWorker.AttemptIdentity(job));
+
+        var expected = new Dictionary<string, string>
+        {
+            ["processId"] = "44444444-4444-4444-4444-444444444444",
+            ["flowName"] = "payment-processing",
+            ["flowVersion"] = "1",
+            ["stepKey"] = "validate_operation",
+            ["jobId"] = "11111111-1111-1111-1111-111111111111",
+            ["executionId"] = "22222222-2222-2222-2222-222222222222",
+            ["attemptId"] = "33333333-3333-3333-3333-333333333333",
+            ["attemptNumber"] = "2",
+            ["leaseVersion"] = "3",
+            ["action"] = "payment.validate",
+            ["actionVersion"] = "1",
+        };
+        foreach (var (name, value) in expected)
+        {
+            Assert.True(record.ContainsKey(name), $"запись о попытке не содержит поля {name}");
+            Assert.Equal(value, record[name]!.ToJsonString().Trim('"'));
+        }
+    }
+
     [Fact]
     public void RecordIsOneJsonObjectOnOneLine()
     {

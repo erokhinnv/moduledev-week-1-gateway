@@ -3,9 +3,9 @@
 
     eval "$(python3 scripts/dev_env.py)"
 
-Tracked Compose has no defaults for JWT, HMAC, capability or tokens. This helper generates
-random synthetic values for one local session and issues the ``receipt-provider`` JWT
-(scope ``receipt:write``) with the same signing key the API validates. Nothing is written to
+Tracked Compose has no defaults for JWT, HMAC, capability, tokens or the observer password. This
+helper generates random synthetic values for one local session and issues the ``receipt-provider``
+JWT (scope ``receipt:write``) with the same signing key the API validates. Nothing is written to
 disk: the values live only in the current shell.
 """
 
@@ -60,6 +60,9 @@ def main() -> None:
         "PROVIDER_HMAC_SECRET": secrets.token_urlsafe(40),
         "PROVIDER_CALLBACK_CAPABILITY": secrets.token_urlsafe(24),
         "PROVIDER_AUDIT_TOKEN": secrets.token_urlsafe(24),
+        # Password of the read-only observer role. It reaches PostgreSQL once, when the volume is
+        # initialised, so the value of the session that created the volume is the one that works.
+        "COURSE_AUTOCHECK_PASSWORD": secrets.token_urlsafe(24),
         "PROVIDER_CALLBACK_TOKEN": issue_token(
             key, "receipt-provider", "integration", ["receipt:write"], ttl_s=7 * 24 * 3600
         ),

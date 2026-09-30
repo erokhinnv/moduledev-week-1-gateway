@@ -16,9 +16,14 @@
 -------------------------------------------------------------------------------
 -- Настройки профиля, принадлежащие базе
 --
--- current_setting(..., true) возвращает NULL для неустановленной настройки, поэтому отсутствие
--- ALTER DATABASE (например на старом томе) не ломает границу, а откатывает её к значению,
--- записанному в delivery.delivery_policy.
+-- Читается настройка уровня БАЗЫ из каталога pg_db_role_setting, а не current_setting().
+-- current_setting отдаёт значение СЕССИИ: для custom-параметра оно лишь по умолчанию равно
+-- настройке базы, и любая роль вправе переопределить его у себя командой SET. Профиль доставки
+-- не имеет права зависеть от того, что выставил в своей сессии клиент границы, поэтому сессионное
+-- значение здесь не участвует вовсе.
+--
+-- Отсутствие ALTER DATABASE (например на старом томе) не ломает границу, а откатывает её к
+-- значению, записанному в delivery.delivery_policy.
 -------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION api.setting_int(p_name text, p_fallback integer)
 RETURNS integer
@@ -29,7 +34,16 @@ AS $fn$
 DECLARE
     v_raw text;
 BEGIN
-    v_raw := btrim(coalesce(current_setting(p_name, true), ''));
+    SELECT pg_catalog.substr(entry, pg_catalog.length(p_name) + 2) INTO v_raw
+    FROM pg_catalog.pg_db_role_setting s
+    CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS entry
+    WHERE s.setdatabase = (SELECT d.oid FROM pg_catalog.pg_database d
+                           WHERE d.datname = pg_catalog.current_database())
+      AND s.setrole = 0
+      AND pg_catalog.starts_with(entry, p_name || '=')
+    LIMIT 1;
+
+    v_raw := btrim(coalesce(v_raw, ''));
 
     -- Настройка базы — это текст. Нечисловое или слишком длинное значение не имеет права
     -- превратиться в исключение посреди захвата доставки: граница продолжает работать по
@@ -60,9 +74,10 @@ $fn$;
 -- Профиль доставки
 -------------------------------------------------------------------------------
 
--- Таблица профилей остаётся значением по умолчанию, но её «лестница задержек» заменяется
--- параметрами экспоненты: база, потолок и jitter. Хранить и список задержек, и экспоненту
--- означало бы иметь два несогласуемых источника одной и той же политики.
+-- Таблица профилей остаётся значением по умолчанию, но решение теперь принимается по параметрам
+-- экспоненты: база, потолок и jitter. Колонка delays_ms недели 3 остаётся наглядной записью той
+-- же лестницы (без jitter) и ниже пересчитывается ИЗ экспоненты: список задержек и правило, не
+-- совпадающие между собой, — это таблица, которая снова противоречит самой себе.
 ALTER TABLE delivery.delivery_policy
     ADD COLUMN IF NOT EXISTS backoff_base_ms integer,
     ADD COLUMN IF NOT EXISTS backoff_max_ms  integer,
@@ -96,6 +111,18 @@ ALTER TABLE delivery.delivery_policy
         backoff_base_ms BETWEEN 1 AND 600000
         AND backoff_max_ms BETWEEN backoff_base_ms AND 600000
         AND jitter_max_ms BETWEEN 0 AND 60000);
+
+-- Лестница строки — следствие её же экспоненты: задержка после отказа номер n равна
+-- least(base * 2^(n-1), max). Профиль test остаётся 200/400/800 мс; профиль default вместо
+-- прежних 1/5/15/60 с, которых экспонента не даёт, получает то, что действительно применяется, —
+-- 1/2/4/8 с. Длина по-прежнему max_attempts - 1 (ограничение delivery_policy_delays_shape из 022).
+UPDATE delivery.delivery_policy p
+SET delays_ms = coalesce((
+    SELECT jsonb_agg(
+               least(p.backoff_base_ms::numeric * pg_catalog.power(2::numeric, n - 1),
+                     p.backoff_max_ms::numeric)::integer
+               ORDER BY n)
+    FROM generate_series(1, p.max_attempts - 1) AS n), '[]'::jsonb);
 
 -- Действующий профиль — составное значение, а не строка таблицы: часть полей приходит из
 -- настроек базы и вообще не обязана существовать в таблице.
@@ -436,15 +463,23 @@ SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
     SELECT jsonb_build_object(
+        -- «Доступно для захвата сейчас» — ровно то условие, по которому кандидатов выбирает
+        -- workflow.claim_jobs: готовые и дождавшиеся своего времени задания И задания с истёкшей
+        -- арендой. Брошенное погибшим исполнителем задание не выполняется и ждёт перехвата —
+        -- очередь без него показывала бы ноль именно тогда, когда работа стоит.
         'workflowJobsReady', (
             SELECT count(*) FROM workflow.workflow_job j
-            WHERE j.state IN ('READY', 'RETRY_WAIT') AND j.next_attempt_at <= clock_timestamp()),
+            WHERE (j.state IN ('READY', 'RETRY_WAIT') AND j.next_attempt_at <= clock_timestamp())
+               OR (j.state = 'LEASED' AND j.lease_until IS NOT NULL AND j.lease_until <= clock_timestamp())),
         -- Возраст считается от момента, с которого задание СТАЛО доступным, а не от его
-        -- создания: отложенный retry не имеет права выглядеть залежавшейся очередью.
+        -- создания: отложенный retry не имеет права выглядеть залежавшейся очередью. Для
+        -- брошенного задания этот момент — истечение аренды.
         'workflowJobOldestAgeSeconds', (
-            SELECT round(coalesce(extract(epoch FROM (clock_timestamp() - min(j.next_attempt_at))), 0), 3)
+            SELECT round(coalesce(extract(epoch FROM (clock_timestamp() - min(
+                       CASE WHEN j.state = 'LEASED' THEN j.lease_until ELSE j.next_attempt_at END))), 0), 3)
             FROM workflow.workflow_job j
-            WHERE j.state IN ('READY', 'RETRY_WAIT') AND j.next_attempt_at <= clock_timestamp()),
+            WHERE (j.state IN ('READY', 'RETRY_WAIT') AND j.next_attempt_at <= clock_timestamp())
+               OR (j.state = 'LEASED' AND j.lease_until IS NOT NULL AND j.lease_until <= clock_timestamp())),
         'workflowProcessesWaiting', (
             SELECT count(*) FROM workflow.process_instance p
             WHERE p.state IN ('WAITING_SIGNAL', 'WAITING_MANUAL')),
@@ -470,9 +505,10 @@ GRANT EXECUTE ON FUNCTION api.runtime_metrics() TO course_runtime;
 -------------------------------------------------------------------------------
 -- Аренда задания: значение по умолчанию принадлежит базе
 --
--- Единственное отличие от 013 — источник значения, которым заполняется не переданный срок
--- аренды. Оно приходит настройкой базы из окружения сервиса postgres, поэтому профиль
--- восстановления задаётся конфигурацией контура, а не константой внутри функции.
+-- Отличий от 023 два. Первое — источник значения, которым заполняется не переданный срок аренды:
+-- оно приходит настройкой базы из окружения сервиса postgres, поэтому профиль восстановления
+-- задаётся конфигурацией контура, а не константой внутри функции. Второе — описание задания
+-- называет закреплённую карту и её версию (flowName, flowVersion): они нужны журналу исполнителя.
 -------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION workflow.claim_jobs(
     p_owner text,
@@ -504,7 +540,7 @@ DECLARE
     c_default_ceiling_minimum constant integer := 10;
 
     v_now        timestamptz := clock_timestamp();
-    -- Единственное отличие от 013: срок аренды по умолчанию принадлежит базе. Он приходит
+    -- Отличие от 023: срок аренды по умолчанию принадлежит базе. Он приходит
     -- настройкой из окружения сервиса postgres, поэтому наблюдаемое время восстановления
     -- задаётся конфигурацией контура, а не константой внутри функции.
     v_floor_ms   integer := greatest(
@@ -677,6 +713,11 @@ BEGIN
             'leaseVersion', j.lease_version,
             'leaseUntil', j.lease_until,
             'processId', j.process_id,
+            -- Имя и версия закреплённой карты нужны исполнителю только для журнала: запись о шаге
+            -- обязана называть процесс, карту и её версию. Ветвиться по ним он по-прежнему не может
+            -- и не должен — исполнение определяют поля задачи ниже.
+            'flowName', f.flow_name,
+            'flowVersion', fv.version,
             'stepInstanceId', j.step_instance_id,
             'stepKey', si.step_key,
             'service', t.service,
@@ -703,6 +744,8 @@ BEGIN
         FROM workflow.workflow_job j
         JOIN workflow.step_instance si ON si.step_instance_id = j.step_instance_id
         JOIN workflow.process_instance p ON p.process_id = j.process_id
+        JOIN workflow.flow_definition f ON f.flow_id = p.flow_id
+        JOIN workflow.flow_version fv ON fv.flow_version_id = p.flow_version_id
         JOIN workflow.step_definition sd ON sd.step_definition_id = si.step_definition_id
         JOIN workflow.task_definition t ON t.step_definition_id = sd.step_definition_id
         JOIN workflow.worker_principal w ON w.principal = 'workflow-worker'
@@ -765,6 +808,85 @@ BEGIN
     ) AS stalled;
 
     RETURN api.action_ok(p_context, 'FOUND', jsonb_build_object('items', v_items));
+END;
+$fn$;
+
+-- К какой цепочке относится один записанный вызов действия. Вызов адресуется ключом запроса, а
+-- ключ у разных вызовов разной природы, поэтому связи перебираются от самой точной к общей:
+--   * сохранённый результат идемпотентной команды называет операцию или процесс сам — так
+--     связываются payment.submit и workflow.manual, чей ключ не лежит ни в одной предметной строке;
+--   * ключ payment.request хранится в самой операции;
+--   * ключ receipt.accept — это messageId квитанции;
+--   * вызов действия исполнителем адресован executionId задания (успех) или attemptId (отказ).
+-- Вызов без ключа (чтение) ни с чем не связывается: связывать его было бы нечем, кроме догадки.
+CREATE OR REPLACE FUNCTION diagnostics.dispatch_chain(p_module text, p_action text, p_request_id text)
+RETURNS TABLE (operation_id uuid, process_id uuid)
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog
+AS $fn$
+#variable_conflict use_column
+DECLARE
+    v_uuid uuid := api.try_uuid(p_request_id);
+BEGIN
+    IF p_request_id IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT o.operation_id, coalesce(o.process_id, p.process_id)
+    FROM api.idempotency_record r
+    LEFT JOIN payment.operation o
+           ON o.operation_id = api.try_uuid(r.response #>> '{result,operationId}')
+    LEFT JOIN workflow.process_instance p
+           ON p.process_id = api.try_uuid(r.response #>> '{result,processId}')
+    WHERE r.module = p_module
+      AND r.action = p_action
+      AND r.request_id = p_request_id
+      AND (o.operation_id IS NOT NULL OR p.process_id IS NOT NULL)
+    ORDER BY r.created_at, r.idempotency_id
+    LIMIT 1;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT o.operation_id, o.process_id
+    FROM payment.operation o
+    WHERE o.request_id = p_request_id
+    ORDER BY o.created_at, o.operation_id
+    LIMIT 1;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT r.operation_id, r.process_id
+    FROM payment.receipt r
+    WHERE r.message_id = p_request_id;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    IF v_uuid IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT NULL::uuid, j.process_id
+    FROM workflow.workflow_job j
+    WHERE j.execution_id = v_uuid
+    ORDER BY j.created_at, j.job_id
+    LIMIT 1;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT NULL::uuid, j.process_id
+    FROM workflow.task_attempt a
+    JOIN workflow.workflow_job j ON j.job_id = a.job_id
+    WHERE a.attempt_id = v_uuid;
 END;
 $fn$;
 
@@ -858,23 +980,22 @@ BEGIN
             v_matched := v_matched || '["correlationId"]'::jsonb;
             v_correlations := array_append(v_correlations, v_uuid);
 
-            -- correlationId команды submit сохранён вместе с внешним запросом, а correlationId
-            -- любой другой команды связан с операцией через её ключ запроса.
+            -- correlationId вызова payment.prepare_external сохранён вместе с внешним запросом и
+            -- доставкой (он же уходит provider заголовком X-Correlation-ID). correlationId любого
+            -- другого вызова связан с цепочкой через ключ запроса этого вызова.
             SELECT e.operation_id, e.process_id INTO v_hit_op, v_hit_process
             FROM payment.external_request e WHERE e.correlation_id = v_uuid;
+            IF NOT FOUND THEN
+                SELECT link.operation_id, link.process_id INTO v_hit_op, v_hit_process
+                FROM api.dispatch d
+                CROSS JOIN LATERAL diagnostics.dispatch_chain(d.module, d.action, d.request_id) AS link
+                WHERE d.correlation_id = v_uuid
+                ORDER BY d.occurred_at, d.dispatch_id
+                LIMIT 1;
+            END IF;
             IF FOUND THEN
                 v_operation_id := coalesce(v_operation_id, v_hit_op);
                 v_process_id := coalesce(v_process_id, v_hit_process);
-            ELSE
-                SELECT o.operation_id, o.process_id INTO v_hit_op, v_hit_process
-                FROM api.dispatch d
-                JOIN payment.operation o ON o.request_id = d.request_id
-                WHERE d.correlation_id = v_uuid
-                LIMIT 1;
-                IF FOUND THEN
-                    v_operation_id := coalesce(v_operation_id, v_hit_op);
-                    v_process_id := coalesce(v_process_id, v_hit_process);
-                END IF;
             END IF;
         END IF;
     END IF;
@@ -908,7 +1029,19 @@ BEGIN
         v_matched := v_matched || '["requestId"]'::jsonb;
 
         SELECT o.operation_id, o.process_id INTO v_hit_op, v_hit_process
-        FROM payment.operation o WHERE o.request_id = v_identifier LIMIT 1;
+        FROM payment.operation o WHERE o.request_id = v_identifier
+        ORDER BY o.created_at, o.operation_id
+        LIMIT 1;
+        IF NOT FOUND THEN
+            -- Ключ любой другой команды цепочки: submit, ручное решение, квитанция или вызов
+            -- действия исполнителем. Он известен только записанному вызову.
+            SELECT link.operation_id, link.process_id INTO v_hit_op, v_hit_process
+            FROM api.dispatch d
+            CROSS JOIN LATERAL diagnostics.dispatch_chain(d.module, d.action, d.request_id) AS link
+            WHERE d.request_id = v_identifier
+            ORDER BY d.occurred_at, d.dispatch_id
+            LIMIT 1;
+        END IF;
         IF FOUND THEN
             v_operation_id := coalesce(v_operation_id, v_hit_op);
             v_process_id := coalesce(v_process_id, v_hit_process);
@@ -935,14 +1068,31 @@ BEGIN
         SELECT * INTO v_process FROM workflow.process_instance WHERE process_id = v_process_id;
     END IF;
 
-    -- HTTP-след собирается по явным связям: ключу запроса команды, идентификатору квитанции,
-    -- использованному как ключ идемпотентности, и correlation id, сохранённому вместе с внешним
-    -- запросом и доставкой. Журналы для этого не читаются вовсе.
+    -- След вызовов собирается по тем же явным связям, по которым вызов разрешается в цепочку
+    -- (diagnostics.dispatch_chain), только в обратную сторону: ключ запроса команды, создавшей
+    -- операцию; идентификатор квитанции, он же ключ receipt.accept; executionId заданий и attemptId
+    -- попыток — ими адресованы вызовы действий исполнителем; ключи идемпотентных команд, чей
+    -- сохранённый результат называет эту операцию или этот процесс (payment.submit,
+    -- workflow.manual); и correlation id, сохранённый вместе с внешним запросом и доставкой.
+    -- Набор не зависит от того, каким идентификатором спросили. Журналы не читаются вовсе.
     SELECT array_agg(DISTINCT value) INTO v_request_ids
     FROM (
         SELECT v_operation.request_id AS value
         UNION ALL
         SELECT r.message_id FROM payment.receipt r WHERE r.operation_id = v_operation_id
+        UNION ALL
+        SELECT j.execution_id::text FROM workflow.workflow_job j WHERE j.process_id = v_process_id
+        UNION ALL
+        SELECT a.attempt_id::text
+        FROM workflow.task_attempt a
+        JOIN workflow.workflow_job j ON j.job_id = a.job_id
+        WHERE j.process_id = v_process_id
+        UNION ALL
+        SELECT r.request_id
+        FROM api.idempotency_record r
+        WHERE r.response IS NOT NULL
+          AND (r.response #>> '{result,operationId}' = v_operation_id::text
+               OR r.response #>> '{result,processId}' = v_process_id::text)
     ) AS request_ids
     WHERE value IS NOT NULL;
 

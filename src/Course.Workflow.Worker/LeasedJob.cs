@@ -30,6 +30,15 @@ public sealed class LeasedJob
 
     public required Guid ProcessId { get; init; }
 
+    /// <summary>
+    /// Имя и версия закреплённой карты. Исполнителю они нужны только для журнала: запись о шаге
+    /// обязана называть карту. Решений по ним он не принимает — в этом классе нет ни одного
+    /// места, где они сравниваются с чем-либо.
+    /// </summary>
+    public string FlowName { get; init; } = string.Empty;
+
+    public int FlowVersion { get; init; }
+
     public required string StepKey { get; init; }
 
     public required string Module { get; init; }
@@ -70,6 +79,8 @@ public sealed class LeasedJob
         LeaseVersion = descriptor["leaseVersion"]!.GetValue<long>(),
         LeaseUntil = ReadInstant(descriptor["leaseUntil"]),
         ProcessId = Guid.Parse(descriptor["processId"]!.GetValue<string>()),
+        FlowName = descriptor["flowName"]?.GetValue<string>() ?? string.Empty,
+        FlowVersion = descriptor["flowVersion"]?.GetValue<int>() ?? 0,
         StepKey = descriptor["stepKey"]?.GetValue<string>() ?? string.Empty,
         Module = descriptor["module"]?.GetValue<string>() ?? string.Empty,
         Action = descriptor["action"]?.GetValue<string>() ?? string.Empty,

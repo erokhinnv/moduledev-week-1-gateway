@@ -16,8 +16,9 @@ name: moduledev-week-4
 #   provider-simulator - выданный внешний provider v0.2.0, закреплён по digest
 #
 # Пароли PostgreSQL ниже — явно обозначенные local-only значения для разработки, а НЕ настоящие
-# секреты; проверка всегда подменяет их synthetic-значениями. У JWT, HMAC, capability и токенов
-# значений по умолчанию нет вовсе: они приходят только из окружения запуска (см. README, «Запуск»).
+# секреты; проверка всегда подменяет их synthetic-значениями. У JWT, HMAC, capability, токенов и
+# пароля наблюдателя значений по умолчанию нет вовсе: они приходят только из окружения запуска
+# (см. README, «Запуск»).
 #
 # Стек самодостаточен: ни одного bind mount, ни одного внешнего ресурса. Миграции, встроенные
 # манифесты действий, карты процессов и скрипт создания ролей копируются ВНУТРЬ образов на этапе
@@ -43,7 +44,9 @@ services:
       COURSE_OUTBOX_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-course_local_outbox}
       COURSE_INBOX_PASSWORD: ${COURSE_INBOX_PASSWORD:-course_local_inbox}
       # Пароль наблюдателя: роль autocheck_reader читает ТОЛЬКО представления схемы autocheck.
-      COURSE_AUTOCHECK_PASSWORD: ${COURSE_AUTOCHECK_PASSWORD:-course_local_autocheck}
+      # Значения по умолчанию нет — контракт конфигурации недели 4 его не разрешает: пароль
+      # приходит из окружения запуска, а без него роль создаётся без пароля и вход под ней закрыт.
+      COURSE_AUTOCHECK_PASSWORD: ${COURSE_AUTOCHECK_PASSWORD}
       # Профиль доставки и аренды принадлежит базе: db/init/00-roles.sh превращает эти значения в
       # настройки самой базы (ALTER DATABASE ... SET), и границы delivery.* читают уже их.
       # Значения ниже — тестовый профиль контракта недели 4.
