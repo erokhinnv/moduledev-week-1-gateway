@@ -100,6 +100,9 @@ services:
       COURSE_POSTGRES_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-course_local_runtime}
       COURSE_APPLICATION_NAME: course-api
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      # Настройки из README пробрасываются из окружения запуска; пустое значение — умолчание процесса.
+      COURSE_MAX_RESULT_BYTES: ${COURSE_MAX_RESULT_BYTES:-}
+      COURSE_DISPATCH_QUEUE_CAPACITY: ${COURSE_DISPATCH_QUEUE_CAPACITY:-}
     # expose (в отличие от ports) делает порт видимым только другим сервисам ВНУТРИ сети Compose.
     expose:
       - "8080"
@@ -119,6 +122,8 @@ services:
       # Внутренний api адресуется именем сервиса Compose, а не через localhost: DNS этого имени
       # разрешается сетью Docker и продолжает работать после пересоздания контейнера api.
       COURSE_API_BASE_URL: http://api:8080
+      COURSE_GATEWAY_UPSTREAM_TIMEOUT: ${COURSE_GATEWAY_UPSTREAM_TIMEOUT:-}
+      COURSE_GATEWAY_MAX_RESPONSE_BYTES: ${COURSE_GATEWAY_MAX_RESPONSE_BYTES:-}
     ports:
       - "127.0.0.1:${COURSE_GATEWAY_PORT:-8080}:8080"
     depends_on:
@@ -155,6 +160,9 @@ services:
       COURSE_APPLICATION_NAME: course-worker
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_WORKER_LEASE_MS: ${COURSE_WORKER_LEASE_MS:-}
+      COURSE_WORKER_POLL_MS: ${COURSE_WORKER_POLL_MS:-}
+      COURSE_MAX_RESULT_BYTES: ${COURSE_MAX_RESULT_BYTES:-}
     stop_grace_period: 5s
     restart: "no"
 
@@ -177,6 +185,9 @@ services:
       COURSE_APPLICATION_NAME: course-worker
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_WORKER_LEASE_MS: ${COURSE_WORKER_LEASE_MS:-}
+      COURSE_WORKER_POLL_MS: ${COURSE_WORKER_POLL_MS:-}
+      COURSE_MAX_RESULT_BYTES: ${COURSE_MAX_RESULT_BYTES:-}
     stop_grace_period: 5s
     restart: "no"
 
@@ -206,11 +217,16 @@ services:
       COURSE_POSTGRES_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-course_local_outbox}
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      PROVIDER_TIMEOUT_MS: ${PROVIDER_TIMEOUT_MS:-}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-}
+      COURSE_POSTGRES_STATEMENT_TIMEOUT_MS: ${COURSE_POSTGRES_STATEMENT_TIMEOUT_MS:-}
     stop_grace_period: 5s
     restart: unless-stopped
 
   receipt-adapter:
     image: moduledev-week-3-integration:local
+    # Без pull_policy, в отличие от worker-b: проверка недели 3 считает любое значение, кроме
+    # build, признаком чужого образа у Python-сервисов («must run the locally built image»).
     command: ["receipt-adapter"]
     # Ни одной переменной подключения к PostgreSQL: adapter физически не может тронуть состояние
     # в обход generic API и не хранит ничего авторитетного.
@@ -219,7 +235,11 @@ services:
       PROVIDER_CALLBACK_TOKEN: ${PROVIDER_CALLBACK_TOKEN}
       PROVIDER_HMAC_SECRET: ${PROVIDER_HMAC_SECRET}
       RECEIPT_API_URL: ${RECEIPT_API_URL:-http://gateway:8080/api/receipt/accept}
+      # Порт закреплён: на него ссылаются expose ниже и callback URL provider. Адрес и бюджет
+      # ожидания API — настройки из README.
       RECEIPT_ADAPTER_PORT: "8082"
+      RECEIPT_ADAPTER_HOST: ${RECEIPT_ADAPTER_HOST:-}
+      RECEIPT_API_TIMEOUT_MS: ${RECEIPT_API_TIMEOUT_MS:-}
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
     expose:
       - "8082"
@@ -237,6 +257,9 @@ services:
       COURSE_POSTGRES_USER: inbox_reconciler
       COURSE_POSTGRES_PASSWORD: ${COURSE_INBOX_PASSWORD:-course_local_inbox}
       COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      INBOX_POLL_INTERVAL_MS: ${INBOX_POLL_INTERVAL_MS:-}
+      INBOX_BATCH_SIZE: ${INBOX_BATCH_SIZE:-}
+      COURSE_POSTGRES_STATEMENT_TIMEOUT_MS: ${COURSE_POSTGRES_STATEMENT_TIMEOUT_MS:-}
     stop_grace_period: 5s
     restart: unless-stopped
 

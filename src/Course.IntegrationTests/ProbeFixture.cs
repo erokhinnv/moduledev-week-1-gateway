@@ -45,6 +45,20 @@ public sealed class ProbeFixture
                     $"probe manifest v{version} could not be published: {publish?.ToJsonString()}");
             }
 
+            // Медленное действие и его карта: тот же каталог фикстур, та же идемпотентная публикация.
+            foreach (var command in new[]
+            {
+                new[] { "action", "publish", "/itest/manifests/itest-slow-v1.action.json" },
+                new[] { "flow", "publish", "/itest/maps/itest-slow-v1.flow.json" },
+                new[] { "flow", "activate", "itest-slow", "--version", "1" },
+            })
+            {
+                var (exitCode, envelope) = IntegrationEnvironment.Cli(fixtures, command);
+                Assert.True(
+                    exitCode == 0,
+                    $"slow fixture step '{string.Join(' ', command)}' failed: {envelope?.ToJsonString()}");
+            }
+
             _published = true;
         }
     }

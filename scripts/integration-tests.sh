@@ -43,3 +43,6 @@ dotnet test src/Course.IntegrationTests/Course.IntegrationTests.csproj -c Releas
 
 echo "выполняю e2e-сценарии Python-периметра"
 python3 scripts/e2e_perimeter.py
+
+echo "выполняю e2e-сценарии ядра недель 1–2"
+python3 scripts/e2e_core.py

@@ -487,9 +487,128 @@ def scenario_storage_invariants() -> None:
         check(result.returncode != 0 and expected in result.stderr, f"storage guard missing: {statement[:60]}")
 
 
+def docker(*args: str, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def run_dispatcher(**environment: str) -> str:
+    """Starts a one-off dispatcher with its own environment and returns the container id.
+
+    The regular service is stopped for the duration: two dispatchers with the same owner would
+    compete for the very deliveries the scenario watches.
+    """
+    call = ["run", "--detach", "--no-deps"]
+    for name, value in environment.items():
+        call += ["-e", f"{name}={value}"]
+    result = compose(*call, "outbox-dispatcher")
+    container = (result.stdout.strip().splitlines() or [""])[-1].strip()
+    check(result.returncode == 0 and bool(container), f"one-off dispatcher did not start: {result.stderr[-300:]}")
+    return container
+
+
+def remove_container(container: str) -> None:
+    """Instant removal: unlike a graceful stop, a kill cannot let one more attempt slip through."""
+    docker("kill", container)
+    docker("rm", "--force", container)
+
+
+def attempt_log(container: str, external_id: str) -> list[dict[str, Any]]:
+    """Structured ``outbox.attempt`` records of one delivery, in the order they were written."""
+    records = []
+    for line in docker("logs", container).stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("event") == "outbox.attempt" and record.get("externalRequestId") == external_id:
+            records.append(record)
+    return records
+
+
+def scenario_outbox_retry_budget() -> None:
+    """Four attempts including the first, delays 200/400/800 ms, and what exhaustion means.
+
+    The provider is made unreachable by pointing a one-off dispatcher at a closed port. A stopped
+    container would leave its name unresolvable, so the provider timeout no longer bounds an
+    attempt; a paused one still accepts connections into the kernel backlog and processes every
+    queued request afterwards. Neither models a provider that is simply not there.
+    """
+    if os.environ.get("COURSE_TEST_PROFILE") != "1":
+        raise Skipped("requires the published test profile of a stand started with COURSE_TEST_PROFILE=1")
+    policy = sql_rows("SELECT max_attempts, delays_ms::text AS delays FROM delivery.active_policy()")
+    check(policy == [{"max_attempts": 4, "delays": "[200, 400, 800]"}], f"published test profile expected: {policy}")
+
+    check(compose("stop", "outbox-dispatcher").returncode == 0, "cannot stop the dispatcher")
+    try:
+        # 1. Unreachable through the whole budget: every attempt, every delay, then a terminal state
+        #    that does not pretend to know the subject result.
+        container = run_dispatcher(PROVIDER_URL="http://127.0.0.1:9")
+        try:
+            operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1050.00")
+            external_id = external_request(operation_id)
+            dead = poll("SELECT state, attempt_count, last_error_code FROM autocheck.outbox "
+                        f"WHERE external_request_id = {sql_text(external_id)}",
+                        lambda rows: len(rows) == 1 and rows[0]["state"] in ("DEAD", "CONFIRMED"), timeout=30)
+            check(dead == [{"state": "DEAD", "attempt_count": 4, "last_error_code": "transport.error.retryable"}],
+                  f"exhaustion must take exactly four attempts: {dead}")
+            # The record is written after the report is committed, so the last line may trail the
+            # DEAD row by a moment: wait for the log to catch up instead of reading it once.
+            deadline = time.monotonic() + 5
+            attempts = attempt_log(container, external_id)
+            while len(attempts) < 4 and time.monotonic() < deadline:
+                time.sleep(0.1)
+                attempts = attempt_log(container, external_id)
+            check([a["state"] for a in attempts] == ["RETRY_WAIT", "RETRY_WAIT", "RETRY_WAIT", "DEAD"],
+                  f"attempt states: {attempts}")
+            check([a.get("nextAttemptInMs") for a in attempts] == [200, 400, 800, None],
+                  f"delays decided by PostgreSQL: {attempts}")
+            check(all(a["errorCode"] == "transport.error.retryable" and a["httpStatus"] is None for a in attempts),
+                  f"an unreachable provider is a retryable transport error: {attempts}")
+            check(len({a["correlationId"] for a in attempts}) == 1, f"the correlation identifier must not change: {attempts}")
+        finally:
+            remove_container(container)
+
+        state = sql_rows("SELECT o.status AS operation, p.state AS process FROM autocheck.operations o "
+                         f"JOIN autocheck.processes p USING (process_id) WHERE o.operation_id = '{operation_id}'::uuid")
+        check(state == [{"operation": "PROCESSING", "process": "WAITING_SIGNAL"}],
+              f"DEAD is a delivery fact, not a subject result: {state}")
+        check(audit(external_id)[0] == 404, "an unreachable provider must not have seen the payment")
+
+        # A valid receipt after exhaustion still confirms the delivery and settles the operation.
+        message_id = f"e2e-late-{secrets.token_hex(5)}"
+        receipt, signature = signed_receipt(external_id, message_id)
+        status, body = action("receipt", "accept", receipt, RECEIPT, message_id, signature)
+        check(status == 200 and body is not None and body["outcome"] == "RECEIVED", f"late receipt: {status} {body}")
+        wait_status(operation_id, "COMPLETED")
+        outbox = sql_rows(f"SELECT state, attempt_count FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}")
+        check(outbox == [{"state": "CONFIRMED", "attempt_count": 4}], f"a late receipt confirms without erasing the attempts: {outbox}")
+
+        # 2. Unreachable for three attempts, back before the fourth: the last attempt is still there.
+        #    Attempts are gated by the dispatcher poll: with a four-second poll the wait before the
+        #    fourth attempt lasts seconds, and the one-off dispatcher is killed inside that window.
+        container = run_dispatcher(PROVIDER_URL="http://127.0.0.1:9", OUTBOX_POLL_INTERVAL_MS="4000")
+        try:
+            operation_id, _ = create_and_submit("PAYMENT_EXECUTION", "1060.00")
+            external_id = external_request(operation_id)
+            poll(f"SELECT state, attempt_count FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}",
+                 lambda rows: rows == [{"state": "RETRY_WAIT", "attempt_count": 3}], timeout=40)
+        finally:
+            remove_container(container)
+    finally:
+        check(compose("start", "outbox-dispatcher").returncode == 0, "cannot start the dispatcher")
+
+    wait_status(operation_id, "COMPLETED")
+    outbox = sql_rows(f"SELECT state, attempt_count FROM autocheck.outbox WHERE external_request_id = {sql_text(external_id)}")
+    check(outbox == [{"state": "CONFIRMED", "attempt_count": 4}], f"the fourth attempt must complete the delivery: {outbox}")
+    status, payment = audit(external_id)
+    check(status == 200 and payment is not None and payment["paymentCount"] == 1 and payment["requestCount"] == 1
+          and payment["idempotencyKey"] == external_id,
+          f"the restored provider must see one request with the original key: {payment}")
+
+
 SCENARIOS = [scenario_provider_path, scenario_adapter_and_recreate, scenario_review, scenario_concurrent_submit,
              scenario_least_privilege, scenario_failpoint_and_lease_expiry, scenario_receipt_lock_order,
-             scenario_submit_rejects_foreign_process, scenario_storage_invariants]
+             scenario_submit_rejects_foreign_process, scenario_storage_invariants, scenario_outbox_retry_budget]
 
 
 def main() -> int:

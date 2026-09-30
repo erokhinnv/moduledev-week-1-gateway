@@ -128,7 +128,7 @@ class FakeOutbox:
 
     def fail(self, message, owner, error_code):
         self.reports.append(("fail", message.lease_version, owner, error_code))
-        return {"status": "ok", "state": "RETRY_WAIT"}
+        return {"status": "ok", "state": "RETRY_WAIT", "nextAttemptInMs": 200}
 
 
 class DispatcherLoopTests(unittest.TestCase):
@@ -187,6 +187,15 @@ class DispatcherLoopTests(unittest.TestCase):
         dispatcher.cycle()
         record = json.loads(log.getvalue())
         self.assertEqual((record["level"], record["reportCode"]), ("warning", "delivery.lease_stale"))
+
+    def test_the_attempt_record_repeats_the_schedule_decided_by_postgres(self):
+        log = io.StringIO()
+        settings = dispatcher_settings({**DISPATCHER, "COURSE_TEST_PROFILE": "1"})
+        dispatcher = Dispatcher(settings, lambda: FakeOutbox([[MESSAGE]]), Logger("outbox-dispatcher", log), StopSignal(),
+                                lambda url, request, timeout: AttemptResult(error_code="transport.error.retryable"))
+        dispatcher.cycle()
+        record = json.loads(log.getvalue())
+        self.assertEqual((record["event"], record["state"], record["nextAttemptInMs"]), ("outbox.attempt", "RETRY_WAIT", 200))
 
     def test_failure_is_reported_and_retry_repeats_exact_request(self):
         retry = OutboxMessage("o-1", 2, "ext-1", "c-1", "10.00", "RUB")

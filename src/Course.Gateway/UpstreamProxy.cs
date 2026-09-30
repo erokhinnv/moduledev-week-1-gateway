@@ -61,6 +61,21 @@ public sealed class UpstreamProxy(
                 : string.Empty,
         }.Uri;
 
+        // Слишком большое тело — ошибка клиента, и она обязана быть названа до пересылки. Объявленную
+        // длину видно сразу; тело без длины ограничивает Kestrel во время чтения, и тот отказ ниже
+        // переводится в тот же ответ, а не в «внутренний api недоступен».
+        if (context.Request.ContentLength is long declaredLength && declaredLength > GatewayOptions.MaxRequestBytes)
+        {
+            logger.LogWarning(
+                "request body too large gatewayRequestId={GatewayRequestId} path={Path} declared={Declared} limit={Limit}",
+                gatewayRequestId,
+                context.Request.Path,
+                declaredLength,
+                GatewayOptions.MaxRequestBytes);
+            await WriteRequestTooLargeAsync(context);
+            return;
+        }
+
         using var upstreamRequest = new HttpRequestMessage(new HttpMethod(context.Request.Method), target);
 
         if (context.Request.ContentLength is > 0 || context.Request.Headers.ContainsKey("Transfer-Encoding"))
@@ -112,6 +127,19 @@ public sealed class UpstreamProxy(
                 context,
                 504,
                 Envelope.Error(ContractCodes.ActionTimeout, "internal api did not answer in time", null, null, retryable: true));
+            return;
+        }
+        catch (Exception exception) when (IsRequestTooLarge(exception))
+        {
+            // Тело без объявленной длины превысило границу уже во время потоковой пересылки: Kestrel
+            // прервал чтение, а HttpClient завернул это в ошибку отправки. Клиент виноват сам, и
+            // повтор того же запроса не поможет — это не недоступность api.
+            logger.LogWarning(
+                "request body too large mid-stream gatewayRequestId={GatewayRequestId} path={Path} limit={Limit}",
+                gatewayRequestId,
+                context.Request.Path,
+                GatewayOptions.MaxRequestBytes);
+            await WriteRequestTooLargeAsync(context);
             return;
         }
         catch (HttpRequestException exception)
@@ -198,6 +226,38 @@ public sealed class UpstreamProxy(
             }
         }
     }
+
+    /// <summary>
+    /// Отказ Kestrel прочитать тело сверх границы приходит либо сам, либо завёрнутым в ошибку
+    /// отправки HttpClient — распознаётся по коду 413 в любой позиции цепочки.
+    /// </summary>
+    private static bool IsRequestTooLarge(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is BadHttpRequestException { StatusCode: 413 })
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Отказ из-за превышения границы запроса: клиентская ошибка без повтора, тем же контрактным
+    /// конвертом, что и остальная матрица, и одинаковая для объявленной длины и потока без неё.
+    /// </summary>
+    private static Task WriteRequestTooLargeAsync(HttpContext context)
+        => GatewayResponses.WriteAsync(
+            context,
+            413,
+            Envelope.Error(
+                ContractCodes.RequestInvalid,
+                "request body exceeds the gateway limit",
+                null,
+                null,
+                retryable: false));
 
     /// <summary>
     /// Отказ из-за превышения границы ответа. Один метод на обе ветки — объявленную длину и

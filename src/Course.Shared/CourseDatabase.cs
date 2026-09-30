@@ -81,6 +81,12 @@ public static class CourseDatabase
         builder.ConnectionPruningInterval = 5;
         builder.KeepAlive = 30;
         builder.ApplicationName = Env.Optional("COURSE_APPLICATION_NAME", "course");
+        // Npgsql 10 по умолчанию ПРЕДПОЧИТАЕТ GSS-шифрование и на каждом подключении пробует
+        // загрузить libgssapi_krb5. В образах dotnet/runtime и dotnet/aspnet этой библиотеки нет,
+        // и каждое подключение оставляло в журнале две строки «Cannot load library ...» — шум,
+        // неотличимый от ошибки. Контур курса аутентифицируется паролем внутри сети Compose, и
+        // договариваться о GSS ему незачем.
+        builder.GssEncryptionMode = GssEncryptionMode.Disable;
         return builder.ConnectionString;
     }
 
